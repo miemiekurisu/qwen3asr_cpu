@@ -307,10 +307,12 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
         /* Input RMSNorm */
         qwen_rms_norm(x_norm, x, l->input_norm, seq_len, dim, eps);
 
-        /* QKV projections (no bias) */
-        qwen_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, seq_len, dim, q_dim);
-        qwen_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, seq_len, dim, kv_dim);
-        qwen_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, seq_len, dim, kv_dim);
+        /* QKV projections (fused single GEMM) */
+        qwen_linear_nobias_bf16_qkv_prefill(q, k, v, x_norm,
+                                            l->wq_weight_bf16,
+                                            l->wk_weight_bf16,
+                                            l->wv_weight_bf16,
+                                            seq_len, dim, q_dim, kv_dim);
 
         /* Per-head Q/K RMSNorm */
         qwen_rms_norm_per_head(q, l->q_norm_weight, seq_len, n_heads, head_dim, eps);

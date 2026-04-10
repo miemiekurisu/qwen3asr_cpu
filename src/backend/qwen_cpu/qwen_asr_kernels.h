@@ -48,6 +48,13 @@ void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
                                  const uint16_t *Wv_bf16,
                                  int in_dim, int q_dim, int kv_dim);
 
+/* Prefill QKV fusion: fuses Wq/Wk/Wv into one BLAS sgemm for seq_len > 1.
+ * Saves 2 BLAS call overheads per layer and reduces input re-reads. */
+void qwen_linear_nobias_bf16_qkv_prefill(
+    float *q, float *k, float *v, const float *x,
+    const uint16_t *Wq_bf16, const uint16_t *Wk_bf16, const uint16_t *Wv_bf16,
+    int seq_len, int in_dim, int q_dim, int kv_dim);
+
 void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
                          int M, int K, int N);
 

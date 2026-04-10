@@ -315,6 +315,32 @@ static void bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
 #endif
 }
 
+/* Threaded BF16→F32 conversion for large weight matrices */
+typedef struct {
+    float *dst;
+    const uint16_t *src;
+    size_t n;
+} bf16_cvt_task_t;
+
+static void bf16_cvt_worker(int tid, int n_threads, void *arg) {
+    bf16_cvt_task_t *t = (bf16_cvt_task_t *)arg;
+    size_t chunk = (t->n + (size_t)n_threads - 1) / (size_t)n_threads;
+    size_t start = (size_t)tid * chunk;
+    size_t end = start + chunk;
+    if (end > t->n) end = t->n;
+    if (start >= end) return;
+    bf16_to_f32_buf(t->dst + start, t->src + start, end - start);
+}
+
+static void bf16_to_f32_buf_threaded(float *dst, const uint16_t *src, size_t n) {
+    if (tp.n_threads <= 1 || n < 65536) {
+        bf16_to_f32_buf(dst, src, n);
+        return;
+    }
+    bf16_cvt_task_t task = { .dst = dst, .src = src, .n = n };
+    parallel_for(bf16_cvt_worker, &task);
+}
+
 /* Reusable scratch buffer for bf16->f32 conversion */
 static float *bf16_scratch = NULL;
 static size_t bf16_scratch_cap = 0;
@@ -405,7 +431,7 @@ static const float *bf16_get_f32_view(const uint16_t *src, size_t n) {
 
     float *scratch = bf16_get_scratch(n);
     if (!scratch) return NULL;
-    bf16_to_f32_buf(scratch, src, n);
+    bf16_to_f32_buf_threaded(scratch, src, n);
     return scratch;
 }
 
@@ -549,6 +575,131 @@ void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
     const float *W_f32 = bf16_get_f32_view(W_bf16, n);
     if (!W_f32) return;
     qwen_linear_nobias(y, x, W_f32, seq_len, in_dim, out_dim);
+}
+
+/* Fused QKV prefill: converts Wq/Wk/Wv into one contiguous F32 block,
+ * does a single BLAS sgemm, then splits the output into q/k/v.
+ * Saves 2 BLAS call overheads per layer and reduces input matrix re-reads. */
+
+typedef struct {
+    float *W_fused;
+    const uint16_t *Wq_bf16;
+    const uint16_t *Wk_bf16;
+    const uint16_t *Wv_bf16;
+    size_t wq_n;
+    size_t wk_n;
+    size_t w_total;
+} qkv_cvt_task_t;
+
+static void qkv_cvt_worker(int tid, int n_threads, void *arg) {
+    qkv_cvt_task_t *t = (qkv_cvt_task_t *)arg;
+    size_t chunk = (t->w_total + (size_t)n_threads - 1) / (size_t)n_threads;
+    size_t start = (size_t)tid * chunk;
+    size_t end = start + chunk;
+    if (end > t->w_total) end = t->w_total;
+    if (start >= end) return;
+
+    /* Map logical offset in fused buffer to correct source segment */
+    size_t pos = start;
+    while (pos < end) {
+        const uint16_t *src;
+        size_t seg_start, seg_end;
+        if (pos < t->wq_n) {
+            src = t->Wq_bf16;
+            seg_start = 0;
+            seg_end = t->wq_n;
+        } else if (pos < t->wq_n + t->wk_n) {
+            src = t->Wk_bf16 - t->wq_n;  /* offset so src[pos] is correct */
+            seg_start = t->wq_n;
+            seg_end = t->wq_n + t->wk_n;
+        } else {
+            src = t->Wv_bf16 - (t->wq_n + t->wk_n);
+            seg_start = t->wq_n + t->wk_n;
+            seg_end = t->w_total;
+        }
+        size_t run_end = end < seg_end ? end : seg_end;
+        size_t run_len = run_end - pos;
+        bf16_to_f32_buf(t->W_fused + pos, src + pos, run_len);
+        pos = run_end;
+    }
+}
+
+void qwen_linear_nobias_bf16_qkv_prefill(
+    float *q, float *k, float *v, const float *x,
+    const uint16_t *Wq_bf16, const uint16_t *Wk_bf16, const uint16_t *Wv_bf16,
+    int seq_len, int in_dim, int q_dim, int kv_dim)
+{
+    /* seq=1 should use the decode-optimized fused matvec path instead */
+    if (seq_len == 1) {
+        qwen_linear_nobias_bf16_qkv(q, k, v, x, Wq_bf16, Wk_bf16, Wv_bf16,
+                                    in_dim, q_dim, kv_dim);
+        return;
+    }
+
+    int total_out = q_dim + 2 * kv_dim;
+    size_t wq_n = (size_t)q_dim * in_dim;
+    size_t wk_n = (size_t)kv_dim * in_dim;
+    size_t w_total = wq_n + 2 * wk_n;
+
+    /* Reuse scratch for fused weight [total_out, in_dim] in F32 */
+    float *W_fused = bf16_get_scratch(w_total);
+    if (!W_fused) return;
+
+    /* Convert all three BF16 weight matrices in one threaded dispatch */
+    if (tp.n_threads > 1) {
+        qkv_cvt_task_t cvt = {
+            .W_fused = W_fused,
+            .Wq_bf16 = Wq_bf16,
+            .Wk_bf16 = Wk_bf16,
+            .Wv_bf16 = Wv_bf16,
+            .wq_n = wq_n,
+            .wk_n = wk_n,
+            .w_total = w_total,
+        };
+        parallel_for(qkv_cvt_worker, &cvt);
+    } else {
+        bf16_to_f32_buf(W_fused, Wq_bf16, wq_n);
+        bf16_to_f32_buf(W_fused + wq_n, Wk_bf16, wk_n);
+        bf16_to_f32_buf(W_fused + wq_n + wk_n, Wv_bf16, wk_n);
+    }
+
+    /* Reusable scratch for fused output [seq_len, total_out] */
+    static float *qkv_out = NULL;
+    static size_t qkv_out_cap = 0;
+    size_t out_n = (size_t)seq_len * total_out;
+    if (out_n > qkv_out_cap) {
+        free(qkv_out);
+        qkv_out = (float *)malloc(out_n * sizeof(float));
+        qkv_out_cap = qkv_out ? out_n : 0;
+    }
+    if (!qkv_out) return;
+
+#ifdef USE_BLAS
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                seq_len, total_out, in_dim,
+                1.0f, x, in_dim, W_fused, in_dim,
+                0.0f, qkv_out, total_out);
+#else
+    for (int s = 0; s < seq_len; s++) {
+        const float *x_row = x + s * in_dim;
+        float *y_row = qkv_out + s * total_out;
+        for (int o = 0; o < total_out; o++) {
+            const float *w_row = W_fused + (size_t)o * in_dim;
+            float sum = 0.0f;
+            for (int i = 0; i < in_dim; i++)
+                sum += x_row[i] * w_row[i];
+            y_row[o] = sum;
+        }
+    }
+#endif
+
+    /* Split fused output into separate q, k, v buffers */
+    for (int s = 0; s < seq_len; s++) {
+        const float *row = qkv_out + (size_t)s * total_out;
+        memcpy(q + (size_t)s * q_dim,  row,                    (size_t)q_dim * sizeof(float));
+        memcpy(k + (size_t)s * kv_dim, row + q_dim,            (size_t)kv_dim * sizeof(float));
+        memcpy(v + (size_t)s * kv_dim, row + q_dim + kv_dim,   (size_t)kv_dim * sizeof(float));
+    }
 }
 
 void qwen_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
