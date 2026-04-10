@@ -9,6 +9,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #define SAFETENSORS_MAX_TENSORS 1024
 #define SAFETENSORS_MAX_SHARDS 8
 
@@ -39,6 +45,10 @@ typedef struct {
     char *header_json;
     int num_tensors;
     safetensor_t tensors[SAFETENSORS_MAX_TENSORS];
+#ifdef _WIN32
+    HANDLE file_handle;
+    HANDLE map_handle;
+#endif
 } safetensors_file_t;
 
 /* Multi-shard wrapper: opens all shard files and provides unified tensor lookup */

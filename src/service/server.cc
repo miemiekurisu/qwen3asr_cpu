@@ -25,6 +25,8 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#else
+#include <windows.h>
 #endif
 
 #ifdef QASR_CPU_BACKEND_ENABLED
@@ -218,6 +220,19 @@ int StatusToHttpCode(const Status & status) {
 std::string ShellEscape(std::string_view value) {
     std::string escaped;
     escaped.reserve(value.size() + 8);
+#ifdef _WIN32
+    escaped.push_back('"');
+    for (const char ch : value) {
+        if (ch == '"') {
+            escaped += "\\\"";
+        } else if (ch == '\\') {
+            escaped += "\\\\";
+        } else {
+            escaped.push_back(ch);
+        }
+    }
+    escaped.push_back('"');
+#else
     escaped.push_back('\'');
     for (const char ch : value) {
         if (ch == '\'') {
@@ -227,6 +242,7 @@ std::string ShellEscape(std::string_view value) {
         }
     }
     escaped.push_back('\'');
+#endif
     return escaped;
 }
 
@@ -252,7 +268,11 @@ std::string NormalizeAudioLocator(std::string_view locator) {
 }
 
 bool CommandExists(const char * name) {
+#ifdef _WIN32
+    const std::string command = "where " + std::string(name) + " >NUL 2>&1";
+#else
     const std::string command = "command -v " + std::string(name) + " >/dev/null 2>&1";
+#endif
     return std::system(command.c_str()) == 0;
 }
 
@@ -288,7 +308,11 @@ Status NormalizeAudioToWav16kMono(std::string_view locator, const fs::path & out
     const std::string command =
         "ffmpeg -loglevel error -nostdin -y -i " + ShellEscape(locator) +
         " -ar 16000 -ac 1 -f wav " + ShellEscape(output_path.string()) +
+#ifdef _WIN32
+        " >NUL 2>&1";
+#else
         " >/dev/null 2>&1";
+#endif
     if (std::system(command.c_str()) != 0) {
         return Status(StatusCode::kInternal, "ffmpeg normalization failed");
     }
@@ -439,7 +463,7 @@ std::vector<float> DecodePcm16Le(const std::string & body) {
     return samples;
 }
 
-#if defined(QASR_CPU_BACKEND_ENABLED) && !defined(_WIN32)
+#if defined(QASR_CPU_BACKEND_ENABLED)
 std::vector<float> DecodePcm16Le(const char * data, std::size_t size) {
     return DecodePcm16Le(std::string(data, size));
 }
@@ -947,7 +971,6 @@ struct ServerMetrics {
     std::atomic<std::uint64_t> host_capture_sessions_started{0};
 };
 
-#if !defined(_WIN32)
 struct HostCaptureSession {
     std::string id;
     std::string backend;
@@ -964,12 +987,85 @@ struct HostCaptureSession {
     bool last_decode_ran = false;
     bool active = true;
     bool stop_requested = false;
+#if defined(_WIN32)
+    HANDLE child_process = INVALID_HANDLE_VALUE;
+    HANDLE read_handle = INVALID_HANDLE_VALUE;
+#else
     pid_t child_pid = -1;
     int read_fd = -1;
+#endif
     std::thread reader;
     std::mutex mu;
 };
 
+#if defined(_WIN32)
+Status SpawnCaptureProcess(
+    const std::vector<std::string> & argv,
+    HANDLE * child_process,
+    HANDLE * read_handle) {
+    if (child_process == nullptr || read_handle == nullptr) {
+        return Status(StatusCode::kInvalidArgument, "capture outputs must not be null");
+    }
+
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = nullptr;
+
+    HANDLE pipe_read = INVALID_HANDLE_VALUE;
+    HANDLE pipe_write = INVALID_HANDLE_VALUE;
+    if (!CreatePipe(&pipe_read, &pipe_write, &sa, 0)) {
+        return Status(StatusCode::kInternal, "CreatePipe failed");
+    }
+    /* Prevent the read end from being inherited by the child. */
+    SetHandleInformation(pipe_read, HANDLE_FLAG_INHERIT, 0);
+
+    /* Build a single command line string. */
+    std::string cmdline;
+    for (std::size_t i = 0; i < argv.size(); i++) {
+        if (i > 0) cmdline.push_back(' ');
+        /* Simple quoting: wrap each arg in double quotes and escape embedded
+           double-quotes.  Sufficient for ffmpeg argument values. */
+        cmdline.push_back('"');
+        for (const char ch : argv[i]) {
+            if (ch == '"') cmdline += "\\\"";
+            else cmdline.push_back(ch);
+        }
+        cmdline.push_back('"');
+    }
+
+    STARTUPINFOA si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = pipe_write;
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+    PROCESS_INFORMATION pi = {};
+    BOOL ok = CreateProcessA(
+        nullptr,
+        &cmdline[0],
+        nullptr,
+        nullptr,
+        TRUE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        nullptr,
+        &si,
+        &pi);
+    CloseHandle(pipe_write);
+
+    if (!ok) {
+        CloseHandle(pipe_read);
+        return Status(StatusCode::kInternal, "CreateProcess failed for: " + cmdline);
+    }
+
+    CloseHandle(pi.hThread);
+    *child_process = pi.hProcess;
+    *read_handle = pipe_read;
+    return OkStatus();
+}
+#else
 Status SpawnCaptureProcess(
     const std::vector<std::string> & argv,
     pid_t * child_pid,
@@ -1009,6 +1105,7 @@ Status SpawnCaptureProcess(
     *read_fd = fds[0];
     return OkStatus();
 }
+#endif
 
 Status BuildCaptureCommand(
     std::string backend,
@@ -1092,6 +1189,9 @@ Status BuildCaptureCommand(
             argv->insert(argv->end(), {"-f", "alsa", "-i",
                 device.empty() ? "default" : device});
         }
+#elif defined(_WIN32)
+        argv->insert(argv->end(), {"-f", "dshow", "-i",
+            device.empty() ? "audio=virtual-audio-capturer" : ("audio=" + device)});
 #else
         argv->insert(argv->end(), {"-f", "alsa", "-i",
             device.empty() ? "default" : device});
@@ -1114,6 +1214,25 @@ void StopHostCaptureSession(const std::shared_ptr<HostCaptureSession> & capture)
         capture->stop_requested = true;
     }
 
+#if defined(_WIN32)
+    /* Terminate the child process; this closes the pipe write-end from the
+       child side, which unblocks the reader thread's ReadFile(). */
+    if (capture->child_process != INVALID_HANDLE_VALUE) {
+        TerminateProcess(capture->child_process, 1);
+    }
+    if (capture->reader.joinable()) {
+        capture->reader.join();
+    }
+    if (capture->read_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(capture->read_handle);
+        capture->read_handle = INVALID_HANDLE_VALUE;
+    }
+    if (capture->child_process != INVALID_HANDLE_VALUE) {
+        WaitForSingleObject(capture->child_process, 2000);
+        CloseHandle(capture->child_process);
+        capture->child_process = INVALID_HANDLE_VALUE;
+    }
+#else
     // Send SIGTERM first, then SIGKILL as forceful fallback.
     // On macOS, ffmpeg -f avfoundation may not respond to SIGTERM if stuck
     // acquiring the audio device.  SIGKILL guarantees the child dies, which
@@ -1136,11 +1255,11 @@ void StopHostCaptureSession(const std::shared_ptr<HostCaptureSession> & capture)
         waitpid(capture->child_pid, &status, 0);
         capture->child_pid = -1;
     }
+#endif
 
     std::lock_guard<std::mutex> lock(capture->mu);
     capture->active = false;
 }
-#endif  // !defined(_WIN32)
 
 template <typename SessionLike>
 void AppendRealtimeSamples(
@@ -1341,10 +1460,12 @@ std::string BuildServerUsage(std::string_view program_name) {
 int RunServer(const ServerConfig & config) {
 #ifndef QASR_CPU_BACKEND_ENABLED
     (void)config;
+    std::fprintf(stderr, "error: CPU backend is not enabled in this build\n");
     return 1;
 #else
     const Status config_status = ValidateServerConfig(config);
     if (!config_status.ok()) {
+        std::fprintf(stderr, "server config invalid: %s\n", config_status.message().c_str());
         return 1;
     }
 
@@ -1365,10 +1486,8 @@ int RunServer(const ServerConfig & config) {
     std::mutex realtime_mu;
     std::unordered_map<std::string, OfflineJob> jobs;
     std::mutex jobs_mu;
-#if !defined(_WIN32)
     std::shared_ptr<HostCaptureSession> host_capture;
     std::mutex host_capture_mu;
-#endif
 
     HttpServer server;
     {
@@ -1439,12 +1558,10 @@ int RunServer(const ServerConfig & config) {
             std::lock_guard<std::mutex> lock(jobs_mu);
             queued_jobs = jobs.size();
         }
-#if !defined(_WIN32)
         {
             std::lock_guard<std::mutex> lock(host_capture_mu);
             host_capture_active = static_cast<bool>(host_capture && host_capture->active);
         }
-#endif
         const auto uptime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - server_start).count();
         Json payload;
@@ -1840,7 +1957,6 @@ int RunServer(const ServerConfig & config) {
         SetJsonResponse(response, body);
     });
 
-#if !defined(_WIN32)
     server.Get("/api/capture/status", [&](const HttpRequest &, HttpResponse & response) {
         std::shared_ptr<HostCaptureSession> capture;
         {
@@ -1900,7 +2016,11 @@ int RunServer(const ServerConfig & config) {
         capture->device = device;
         capture->backend = selected_backend;
 
+#if defined(_WIN32)
+        const Status spawn_status = SpawnCaptureProcess(argv, &capture->child_process, &capture->read_handle);
+#else
         const Status spawn_status = SpawnCaptureProcess(argv, &capture->child_pid, &capture->read_fd);
+#endif
         if (!spawn_status.ok()) {
             SetErrorResponse(response, spawn_status, StatusToHttpCode(spawn_status));
             return;
@@ -1910,10 +2030,21 @@ int RunServer(const ServerConfig & config) {
         capture->reader = std::thread([capture, &model, realtime_policy]() {
             std::vector<char> buffer(6400);
             while (true) {
-                const ssize_t n_read = read(capture->read_fd, buffer.data(), buffer.size());
-                if (n_read <= 0) {
+#if defined(_WIN32)
+                DWORD bytes_read = 0;
+                BOOL ok = ReadFile(capture->read_handle, buffer.data(),
+                    static_cast<DWORD>(buffer.size()), &bytes_read, nullptr);
+                if (!ok || bytes_read == 0) {
                     break;
                 }
+                const std::size_t n_read = static_cast<std::size_t>(bytes_read);
+#else
+                const ssize_t raw_read = read(capture->read_fd, buffer.data(), buffer.size());
+                if (raw_read <= 0) {
+                    break;
+                }
+                const std::size_t n_read = static_cast<std::size_t>(raw_read);
+#endif
 
                 const std::vector<float> chunk = DecodePcm16Le(buffer.data(), static_cast<std::size_t>(n_read));
                 if (chunk.empty()) {
@@ -2038,17 +2169,6 @@ int RunServer(const ServerConfig & config) {
         body["error"] = capture->error;
         SetJsonResponse(response, body);
     });
-#else
-    server.Get("/api/capture/status", [&](const HttpRequest &, HttpResponse & response) {
-        SetJsonResponse(response, Json::object({{"active", false}, {"supported", false}}));
-    });
-    server.Post("/api/capture/start", [&](const HttpRequest &, HttpResponse & response) {
-        SetErrorResponse(response, Status(StatusCode::kUnimplemented, "host capture requires a POSIX platform"), 501);
-    });
-    server.Post("/api/capture/stop", [&](const HttpRequest &, HttpResponse & response) {
-        SetErrorResponse(response, Status(StatusCode::kUnimplemented, "host capture requires a POSIX platform"), 501);
-    });
-#endif
 
     std::fprintf(stderr, "qasr_server listening on %s:%d\n", config.host.c_str(), config.port);
     const bool ok = server.listen(config.host, config.port);

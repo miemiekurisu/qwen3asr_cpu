@@ -10,11 +10,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(QASR_ENABLE_TESTS "Build unit tests" ${BUILD_TESTING})
 option(QASR_ENABLE_ASAN "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
-if(WIN32)
-    set(QASR_DEFAULT_CPU_BACKEND OFF)
-else()
-    set(QASR_DEFAULT_CPU_BACKEND ON)
-endif()
+set(QASR_DEFAULT_CPU_BACKEND ON)
 option(QASR_ENABLE_CPU_BACKEND "Build the internal CPU inference backend" ${QASR_DEFAULT_CPU_BACKEND})
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -68,10 +64,12 @@ endif()
 include(QasrBlas)
 qasr_configure_blas(qasr_core)
 
-if(QASR_ENABLE_CPU_BACKEND AND NOT WIN32)
-    find_package(Threads REQUIRED)
+if(QASR_ENABLE_CPU_BACKEND)
+    if(NOT WIN32)
+        find_package(Threads REQUIRED)
+    endif()
 
-    add_library(qasr_cpu_c STATIC
+    set(QASR_CPU_SOURCES
         src/backend/qwen_cpu/qwen_asr.c
         src/backend/qwen_cpu/qwen_asr_stream.h
         src/backend/qwen_cpu/qwen_asr_audio.c
@@ -79,16 +77,26 @@ if(QASR_ENABLE_CPU_BACKEND AND NOT WIN32)
         src/backend/qwen_cpu/qwen_asr_encoder.c
         src/backend/qwen_cpu/qwen_asr_kernels.c
         src/backend/qwen_cpu/qwen_asr_kernels_generic.c
-        src/backend/qwen_cpu/qwen_asr_kernels_neon.c
         src/backend/qwen_cpu/qwen_asr_kernels_avx.c
         src/backend/qwen_cpu/qwen_asr_safetensors.c
         src/backend/qwen_cpu/qwen_asr_tokenizer.c
     )
 
+    # NEON kernels only on ARM
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm")
+        list(APPEND QASR_CPU_SOURCES src/backend/qwen_cpu/qwen_asr_kernels_neon.c)
+    endif()
+
+    add_library(qasr_cpu_c STATIC ${QASR_CPU_SOURCES})
+
     target_include_directories(qasr_cpu_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/qwen_cpu)
     target_compile_features(qasr_cpu_c PUBLIC c_std_11)
 
     if(MSVC)
+        # /O2 conflicts with /RTC1 and /Od that CMake adds in Debug mode.
+        # Strip them for this perf-critical C library (the only C target).
+        string(REGEX REPLACE "/RTC[^ ]*" "" CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
+        string(REPLACE "/Od" "" CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
         target_compile_options(qasr_cpu_c PRIVATE /O2)
     else()
         target_compile_options(qasr_cpu_c PRIVATE -O3 -ffast-math -Wall -Wextra)
@@ -102,7 +110,11 @@ if(QASR_ENABLE_CPU_BACKEND AND NOT WIN32)
 
     target_compile_definitions(qasr_core PUBLIC QASR_CPU_BACKEND_ENABLED=1)
     target_include_directories(qasr_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/qwen_cpu)
-    target_link_libraries(qasr_cpu_c PUBLIC Threads::Threads)
+    if(WIN32)
+        # Win32 threading API + memory-mapped I/O are in kernel32 (linked by default)
+    else()
+        target_link_libraries(qasr_cpu_c PUBLIC Threads::Threads)
+    endif()
     if(UNIX AND NOT APPLE)
         target_link_libraries(qasr_cpu_c PUBLIC m)
     endif()

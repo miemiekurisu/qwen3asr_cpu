@@ -13,6 +13,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_MSC_VER) && !defined(strdup)
+#define strdup _strdup
+#endif
 
 /* ========================================================================
  * GPT-2 Bytes-to-Unicode Mapping
