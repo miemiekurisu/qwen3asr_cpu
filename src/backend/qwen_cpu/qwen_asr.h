@@ -10,7 +10,17 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+/* MSVC names POSIX functions with underscore prefix */
+#ifndef strdup
+#define strdup _strdup
+#endif
+#else
 #include <pthread.h>
+#endif
 
 /* ========================================================================
  * Constants
@@ -254,9 +264,15 @@ typedef struct {
     int64_t n_samples;          /* number of valid samples in buffer */
     int64_t capacity;           /* allocated capacity (in samples) */
     int eof;
+#ifdef _WIN32
+    CRITICAL_SECTION mutex;
+    CONDITION_VARIABLE cond;
+    HANDLE thread;
+#else
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     pthread_t thread;
+#endif
 } qwen_live_audio_t;
 
 /* ========================================================================

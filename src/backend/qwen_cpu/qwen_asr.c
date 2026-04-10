@@ -17,11 +17,30 @@
 #include <ctype.h>
 #include <math.h>
 #include <limits.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <sys/time.h>
+#endif
 
 /* Global verbose flag */
 int qwen_verbose = 0;
 int qwen_monitor = 0;
+
+/* Threading compatibility macros for live audio */
+#ifdef _WIN32
+#define LA_LOCK(la)        EnterCriticalSection(&(la)->mutex)
+#define LA_UNLOCK(la)      LeaveCriticalSection(&(la)->mutex)
+#define LA_SIGNAL(la)      WakeConditionVariable(&(la)->cond)
+#define LA_WAIT(la)        SleepConditionVariableCS(&(la)->cond, &(la)->mutex, INFINITE)
+#else
+#define LA_LOCK(la)        pthread_mutex_lock(&(la)->mutex)
+#define LA_UNLOCK(la)      pthread_mutex_unlock(&(la)->mutex)
+#define LA_SIGNAL(la)      pthread_cond_signal(&(la)->cond)
+#define LA_WAIT(la)        pthread_cond_wait(&(la)->cond, &(la)->mutex)
+#endif
 
 void qwen_set_token_callback(qwen_ctx_t *ctx, qwen_token_cb cb, void *userdata) {
     ctx->token_cb = cb;
@@ -361,9 +380,17 @@ static void tok_embed_bf16_to_f32(float *dst, const uint16_t *tok_emb_bf16,
 }
 
 static double get_time_ms(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq = {0};
+    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (double)now.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+#endif
 }
 
 static int cmp_float_asc(const void *a, const void *b) {
@@ -1251,7 +1278,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
 
     if (live) {
         /* Seed local buffer with whatever is available now. */
-        pthread_mutex_lock(&live->mutex);
+        LA_LOCK(live);
         int64_t live_start = live->sample_offset;
         int64_t live_count = live->n_samples;
         live_eof = live->eof;
@@ -1260,12 +1287,12 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         if (local_n_samples > 0) {
             local_capacity = local_n_samples + chunk_samples * 4;
             if ((uint64_t)local_capacity > (uint64_t)(SIZE_MAX / sizeof(float))) {
-                pthread_mutex_unlock(&live->mutex);
+                LA_UNLOCK(live);
                 return NULL;
             }
             local_samples = (float *)malloc((size_t)local_capacity * sizeof(float));
             if (!local_samples) {
-                pthread_mutex_unlock(&live->mutex);
+                LA_UNLOCK(live);
                 return NULL;
             }
             memcpy(local_samples, live->samples, (size_t)local_n_samples * sizeof(float));
@@ -1273,7 +1300,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         /* Producer buffer is now mirrored locally: reset it to bound memory. */
         live->sample_offset = live_start + live_count;
         live->n_samples = 0;
-        pthread_mutex_unlock(&live->mutex);
+        LA_UNLOCK(live);
         audio_samples = local_samples;
         audio_n_samples = local_base_sample + local_n_samples;
     } else {
@@ -1440,9 +1467,9 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         /* Live mode: wait until we have enough data for the next chunk. */
         if (live) {
             int64_t want = audio_cursor + chunk_samples;
-            pthread_mutex_lock(&live->mutex);
+            LA_LOCK(live);
             while (live->sample_offset + live->n_samples < want && !live->eof)
-                pthread_cond_wait(&live->cond, &live->mutex);
+                LA_WAIT(live);
 
             int64_t live_start = live->sample_offset;
             int64_t live_count = live->n_samples;
@@ -1466,7 +1493,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 int64_t delta64 = live_end - local_end;
                 int64_t src_off64 = local_end - live_start;
                 if (delta64 < 0 || src_off64 < 0 || src_off64 > live_count) {
-                    pthread_mutex_unlock(&live->mutex);
+                    LA_UNLOCK(live);
                     break;
                 }
 
@@ -1474,13 +1501,13 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                     int64_t new_cap = local_capacity > 0 ? local_capacity : 32000;
                     while (new_cap < local_n_samples + delta64) new_cap *= 2;
                     if ((uint64_t)new_cap > (uint64_t)(SIZE_MAX / sizeof(float))) {
-                        pthread_mutex_unlock(&live->mutex);
+                        LA_UNLOCK(live);
                         break;
                     }
                     float *tmp = (float *)realloc(local_samples,
                                                   (size_t)new_cap * sizeof(float));
                     if (!tmp) {
-                        pthread_mutex_unlock(&live->mutex);
+                        LA_UNLOCK(live);
                         break;
                     }
                     local_samples = tmp;
@@ -1496,7 +1523,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             live->sample_offset = live_end;
             live->n_samples = 0;
             live_eof = is_eof_now;
-            pthread_mutex_unlock(&live->mutex);
+            LA_UNLOCK(live);
 
             audio_samples = local_samples;
             audio_n_samples = local_base_sample + local_n_samples;

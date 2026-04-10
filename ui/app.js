@@ -5,6 +5,7 @@ const audioFile = document.getElementById("audioFile");
 const offlineResult = document.getElementById("offlineResult");
 const startRealtime = document.getElementById("startRealtime");
 const stopRealtime = document.getElementById("stopRealtime");
+const clearRealtime = document.getElementById("clearRealtime");
 const realtimeResult = document.getElementById("realtimeResult");
 const realtimeStatus = document.getElementById("realtimeStatus");
 const hostBackend = document.getElementById("hostBackend");
@@ -298,6 +299,7 @@ async function startRealtimeCapture() {
   processor.connect(audioContext.destination);
   startRealtime.disabled = true;
   stopRealtime.disabled = false;
+  clearRealtime.style.display = "none";
   renderTranscript(realtimeResult, null, "实时转写中...");
   realtimeStatus.textContent = `会话 ${realtimeState.sessionId} 已启动`;
 }
@@ -339,6 +341,7 @@ async function stopRealtimeCapture() {
   };
   startRealtime.disabled = false;
   stopRealtime.disabled = true;
+  clearRealtime.style.display = "";
 }
 
 startRealtime.addEventListener("click", async () => {
@@ -355,6 +358,12 @@ stopRealtime.addEventListener("click", async () => {
   } catch (error) {
     realtimeStatus.textContent = `停止失败：${error.message}`;
   }
+});
+
+clearRealtime.addEventListener("click", () => {
+  realtimeResult.textContent = "尚无结果";
+  realtimeStatus.textContent = "未开始";
+  clearRealtime.style.display = "none";
 });
 
 startHostCapture.addEventListener("click", async () => {

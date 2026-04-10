@@ -30,6 +30,17 @@
 #define N_FFT        400
 #define N_FREQ       (N_FFT / 2 + 1)    /* 201 bins */
 
+/* Modified Bessel function of the first kind, order 0.
+ * Power-series approximation; converges fast for beta <= 10. */
+static double bessel_i0(double x) {
+    double sum = 1.0, term = 1.0, xx = x * x;
+    for (int k = 1; k <= 20; k++) {
+        term *= xx / (4.0 * (double)k * (double)k);
+        sum += term;
+    }
+    return sum;
+}
+
 /* ========================================================================
  * WAV File Loading (adapted from voxtral)
  * ======================================================================== */
@@ -109,15 +120,7 @@ float *qwen_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_s
 
         /* Precompute Kaiser window: I0(beta * sqrt(1 - (n/N)^2)) / I0(beta)
          * I0 approximation via power series (converges fast for beta <= 10). */
-        /* I0 (modified Bessel, first kind, order 0) */
-        #define BESSEL_I0(x) ({ \
-            double _sum = 1.0, _term = 1.0, _xx = (x)*(x); \
-            for (int _k = 1; _k <= 20; _k++) { \
-                _term *= _xx / (4.0 * (double)_k * (double)_k); \
-                _sum += _term; \
-            } \
-            _sum; })
-        double inv_I0_beta = 1.0 / BESSEL_I0(KAISER_BETA);
+        double inv_I0_beta = 1.0 / bessel_i0(KAISER_BETA);
 
         for (int i = 0; i < new_n; i++) {
             double src_pos = (double)i / ratio;
@@ -145,7 +148,7 @@ float *qwen_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_s
                 if (npos <= -1.0 || npos >= 1.0) {
                     w = 0.0;
                 } else {
-                    w = BESSEL_I0(KAISER_BETA * sqrt(1.0 - npos * npos)) * inv_I0_beta;
+                    w = bessel_i0(KAISER_BETA * sqrt(1.0 - npos * npos)) * inv_I0_beta;
                 }
 
                 double coeff = s * w * cutoff;
@@ -157,7 +160,6 @@ float *qwen_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_s
             /* Normalize to handle edge effects at boundaries */
             resampled[i] = (wsum > 1e-9) ? (float)(acc / wsum) : 0.0f;
         }
-        #undef BESSEL_I0
         free(samples);
         samples = resampled;
         n_frames = new_n;
@@ -397,24 +399,36 @@ float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames
  * Live Audio: stdin reader thread for incremental streaming
  * ======================================================================== */
 
+/* Threading compatibility macros */
+#ifdef _WIN32
+#define LA_LOCK(la)        EnterCriticalSection(&(la)->mutex)
+#define LA_UNLOCK(la)      LeaveCriticalSection(&(la)->mutex)
+#define LA_SIGNAL(la)      WakeConditionVariable(&(la)->cond)
+#define LA_WAIT(la)        SleepConditionVariableCS(&(la)->cond, &(la)->mutex, INFINITE)
+#else
 #include <pthread.h>
+#define LA_LOCK(la)        pthread_mutex_lock(&(la)->mutex)
+#define LA_UNLOCK(la)      pthread_mutex_unlock(&(la)->mutex)
+#define LA_SIGNAL(la)      pthread_cond_signal(&(la)->cond)
+#define LA_WAIT(la)        pthread_cond_wait(&(la)->cond, &(la)->mutex)
+#endif
 
 /* Append n_new float samples to la->samples under mutex + signal condvar. */
 static void live_audio_append(qwen_live_audio_t *la, const float *data, int n_new) {
     if (!la || !data || n_new <= 0) return;
 
-    pthread_mutex_lock(&la->mutex);
+    LA_LOCK(la);
     int64_t need = la->n_samples + (int64_t)n_new;
     if (need > la->capacity) {
         int64_t new_cap = la->capacity > 0 ? la->capacity : 32000;
         while (new_cap < need) new_cap *= 2;
         if ((uint64_t)new_cap > (uint64_t)(SIZE_MAX / sizeof(float))) {
-            pthread_mutex_unlock(&la->mutex);
+            LA_UNLOCK(la);
             return;
         }
         float *tmp = (float *)realloc(la->samples, (size_t)new_cap * sizeof(float));
         if (!tmp) {
-            pthread_mutex_unlock(&la->mutex);
+            LA_UNLOCK(la);
             return;
         }
         la->samples = tmp;
@@ -422,8 +436,8 @@ static void live_audio_append(qwen_live_audio_t *la, const float *data, int n_ne
     }
     memcpy(la->samples + (size_t)la->n_samples, data, (size_t)n_new * sizeof(float));
     la->n_samples += n_new;
-    pthread_cond_signal(&la->cond);
-    pthread_mutex_unlock(&la->mutex);
+    LA_SIGNAL(la);
+    LA_UNLOCK(la);
 }
 
 /* Convert a chunk of s16le bytes to float samples and append. */
@@ -445,7 +459,11 @@ typedef struct {
     int data_remaining;  /* bytes remaining in WAV data chunk, -1 if raw */
 } live_reader_ctx_t;
 
+#ifdef _WIN32
+static DWORD WINAPI live_reader_thread(LPVOID arg) {
+#else
 static void *live_reader_thread(void *arg) {
+#endif
     live_reader_ctx_t *rctx = (live_reader_ctx_t *)arg;
     qwen_live_audio_t *la = rctx->la;
     int is_wav = rctx->is_wav;
@@ -456,11 +474,15 @@ static void *live_reader_thread(void *arg) {
     const size_t READ_SIZE = 64000;
     uint8_t *buf = (uint8_t *)malloc(READ_SIZE);
     if (!buf) {
-        pthread_mutex_lock(&la->mutex);
+        LA_LOCK(la);
         la->eof = 1;
-        pthread_cond_signal(&la->cond);
-        pthread_mutex_unlock(&la->mutex);
+        LA_SIGNAL(la);
+        LA_UNLOCK(la);
+#ifdef _WIN32
+        return 0;
+#else
         return NULL;
+#endif
     }
 
     while (1) {
@@ -476,11 +498,15 @@ static void *live_reader_thread(void *arg) {
     }
 
     free(buf);
-    pthread_mutex_lock(&la->mutex);
+    LA_LOCK(la);
     la->eof = 1;
-    pthread_cond_signal(&la->cond);
-    pthread_mutex_unlock(&la->mutex);
+    LA_SIGNAL(la);
+    LA_UNLOCK(la);
+#ifdef _WIN32
+    return 0;
+#else
     return NULL;
+#endif
 }
 
 qwen_live_audio_t *qwen_live_audio_start_stdin(void) {
@@ -563,8 +589,13 @@ qwen_live_audio_t *qwen_live_audio_start_stdin(void) {
     /* Allocate live audio context */
     qwen_live_audio_t *la = (qwen_live_audio_t *)calloc(1, sizeof(qwen_live_audio_t));
     if (!la) return NULL;
+#ifdef _WIN32
+    InitializeCriticalSection(&la->mutex);
+    InitializeConditionVariable(&la->cond);
+#else
     pthread_mutex_init(&la->mutex, NULL);
     pthread_cond_init(&la->cond, NULL);
+#endif
 
     /* Convert and append any PCM data already read in the header buffer */
     if (is_wav && pcm_in_header > 0) {
@@ -584,12 +615,22 @@ qwen_live_audio_t *qwen_live_audio_start_stdin(void) {
     rctx->is_wav = is_wav;
     rctx->data_remaining = is_wav ? (data_chunk_size - (int)pcm_in_header) : -1;
 
+#ifdef _WIN32
+    la->thread = CreateThread(NULL, 0, live_reader_thread, rctx, 0, NULL);
+    if (!la->thread) {
+        fprintf(stderr, "qwen_live_audio_start_stdin: failed to create reader thread\n");
+        free(rctx);
+        qwen_live_audio_free(la);
+        return NULL;
+    }
+#else
     if (pthread_create(&la->thread, NULL, live_reader_thread, rctx) != 0) {
         fprintf(stderr, "qwen_live_audio_start_stdin: failed to create reader thread\n");
         free(rctx);
         qwen_live_audio_free(la);
         return NULL;
     }
+#endif
 
     return la;
 }
@@ -597,11 +638,20 @@ qwen_live_audio_t *qwen_live_audio_start_stdin(void) {
 void qwen_live_audio_free(qwen_live_audio_t *la) {
     if (!la) return;
     /* If thread was started, wait for it to finish */
+#ifdef _WIN32
+    if (la->thread) {
+        WaitForSingleObject(la->thread, INFINITE);
+        CloseHandle(la->thread);
+    }
+    DeleteCriticalSection(&la->mutex);
+    /* CONDITION_VARIABLE doesn't need explicit destruction on Windows */
+#else
     if (la->thread) {
         pthread_join(la->thread, NULL);
     }
     pthread_mutex_destroy(&la->mutex);
     pthread_cond_destroy(&la->cond);
+#endif
     free(la->samples);
     free(la);
 }
