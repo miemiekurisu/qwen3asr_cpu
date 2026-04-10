@@ -729,26 +729,28 @@ static void qkv_cvt_worker(int tid, int n_threads, void *arg) {
     if (start >= end) return;
 
     /* Map logical offset in fused buffer to correct source segment */
+    size_t wk_off = t->wq_n;
+    size_t wv_off = t->wq_n + t->wk_n;
     size_t pos = start;
     while (pos < end) {
         const uint16_t *src;
-        size_t seg_start, seg_end;
-        if (pos < t->wq_n) {
+        size_t local_pos, seg_end;
+        if (pos < wk_off) {
             src = t->Wq_bf16;
-            seg_start = 0;
-            seg_end = t->wq_n;
-        } else if (pos < t->wq_n + t->wk_n) {
-            src = t->Wk_bf16 - t->wq_n;  /* offset so src[pos] is correct */
-            seg_start = t->wq_n;
-            seg_end = t->wq_n + t->wk_n;
+            local_pos = pos;
+            seg_end = wk_off;
+        } else if (pos < wv_off) {
+            src = t->Wk_bf16;
+            local_pos = pos - wk_off;
+            seg_end = wv_off;
         } else {
-            src = t->Wv_bf16 - (t->wq_n + t->wk_n);
-            seg_start = t->wq_n + t->wk_n;
+            src = t->Wv_bf16;
+            local_pos = pos - wv_off;
             seg_end = t->w_total;
         }
         size_t run_end = end < seg_end ? end : seg_end;
         size_t run_len = run_end - pos;
-        bf16_to_f32_buf(t->W_fused + pos, src + pos, run_len);
+        bf16_to_f32_buf(t->W_fused + pos, src + local_pos, run_len);
         pos = run_end;
     }
 }
