@@ -32,8 +32,8 @@ extern "C" {
 #include "qwen_asr.h"
 #include "qwen_asr_kernels.h"
 }
-#include "httplib.h"
-#include "json.hpp"
+#include "qasr/base/http_server.h"
+#include "qasr/base/json.h"
 #endif
 
 #include "qasr/runtime/model_bridge.h"
@@ -146,7 +146,7 @@ namespace {
 namespace fs = std::filesystem;
 
 #ifdef QASR_CPU_BACKEND_ENABLED
-using json = nlohmann::ordered_json;
+using Json = qasr::Json;
 #endif
 
 constexpr std::size_t kHttpWorkerQueueLimit = 64;
@@ -183,12 +183,12 @@ Status RequireValue(int argc, const char * const argv[], int index, const char *
 
 std::string JsonErrorBody(const Status & status) {
 #ifdef QASR_CPU_BACKEND_ENABLED
-    json body;
-    body["error"] = {
+    Json body;
+    body["error"] = Json::object({
         {"code", StatusCodeName(status.code())},
         {"message", status.message()},
-    };
-    return body.dump(-1, ' ', false, json::error_handler_t::replace);
+    });
+    return body.dump();
 #else
     return "{\"error\":{\"code\":\"internal\",\"message\":\"cpu backend disabled\"}}";
 #endif
@@ -319,7 +319,7 @@ void CleanupPreparedAudio(PreparedAudioInput * prepared) {
 }
 
 #ifdef QASR_CPU_BACKEND_ENABLED
-const httplib::MultipartFormData * FindUploadedAudio(const httplib::Request & request) {
+const MultipartFormData * FindUploadedAudio(const HttpRequest & request) {
     auto it = request.files.find("file");
     if (it != request.files.end()) {
         return &it->second;
@@ -331,7 +331,7 @@ const httplib::MultipartFormData * FindUploadedAudio(const httplib::Request & re
     return nullptr;
 }
 
-bool TryGetFormField(const httplib::Request & request, const std::string & name, std::string * value) {
+bool TryGetFormField(const HttpRequest & request, const std::string & name, std::string * value) {
     if (value == nullptr) {
         return false;
     }
@@ -350,7 +350,7 @@ bool TryGetFormField(const httplib::Request & request, const std::string & name,
 
 Status PrepareUploadedAudio(
 #ifdef QASR_CPU_BACKEND_ENABLED
-    const httplib::MultipartFormData & file,
+    const MultipartFormData & file,
 #else
     const std::string &,
 #endif
@@ -464,7 +464,7 @@ struct TranscriptionApiOptions {
     bool want_word_timestamps = false;
 };
 
-Status ParseTranscriptionApiOptions(const httplib::Request & request, TranscriptionApiOptions * options) {
+Status ParseTranscriptionApiOptions(const HttpRequest & request, TranscriptionApiOptions * options) {
     if (options == nullptr) {
         return Status(StatusCode::kInvalidArgument, "options output must not be null");
     }
@@ -546,12 +546,12 @@ struct ChatCompletionRequestOptions {
     bool stream = false;
 };
 
-Status ParseChatCompletionRequest(const httplib::Request & request, ChatCompletionRequestOptions * options) {
+Status ParseChatCompletionRequest(const HttpRequest & request, ChatCompletionRequestOptions * options) {
     if (options == nullptr) {
         return Status(StatusCode::kInvalidArgument, "options output must not be null");
     }
 
-    json body = json::parse(request.body, nullptr, false);
+    Json body = Json::parse(request.body);
     if (body.is_discarded()) {
         return Status(StatusCode::kInvalidArgument, "request body must be valid JSON");
     }
@@ -568,7 +568,7 @@ Status ParseChatCompletionRequest(const httplib::Request & request, ChatCompleti
         return Status(StatusCode::kInvalidArgument, "messages must be a non-empty array");
     }
 
-    for (const json & message : body["messages"]) {
+    for (const Json & message : body["messages"]) {
         if (!message.is_object() || message.value("role", std::string()) != "user") {
             continue;
         }
@@ -577,7 +577,7 @@ Status ParseChatCompletionRequest(const httplib::Request & request, ChatCompleti
             continue;
         }
 
-        const json & content = message["content"];
+        const Json & content = message["content"];
         if (content.is_string()) {
             if (!options->prompt.empty()) {
                 options->prompt.push_back(' ');
@@ -590,7 +590,7 @@ Status ParseChatCompletionRequest(const httplib::Request & request, ChatCompleti
             continue;
         }
 
-        for (const json & item : content) {
+        for (const Json & item : content) {
             if (!item.is_object()) {
                 continue;
             }
@@ -745,11 +745,11 @@ private:
     std::mutex mu_;
 };
 
-void SetJsonResponse(httplib::Response & response, const json & body) {
-    response.set_content(body.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
+void SetJsonResponse(HttpResponse & response, const Json & body) {
+    response.set_content(body.dump(), "application/json");
 }
 
-void SetErrorResponse(httplib::Response & response, const Status & status, int http_code) {
+void SetErrorResponse(HttpResponse & response, const Status & status, int http_code) {
     response.status = http_code;
     response.set_content(JsonErrorBody(status), "application/json");
 }
@@ -758,10 +758,10 @@ std::string DetectLanguageLabel(std::string_view requested_language) {
     return requested_language.empty() ? "unknown" : std::string(requested_language);
 }
 
-json BuildBasicTranscriptionJson(
+Json BuildBasicTranscriptionJson(
     const AsrRunResult & result,
     const TranscriptionApiOptions & options) {
-    json body;
+    Json body;
     body["text"] = result.text;
     body["language"] = DetectLanguageLabel(options.language);
     body["inference_ms"] = result.total_ms;
@@ -770,25 +770,25 @@ json BuildBasicTranscriptionJson(
     return body;
 }
 
-json BuildVerboseTranscriptionJson(
+Json BuildVerboseTranscriptionJson(
     const AsrRunResult & result,
     const TranscriptionApiOptions & options) {
-    json body;
+    Json body;
     body["task"] = "transcribe";
     body["language"] = DetectLanguageLabel(options.language);
     body["duration"] = result.audio_ms / 1000.0;
     body["text"] = result.text;
 
-    json segments = json::array();
-    json segment;
+    Json segments = Json::array();
+    Json segment;
     segment["id"] = 0;
     segment["seek"] = 0;
     segment["start"] = 0.0;
     segment["end"] = result.audio_ms / 1000.0;
     segment["text"] = result.text;
-    segment["tokens"] = json::array();
+    segment["tokens"] = Json::array();
     if (options.want_segment_timestamps) {
-        segment["words"] = json::array();
+        segment["words"] = Json::array();
     }
     segments.push_back(segment);
     body["segments"] = segments;
@@ -808,8 +808,8 @@ struct OfflineJob {
     std::int64_t updated_at = 0;
 };
 
-json BuildJobJson(const OfflineJob & job) {
-    json body;
+Json BuildJobJson(const OfflineJob & job) {
+    Json body;
     body["id"] = job.id;
     body["state"] = job.state;
     body["text"] = job.text;
@@ -841,17 +841,15 @@ public:
         cv_.notify_all();
     }
 
-    bool WriteNext(httplib::DataSink & sink) {
+    bool WriteNext(std::string & output) {
         std::unique_lock<std::mutex> lock(mu_);
         cv_.wait(lock, [&]() { return !events_.empty() || finished_; });
         if (!events_.empty()) {
-            std::string next = std::move(events_.front());
+            output = std::move(events_.front());
             events_.pop_front();
-            lock.unlock();
-            return sink.write(next.data(), next.size());
+            return true;
         }
-        sink.done();
-        return true;
+        return false;
     }
 
     void Join() {
@@ -879,16 +877,16 @@ std::string BuildChatChunk(
     std::string_view content,
     bool include_role,
     bool is_final) {
-    json chunk;
+    Json chunk;
     chunk["id"] = id;
     chunk["object"] = "chat.completion.chunk";
     chunk["created"] = CurrentUnixSeconds();
     chunk["model"] = model;
 
-    json choice;
+    Json choice;
     choice["index"] = 0;
-    choice["finish_reason"] = is_final ? json("stop") : json(nullptr);
-    choice["delta"] = json::object();
+    choice["finish_reason"] = is_final ? Json("stop") : Json(nullptr);
+    choice["delta"] = Json::object();
     if (include_role) {
         choice["delta"]["role"] = "assistant";
     }
@@ -896,33 +894,33 @@ std::string BuildChatChunk(
         choice["delta"]["content"] = content;
     }
 
-    chunk["choices"] = json::array({choice});
-    return chunk.dump(-1, ' ', false, json::error_handler_t::replace);
+    chunk["choices"] = Json::array({choice});
+    return chunk.dump();
 }
 
-json BuildChatCompletionResponse(
+Json BuildChatCompletionResponse(
     std::string_view id,
     std::string_view model,
     const AsrRunResult & result) {
-    json response;
+    Json response;
     response["id"] = id;
     response["object"] = "chat.completion";
     response["created"] = CurrentUnixSeconds();
     response["model"] = model;
 
-    json choice;
+    Json choice;
     choice["index"] = 0;
     choice["finish_reason"] = "stop";
-    choice["message"] = {
+    choice["message"] = Json::object({
         {"role", "assistant"},
         {"content", result.text},
-    };
-    response["choices"] = json::array({choice});
-    response["usage"] = {
+    });
+    response["choices"] = Json::array({choice});
+    response["usage"] = Json::object({
         {"prompt_tokens", 0},
         {"completion_tokens", result.text_tokens},
         {"total_tokens", result.text_tokens},
-    };
+    });
     return response;
 }
 
@@ -1131,11 +1129,11 @@ void ApplyRealtimeUpdate(
 }
 
 template <typename SessionLike>
-json BuildRealtimeJson(
+Json BuildRealtimeJson(
     const SessionLike & session,
     bool finalized,
     bool supported) {
-    json body;
+    Json body;
     body["session_id"] = session.id;
     body["sample_count"] = session.total_samples;
     body["retained_sample_count"] = session.samples.size();
@@ -1327,12 +1325,12 @@ int RunServer(const ServerConfig & config) {
     std::mutex host_capture_mu;
 #endif
 
-    httplib::Server server;
-    server.new_task_queue = [] {
+    HttpServer server;
+    {
         const unsigned int hardware_threads = std::thread::hardware_concurrency();
         const std::size_t workers = hardware_threads == 0U ? 4U : static_cast<std::size_t>(hardware_threads);
-        return new httplib::ThreadPool(workers, kHttpWorkerQueueLimit);
-    };
+        server.set_thread_pool_size(workers, kHttpWorkerQueueLimit);
+    }
     server.set_keep_alive_max_count(100);
     server.set_keep_alive_timeout(5);
     server.set_read_timeout(30, 0);
@@ -1340,7 +1338,7 @@ int RunServer(const ServerConfig & config) {
     server.set_idle_interval(1, 0);
     server.set_payload_max_length(64ULL * 1024ULL * 1024ULL);
 
-    server.Get("/", [&](const httplib::Request &, httplib::Response & response) {
+    server.Get("/", [&](const HttpRequest &, HttpResponse & response) {
         const std::string body = LoadTextFile(ui_dir / "index.html");
         if (body.empty()) {
             SetErrorResponse(response, Status(StatusCode::kInternal, "failed to load index.html"), 500);
@@ -1348,7 +1346,7 @@ int RunServer(const ServerConfig & config) {
         }
         response.set_content(body, "text/html; charset=utf-8");
     });
-    server.Get("/app.js", [&](const httplib::Request &, httplib::Response & response) {
+    server.Get("/app.js", [&](const HttpRequest &, HttpResponse & response) {
         const std::string body = LoadTextFile(ui_dir / "app.js");
         if (body.empty()) {
             SetErrorResponse(response, Status(StatusCode::kInternal, "failed to load app.js"), 500);
@@ -1356,7 +1354,7 @@ int RunServer(const ServerConfig & config) {
         }
         response.set_content(body, "application/javascript; charset=utf-8");
     });
-    server.Get("/style.css", [&](const httplib::Request &, httplib::Response & response) {
+    server.Get("/style.css", [&](const HttpRequest &, HttpResponse & response) {
         const std::string body = LoadTextFile(ui_dir / "style.css");
         if (body.empty()) {
             SetErrorResponse(response, Status(StatusCode::kInternal, "failed to load style.css"), 500);
@@ -1365,26 +1363,26 @@ int RunServer(const ServerConfig & config) {
         response.set_content(body, "text/css; charset=utf-8");
     });
 
-    server.Get("/health", [&](const httplib::Request &, httplib::Response & response) {
-        SetJsonResponse(response, json{{"status", "ok"}});
+    server.Get("/health", [&](const HttpRequest &, HttpResponse & response) {
+        SetJsonResponse(response, Json::object({{"status", "ok"}}));
     });
-    server.Get("/api/health", [&](const httplib::Request &, httplib::Response & response) {
-        SetJsonResponse(response, json{{"status", "ok"}});
+    server.Get("/api/health", [&](const HttpRequest &, HttpResponse & response) {
+        SetJsonResponse(response, Json::object({{"status", "ok"}}));
     });
-    server.Get("/v1/models", [&](const httplib::Request &, httplib::Response & response) {
-        json payload;
+    server.Get("/v1/models", [&](const HttpRequest &, HttpResponse & response) {
+        Json payload;
         payload["object"] = "list";
-        payload["data"] = json::array({
-            {
+        payload["data"] = Json::array({
+            Json::object({
                 {"id", served_model_id},
                 {"object", "model"},
                 {"created", 0},
                 {"owned_by", "qwen-asr-provider"},
-            }
+            })
         });
         SetJsonResponse(response, payload);
     });
-    server.Get("/api/metrics", [&](const httplib::Request &, httplib::Response & response) {
+    server.Get("/api/metrics", [&](const HttpRequest &, HttpResponse & response) {
         std::size_t active_realtime_sessions = 0;
         std::size_t queued_jobs = 0;
         bool host_capture_active = false;
@@ -1404,7 +1402,7 @@ int RunServer(const ServerConfig & config) {
 #endif
         const auto uptime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - server_start).count();
-        json payload;
+        Json payload;
         payload["uptime_ms"] = uptime_ms;
         payload["offline_requests"] = metrics.offline_requests.load();
         payload["async_jobs_submitted"] = metrics.async_jobs_submitted.load();
@@ -1419,8 +1417,8 @@ int RunServer(const ServerConfig & config) {
         SetJsonResponse(response, payload);
     });
 
-    server.Post("/api/transcriptions", [&](const httplib::Request & request, httplib::Response & response) {
-        const httplib::MultipartFormData * file = FindUploadedAudio(request);
+    server.Post("/api/transcriptions", [&](const HttpRequest & request, HttpResponse & response) {
+        const MultipartFormData * file = FindUploadedAudio(request);
         if (file == nullptr) {
             SetErrorResponse(response, Status(StatusCode::kInvalidArgument, "multipart field 'audio' or 'file' is required"), 400);
             return;
@@ -1458,12 +1456,12 @@ int RunServer(const ServerConfig & config) {
             return;
         }
 
-        json body = BuildBasicTranscriptionJson(result, options);
+        Json body = BuildBasicTranscriptionJson(result, options);
         SetJsonResponse(response, body);
     });
 
-    server.Post("/api/transcriptions/async", [&](const httplib::Request & request, httplib::Response & response) {
-        const httplib::MultipartFormData * file = FindUploadedAudio(request);
+    server.Post("/api/transcriptions/async", [&](const HttpRequest & request, HttpResponse & response) {
+        const MultipartFormData * file = FindUploadedAudio(request);
         if (file == nullptr) {
             SetErrorResponse(response, Status(StatusCode::kInvalidArgument, "multipart field 'audio' or 'file' is required"), 400);
             return;
@@ -1532,7 +1530,7 @@ int RunServer(const ServerConfig & config) {
         SetJsonResponse(response, BuildJobJson(job));
     });
 
-    server.Get("/api/jobs/:id", [&](const httplib::Request & request, httplib::Response & response) {
+    server.Get("/api/jobs/:id", [&](const HttpRequest & request, HttpResponse & response) {
         const auto path_it = request.path_params.find("id");
         if (path_it == request.path_params.end()) {
             SetErrorResponse(response, Status(StatusCode::kInvalidArgument, "job id is required"), 400);
@@ -1547,8 +1545,8 @@ int RunServer(const ServerConfig & config) {
         SetJsonResponse(response, BuildJobJson(it->second));
     });
 
-    server.Post("/v1/audio/transcriptions", [&](const httplib::Request & request, httplib::Response & response) {
-        const httplib::MultipartFormData * file = FindUploadedAudio(request);
+    server.Post("/v1/audio/transcriptions", [&](const HttpRequest & request, HttpResponse & response) {
+        const MultipartFormData * file = FindUploadedAudio(request);
         if (file == nullptr) {
             SetErrorResponse(response, Status(StatusCode::kInvalidArgument, "multipart field 'file' is required"), 400);
             return;
@@ -1595,12 +1593,12 @@ int RunServer(const ServerConfig & config) {
                 return;
             case TranscriptionResponseFormat::kJson:
             default:
-                SetJsonResponse(response, json{{"text", result.text}});
+                SetJsonResponse(response, Json::object({{"text", result.text}}));
                 return;
         }
     });
 
-    server.Post("/v1/chat/completions", [&](const httplib::Request & request, httplib::Response & response) {
+    server.Post("/v1/chat/completions", [&](const HttpRequest & request, HttpResponse & response) {
         metrics.chat_requests.fetch_add(1);
         ChatCompletionRequestOptions options;
         const Status parse_status = ParseChatCompletionRequest(request, &options);
@@ -1644,7 +1642,7 @@ int RunServer(const ServerConfig & config) {
         response.set_content(sse, "text/event-stream");
     });
 
-    server.Post("/api/realtime/start", [&](const httplib::Request &, httplib::Response & response) {
+    server.Post("/api/realtime/start", [&](const HttpRequest &, HttpResponse & response) {
         RealtimeSession session;
         session.id = std::to_string(session_counter.fetch_add(1));
         metrics.realtime_sessions_started.fetch_add(1);
@@ -1656,7 +1654,7 @@ int RunServer(const ServerConfig & config) {
             }
             realtime_sessions.emplace(session.id, session);
         }
-        SetJsonResponse(response, json{
+        SetJsonResponse(response, Json::object({
             {"session_id", session.id},
             {"supported", true},
             {"decoded", false},
@@ -1667,10 +1665,10 @@ int RunServer(const ServerConfig & config) {
             {"stable_text", ""},
             {"partial_text", ""},
             {"text", ""},
-        });
+        }));
     });
 
-    server.Post("/api/realtime/chunk", [&](const httplib::Request & request, httplib::Response & response) {
+    server.Post("/api/realtime/chunk", [&](const HttpRequest & request, HttpResponse & response) {
         if (!request.has_param("session_id")) {
             SetErrorResponse(response, Status(StatusCode::kInvalidArgument, "session_id is required"), 400);
             return;
@@ -1684,7 +1682,7 @@ int RunServer(const ServerConfig & config) {
 
         std::vector<float> samples;
         std::size_t total_samples = 0;
-        json body;
+        Json body;
         {
             std::lock_guard<std::mutex> lock(realtime_mu);
             auto it = realtime_sessions.find(session_id);
@@ -1741,7 +1739,7 @@ int RunServer(const ServerConfig & config) {
         SetJsonResponse(response, body);
     });
 
-    server.Post("/api/realtime/stop", [&](const httplib::Request & request, httplib::Response & response) {
+    server.Post("/api/realtime/stop", [&](const HttpRequest & request, HttpResponse & response) {
         if (!request.has_param("session_id")) {
             SetErrorResponse(response, Status(StatusCode::kInvalidArgument, "session_id is required"), 400);
             return;
@@ -1793,24 +1791,24 @@ int RunServer(const ServerConfig & config) {
         }
 
         metrics.realtime_finalizations.fetch_add(1);
-        json body = BuildRealtimeJson(session, true, true);
+        Json body = BuildRealtimeJson(session, true, true);
         SetJsonResponse(response, body);
     });
 
 #if defined(__linux__)
-    server.Get("/api/capture/status", [&](const httplib::Request &, httplib::Response & response) {
+    server.Get("/api/capture/status", [&](const HttpRequest &, HttpResponse & response) {
         std::shared_ptr<HostCaptureSession> capture;
         {
             std::lock_guard<std::mutex> lock(host_capture_mu);
             capture = host_capture;
         }
         if (!capture) {
-            SetJsonResponse(response, json{{"active", false}, {"supported", true}});
+            SetJsonResponse(response, Json::object({{"active", false}, {"supported", true}}));
             return;
         }
 
         std::lock_guard<std::mutex> lock(capture->mu);
-        json body = BuildRealtimeJson(*capture, false, true);
+        Json body = BuildRealtimeJson(*capture, false, true);
         body["active"] = capture->active;
         body["capture_id"] = capture->id;
         body["backend"] = capture->backend;
@@ -1819,7 +1817,7 @@ int RunServer(const ServerConfig & config) {
         SetJsonResponse(response, body);
     });
 
-    server.Post("/api/capture/start", [&](const httplib::Request & request, httplib::Response & response) {
+    server.Post("/api/capture/start", [&](const HttpRequest & request, HttpResponse & response) {
         {
             std::lock_guard<std::mutex> lock(host_capture_mu);
             if (host_capture && host_capture->active) {
@@ -1831,7 +1829,7 @@ int RunServer(const ServerConfig & config) {
         std::string backend = "auto";
         std::string device;
         if (!request.body.empty()) {
-            json body = json::parse(request.body, nullptr, false);
+            Json body = Json::parse(request.body);
             if (!body.is_discarded() && body.is_object()) {
                 backend = body.value("backend", backend);
                 device = body.value("device", device);
@@ -1926,7 +1924,7 @@ int RunServer(const ServerConfig & config) {
             host_capture = capture;
         }
 
-        json body;
+        Json body;
         body["capture_id"] = capture->id;
         body["backend"] = capture->backend;
         body["device"] = capture->device;
@@ -1934,7 +1932,7 @@ int RunServer(const ServerConfig & config) {
         SetJsonResponse(response, body);
     });
 
-    server.Post("/api/capture/stop", [&](const httplib::Request &, httplib::Response & response) {
+    server.Post("/api/capture/stop", [&](const HttpRequest &, HttpResponse & response) {
         std::shared_ptr<HostCaptureSession> capture;
         {
             std::lock_guard<std::mutex> lock(host_capture_mu);
@@ -1988,7 +1986,7 @@ int RunServer(const ServerConfig & config) {
 
         metrics.realtime_finalizations.fetch_add(1);
         std::lock_guard<std::mutex> lock(capture->mu);
-        json body = BuildRealtimeJson(*capture, true, true);
+        Json body = BuildRealtimeJson(*capture, true, true);
         body["capture_id"] = capture->id;
         body["backend"] = capture->backend;
         body["device"] = capture->device;
@@ -1996,19 +1994,19 @@ int RunServer(const ServerConfig & config) {
         SetJsonResponse(response, body);
     });
 #else
-    server.Get("/api/capture/status", [&](const httplib::Request &, httplib::Response & response) {
-        SetJsonResponse(response, json{{"active", false}, {"supported", false}});
+    server.Get("/api/capture/status", [&](const HttpRequest &, HttpResponse & response) {
+        SetJsonResponse(response, Json::object({{"active", false}, {"supported", false}}));
     });
-    server.Post("/api/capture/start", [&](const httplib::Request &, httplib::Response & response) {
+    server.Post("/api/capture/start", [&](const HttpRequest &, HttpResponse & response) {
         SetErrorResponse(response, Status(StatusCode::kUnimplemented, "host capture backend is Linux-only"), 501);
     });
-    server.Post("/api/capture/stop", [&](const httplib::Request &, httplib::Response & response) {
+    server.Post("/api/capture/stop", [&](const HttpRequest &, HttpResponse & response) {
         SetErrorResponse(response, Status(StatusCode::kUnimplemented, "host capture backend is Linux-only"), 501);
     });
 #endif
 
     std::fprintf(stderr, "qasr_server listening on %s:%d\n", config.host.c_str(), config.port);
-    const bool ok = server.listen(config.host.c_str(), config.port);
+    const bool ok = server.listen(config.host, config.port);
     if (!ok) {
         std::fprintf(stderr, "qasr_server listen failed on %s:%d\n", config.host.c_str(), config.port);
         return 1;
