@@ -10,6 +10,7 @@
 #include "qwen_asr_safetensors.h"
 #include "qwen_asr_audio.h"
 #include "qwen_asr_tokenizer.h"
+#include "qwen_asr_stream.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1312,6 +1313,8 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     #define QWEN_STREAM_MAX_REPEAT_TOKEN_RUN 12
     #define QWEN_STREAM_OVERLAP_MAX_TOKENS 48
     #define QWEN_STREAM_OVERLAP_MIN_TOKENS 4
+    #define QWEN_STREAM_DUP_SUPPRESS_MAX_TOKENS 96
+    #define QWEN_STREAM_DUP_SUPPRESS_LOOKBACK_TOKENS 256
     #define QWEN_STREAM_DEGEN_MAX_PERIOD 6
     #define QWEN_STREAM_DEGEN_MIN_REPEATS 4
     #define QWEN_STREAM_STALE_CHUNKS 4
@@ -2001,17 +2004,24 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                     }
                 }
 
+                int prev_stable_text_tokens = n_stable_text_tokens;
                 int lcp = 0;
                 while (lcp < n_stable_text_tokens &&
                        lcp < candidate_len &&
                        stable_text_tokens[lcp] == candidate_tokens[lcp]) {
                     lcp++;
                 }
+                int revised_committed_prefix = (lcp < prev_stable_text_tokens);
                 for (int i = lcp; i < candidate_len; i++) {
                     stable_text_tokens[i] = candidate_tokens[i];
                 }
 
-                int emit_start = lcp;
+                /* Streaming output is append-only.  If the decoder revises
+                 * already committed text, do not emit the replacement span:
+                 * without a delete/update protocol that would duplicate text.
+                 */
+                int emit_start = prev_stable_text_tokens;
+                if (emit_start > candidate_len) emit_start = candidate_len;
                 if (emit_start < candidate_len && n_emitted_text_tokens > 0) {
                     int max_overlap = candidate_len - emit_start;
                     if (max_overlap > n_emitted_text_tokens) max_overlap = n_emitted_text_tokens;
@@ -2024,6 +2034,17 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                             emit_start += k;
                             break;
                         }
+                    }
+                    if (revised_committed_prefix) {
+                        emit_start = qwen_stream_skip_recent_duplicate_prefix(
+                            emitted_text_tokens,
+                            n_emitted_text_tokens,
+                            candidate_tokens,
+                            emit_start,
+                            candidate_len,
+                            QWEN_STREAM_OVERLAP_MIN_TOKENS,
+                            QWEN_STREAM_DUP_SUPPRESS_MAX_TOKENS,
+                            QWEN_STREAM_DUP_SUPPRESS_LOOKBACK_TOKENS);
                     }
                 }
 
@@ -2056,7 +2077,9 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                     }
                 }
 
-                n_stable_text_tokens = candidate_len;
+                if (candidate_len > n_stable_text_tokens) {
+                    n_stable_text_tokens = candidate_len;
+                }
 
                 int periodic_reset =
                     (!is_final &&

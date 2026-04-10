@@ -4,7 +4,9 @@ set -euo pipefail
 platform="${1:-linux/arm64}"
 image="${2:-ubuntu:24.04}"
 build_dir="build/docker-${platform//\//-}"
-apt_mirror="${QASR_APT_MIRROR:-http://mirrors.aliyun.com/ubuntu}"
+apt_mirror="${QASR_APT_MIRROR-http://mirrors.aliyun.com/ubuntu}"
+apt_retries="${QASR_APT_RETRIES:-3}"
+apt_timeout="${QASR_APT_TIMEOUT:-20}"
 
 docker run --rm \
   --platform "${platform}" \
@@ -16,7 +18,11 @@ docker run --rm \
       find /etc/apt -type f \\( -name '*.list' -o -name '*.sources' \\) -print0 |
         xargs -0 sed -i -E 's#http://(archive|security).ubuntu.com/ubuntu#${apt_mirror}#g';
     fi &&
-    apt-get -o Acquire::Retries=5 update &&
+    apt-get \
+      -o Acquire::Retries=${apt_retries} \
+      -o Acquire::http::Timeout=${apt_timeout} \
+      -o Acquire::https::Timeout=${apt_timeout} \
+      update &&
     DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake ninja-build pkg-config libopenblas-dev &&
     cmake -S . -B ${build_dir} -G Ninja -DQASR_ENABLE_TESTS=ON &&
     cmake --build ${build_dir} &&

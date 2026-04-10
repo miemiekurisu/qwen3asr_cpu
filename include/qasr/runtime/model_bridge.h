@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include "qasr/core/status.h"
 
@@ -12,9 +13,11 @@ struct AsrRunOptions {
     std::string audio_path;
     std::int32_t threads = 0;
     std::int32_t stream_max_new_tokens = 32;
+    std::int32_t segment_max_codepoints = 48;
     std::int32_t verbosity = 0;
     bool stream = false;
     bool emit_tokens = false;
+    bool emit_segments = false;
     std::string prompt;
     std::string language;
 };
@@ -32,6 +35,7 @@ struct AsrRunResult {
 bool CpuBackendAvailable() noexcept;
 Status ValidateModelDirectory(const std::string & model_dir);
 Status ValidateAsrRunOptions(const AsrRunOptions & options);
+bool ShouldFlushAsrSegment(std::string_view text, std::int32_t max_codepoints) noexcept;
 AsrRunResult RunAsr(const AsrRunOptions & options);
 
 }  // namespace qasr

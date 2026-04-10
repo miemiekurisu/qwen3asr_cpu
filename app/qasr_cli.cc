@@ -25,7 +25,7 @@ int main(int argc, char ** argv) {
 
     if (options.asr.emit_tokens) {
         std::cout << "\n";
-    } else {
+    } else if (!options.asr.emit_segments) {
         std::cout << result.text << "\n";
     }
     std::cout.flush();

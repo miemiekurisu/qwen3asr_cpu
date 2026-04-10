@@ -1,5 +1,6 @@
 #include "qasr/runtime/model_bridge.h"
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -7,6 +8,7 @@
 #include <regex>
 #include <set>
 #include <string>
+#include <string_view>
 
 #ifdef QASR_CPU_BACKEND_ENABLED
 extern "C" {
@@ -30,7 +32,115 @@ std::set<std::string> ExtractIndexedSafetensors(const std::string & json_text) {
     return files;
 }
 
+bool IsUtf8Continuation(unsigned char byte) noexcept {
+    return (byte & 0xC0U) == 0x80U;
+}
+
+std::size_t CountUtf8Codepoints(std::string_view text) noexcept {
+    std::size_t count = 0;
+    for (const char ch : text) {
+        if (!IsUtf8Continuation(static_cast<unsigned char>(ch))) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+bool EndsWith(std::string_view text, std::string_view suffix) noexcept {
+    return text.size() >= suffix.size() && text.substr(text.size() - suffix.size()) == suffix;
+}
+
+bool EndsWithSegmentPunctuation(std::string_view text) noexcept {
+    while (!text.empty()) {
+        const unsigned char byte = static_cast<unsigned char>(text.back());
+        if (!std::isspace(byte)) {
+            break;
+        }
+        text.remove_suffix(1);
+    }
+    if (text.empty()) {
+        return false;
+    }
+    const char last = text.back();
+    if (last == '.' || last == '!' || last == '?' || last == ';' || last == '\n') {
+        return true;
+    }
+    return EndsWith(text, "\xE3\x80\x82") || EndsWith(text, "\xEF\xBC\x81") ||
+        EndsWith(text, "\xEF\xBC\x9F") || EndsWith(text, "\xEF\xBC\x9B");
+}
+
+bool IsPunctuationOnly(std::string_view text) noexcept {
+    return text == "." || text == "!" || text == "?" || text == ";" ||
+        text == "\xE3\x80\x82" || text == "\xEF\xBC\x81" ||
+        text == "\xEF\xBC\x9F" || text == "\xEF\xBC\x9B";
+}
+
+std::string TrimAsciiWhitespace(std::string_view text) {
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
+        text.remove_prefix(1);
+    }
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+        text.remove_suffix(1);
+    }
+    return std::string(text);
+}
+
 #ifdef QASR_CPU_BACKEND_ENABLED
+class SegmentPrinter {
+public:
+    explicit SegmentPrinter(std::int32_t max_codepoints)
+        : max_codepoints_(max_codepoints) {}
+
+    void Append(std::string_view piece) {
+        pending_ += piece;
+        if (ShouldFlushAsrSegment(pending_, max_codepoints_)) {
+            Flush(false);
+        }
+    }
+
+    void Flush(bool force) {
+        if (!force && !ShouldFlushAsrSegment(pending_, max_codepoints_)) {
+            return;
+        }
+        std::string text = TrimAsciiWhitespace(pending_);
+        pending_.clear();
+        if (text.empty()) {
+            if (force) {
+                PrintReady();
+            }
+            return;
+        }
+        if (IsPunctuationOnly(text) && !ready_.empty()) {
+            ready_ += text;
+            if (force) {
+                PrintReady();
+            }
+            return;
+        }
+        PrintReady();
+        ready_ = text;
+        if (force) {
+            PrintReady();
+        }
+    }
+
+private:
+    void PrintReady() {
+        if (ready_.empty()) {
+            return;
+        }
+        ++index_;
+        std::fprintf(stdout, "[%04d] %s\n", index_, ready_.c_str());
+        std::fflush(stdout);
+        ready_.clear();
+    }
+
+    std::string pending_;
+    std::string ready_;
+    std::int32_t max_codepoints_;
+    int index_ = 0;
+};
+
 void WriteTokenToStdout(const char * piece, void * userdata) {
     (void)userdata;
     if (piece == nullptr) {
@@ -38,6 +148,14 @@ void WriteTokenToStdout(const char * piece, void * userdata) {
     }
     std::fputs(piece, stdout);
     std::fflush(stdout);
+}
+
+void WriteSegmentPieceToStdout(const char * piece, void * userdata) {
+    if (piece == nullptr || userdata == nullptr) {
+        return;
+    }
+    auto * printer = static_cast<SegmentPrinter *>(userdata);
+    printer->Append(piece);
 }
 #endif
 
@@ -127,10 +245,26 @@ Status ValidateAsrRunOptions(const AsrRunOptions & options) {
     if (options.stream_max_new_tokens <= 0) {
         return Status(StatusCode::kInvalidArgument, "stream_max_new_tokens must be > 0");
     }
+    if (options.segment_max_codepoints <= 0) {
+        return Status(StatusCode::kInvalidArgument, "segment_max_codepoints must be > 0");
+    }
     if (options.verbosity < 0) {
         return Status(StatusCode::kInvalidArgument, "verbosity must be >= 0");
     }
+    if (options.emit_tokens && options.emit_segments) {
+        return Status(StatusCode::kInvalidArgument, "emit_tokens and emit_segments are mutually exclusive");
+    }
     return OkStatus();
+}
+
+bool ShouldFlushAsrSegment(std::string_view text, std::int32_t max_codepoints) noexcept {
+    if (text.empty() || max_codepoints <= 0) {
+        return false;
+    }
+    if (EndsWithSegmentPunctuation(text)) {
+        return true;
+    }
+    return CountUtf8Codepoints(text) >= static_cast<std::size_t>(max_codepoints);
 }
 
 AsrRunResult RunAsr(const AsrRunOptions & options) {
@@ -169,7 +303,12 @@ AsrRunResult RunAsr(const AsrRunOptions & options) {
         return result;
     }
 
-    qwen_set_token_callback(ctx, options.emit_tokens ? WriteTokenToStdout : nullptr, nullptr);
+    SegmentPrinter segment_printer(options.segment_max_codepoints);
+    if (options.emit_segments) {
+        qwen_set_token_callback(ctx, WriteSegmentPieceToStdout, &segment_printer);
+    } else {
+        qwen_set_token_callback(ctx, options.emit_tokens ? WriteTokenToStdout : nullptr, nullptr);
+    }
 
     char * raw_text = nullptr;
     if (options.stream) {
@@ -190,6 +329,9 @@ AsrRunResult RunAsr(const AsrRunOptions & options) {
         qwen_free(ctx);
         result.status = Status(StatusCode::kInternal, "transcription failed");
         return result;
+    }
+    if (options.emit_segments) {
+        segment_printer.Flush(true);
     }
 
     result.text = raw_text;

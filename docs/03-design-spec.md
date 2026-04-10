@@ -82,7 +82,20 @@
 | `CpuBackendAvailable` | 判当前平台能否启 CPU 后端 |
 | `ValidateModelDirectory` | 校模型目录与分片齐备性 |
 | `ValidateAsrRunOptions` | 校推理入参 |
+| `ShouldFlushAsrSegment` | CLI 分段输出刷新判定 |
 | `RunAsr` | 调 CPU 后端，完成离线/流式转写 |
+
+CLI 长音频输出：
+
+- `--emit-tokens`：逐 token 输出。
+- `--emit-segments`：按标点或长度聚合输出。
+- `--segment-max-codepoints <n>`：无标点时强制分段阈值，默认 `48`。
+
+### `src/backend/qwen_cpu/qwen_asr_stream.h`
+
+| 实体 | 职责 |
+|---|---|
+| `qwen_stream_skip_recent_duplicate_prefix` | 流式 append-only 输出前，跳过近邻已提交 token span |
 
 ### `qasr/cli/options.h`
 
@@ -331,13 +344,14 @@
 | 项 | 规则 |
 |---|---|
 | `partial` | 本轮全文减去已稳定前缀 |
-| `stable` | 连续两轮公共前缀，且扣去 rollback guard |
+| `stable` | 只向前增长；已提交前缀内的模型修正不再外发 |
 | `final` | stop / flush / align 完成后 |
 
 ### 失败保护
 
 - 未决尾巴超过 `12~15s`，强制冻结一段。
 - 连续多轮空转或重复尾巴，触发 `ReanchorContext`。
+- 每次外发前扫描近邻已提交 token，若候选前缀已出现，则跳过，防 rollback/reanchor 重放旧句。
 - 若 session 堆积，则先降刷新率，再拒绝新会话。
 
 ### 时间戳律

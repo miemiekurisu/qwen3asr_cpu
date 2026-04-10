@@ -98,6 +98,19 @@ Status ParseCliArguments(int argc, const char * const argv[], CliOptions * optio
             ++index;
             continue;
         }
+        if (arg == "--segment-max-codepoints") {
+            const char * value = nullptr;
+            Status status = RequireValue(argc, argv, index, "--segment-max-codepoints", &value);
+            if (!status.ok()) {
+                return status;
+            }
+            status = ParseInt32Option(value, "segment_max_codepoints", &options->asr.segment_max_codepoints);
+            if (!status.ok()) {
+                return status;
+            }
+            ++index;
+            continue;
+        }
         if (arg == "--verbosity") {
             const char * value = nullptr;
             Status status = RequireValue(argc, argv, index, "--verbosity", &value);
@@ -139,6 +152,10 @@ Status ParseCliArguments(int argc, const char * const argv[], CliOptions * optio
             options->asr.emit_tokens = true;
             continue;
         }
+        if (arg == "--emit-segments") {
+            options->asr.emit_segments = true;
+            continue;
+        }
         return Status(StatusCode::kInvalidArgument, "unknown argument: " + std::string(arg));
     }
 
@@ -161,6 +178,8 @@ std::string BuildCliUsage(std::string_view program_name) {
     usage += "  --threads <n>\n";
     usage += "  --stream\n";
     usage += "  --stream-max-new-tokens <n>\n";
+    usage += "  --emit-segments\n";
+    usage += "  --segment-max-codepoints <n>\n";
     usage += "  --prompt <text>\n";
     usage += "  --language <lang>\n";
     usage += "  --verbosity <n>\n";

@@ -15,7 +15,7 @@ if(WIN32)
 else()
     set(QASR_DEFAULT_CPU_BACKEND ON)
 endif()
-option(QASR_ENABLE_CPU_BACKEND "Build the vendored CPU inference backend" ${QASR_DEFAULT_CPU_BACKEND})
+option(QASR_ENABLE_CPU_BACKEND "Build the internal CPU inference backend" ${QASR_DEFAULT_CPU_BACKEND})
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -56,19 +56,20 @@ if(QASR_ENABLE_CPU_BACKEND AND NOT WIN32)
     find_package(Threads REQUIRED)
 
     add_library(qasr_cpu_c STATIC
-        vendor/qasr_cpu/qwen_asr.c
-        vendor/qasr_cpu/qwen_asr_audio.c
-        vendor/qasr_cpu/qwen_asr_decoder.c
-        vendor/qasr_cpu/qwen_asr_encoder.c
-        vendor/qasr_cpu/qwen_asr_kernels.c
-        vendor/qasr_cpu/qwen_asr_kernels_generic.c
-        vendor/qasr_cpu/qwen_asr_kernels_neon.c
-        vendor/qasr_cpu/qwen_asr_kernels_avx.c
-        vendor/qasr_cpu/qwen_asr_safetensors.c
-        vendor/qasr_cpu/qwen_asr_tokenizer.c
+        src/backend/qwen_cpu/qwen_asr.c
+        src/backend/qwen_cpu/qwen_asr_stream.h
+        src/backend/qwen_cpu/qwen_asr_audio.c
+        src/backend/qwen_cpu/qwen_asr_decoder.c
+        src/backend/qwen_cpu/qwen_asr_encoder.c
+        src/backend/qwen_cpu/qwen_asr_kernels.c
+        src/backend/qwen_cpu/qwen_asr_kernels_generic.c
+        src/backend/qwen_cpu/qwen_asr_kernels_neon.c
+        src/backend/qwen_cpu/qwen_asr_kernels_avx.c
+        src/backend/qwen_cpu/qwen_asr_safetensors.c
+        src/backend/qwen_cpu/qwen_asr_tokenizer.c
     )
 
-    target_include_directories(qasr_cpu_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/vendor/qasr_cpu)
+    target_include_directories(qasr_cpu_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/qwen_cpu)
     target_compile_features(qasr_cpu_c PUBLIC c_std_11)
 
     if(MSVC)
@@ -84,7 +85,7 @@ if(QASR_ENABLE_CPU_BACKEND AND NOT WIN32)
     endif()
 
     target_compile_definitions(qasr_core PUBLIC QASR_CPU_BACKEND_ENABLED=1)
-    target_include_directories(qasr_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/qasr_cpu)
+    target_include_directories(qasr_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/qwen_cpu)
     target_link_libraries(qasr_cpu_c PUBLIC Threads::Threads)
     if(UNIX AND NOT APPLE)
         target_link_libraries(qasr_cpu_c PUBLIC m)

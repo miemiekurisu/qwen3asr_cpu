@@ -34,7 +34,8 @@ QASR_TEST(ParseCliArgumentsAcceptsMinimalInvocation) {
         "--stream-max-new-tokens", "16",
         "--verbosity", "1",
         "--stream",
-        "--emit-tokens",
+        "--emit-segments",
+        "--segment-max-codepoints", "24",
     };
 
     qasr::CliOptions options;
@@ -43,8 +44,9 @@ QASR_TEST(ParseCliArgumentsAcceptsMinimalInvocation) {
     QASR_EXPECT_EQ(options.asr.threads, 2);
     QASR_EXPECT_EQ(options.asr.stream_max_new_tokens, 16);
     QASR_EXPECT_EQ(options.asr.verbosity, 1);
+    QASR_EXPECT_EQ(options.asr.segment_max_codepoints, 24);
     QASR_EXPECT(options.asr.stream);
-    QASR_EXPECT(options.asr.emit_tokens);
+    QASR_EXPECT(options.asr.emit_segments);
 }
 
 QASR_TEST(ParseCliArgumentsRejectsUnknownFlags) {
@@ -65,4 +67,5 @@ QASR_TEST(BuildCliUsageMentionsRequiredFlags) {
     const std::string usage = qasr::BuildCliUsage("qasr_cli");
     QASR_EXPECT(usage.find("--model-dir") != std::string::npos);
     QASR_EXPECT(usage.find("--audio") != std::string::npos);
+    QASR_EXPECT(usage.find("--emit-segments") != std::string::npos);
 }
