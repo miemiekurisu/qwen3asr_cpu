@@ -21,9 +21,25 @@
       "description": "macOS / Apple Accelerate"
     },
     {
+      "name": "macos-accelerate-asan",
+      "inherits": "macos-accelerate",
+      "description": "macOS / Apple Accelerate with ASan/UBSan",
+      "cacheVariables": {
+        "QASR_ENABLE_ASAN": "ON"
+      }
+    },
+    {
       "name": "linux-openblas",
       "inherits": "base",
       "description": "Linux / OpenBLAS"
+    },
+    {
+      "name": "linux-openblas-asan",
+      "inherits": "linux-openblas",
+      "description": "Linux / OpenBLAS with ASan/UBSan",
+      "cacheVariables": {
+        "QASR_ENABLE_ASAN": "ON"
+      }
     },
     {
       "name": "windows-openblas",
@@ -37,8 +53,16 @@
       "configurePreset": "macos-accelerate"
     },
     {
+      "name": "macos-accelerate-asan",
+      "configurePreset": "macos-accelerate-asan"
+    },
+    {
       "name": "linux-openblas",
       "configurePreset": "linux-openblas"
+    },
+    {
+      "name": "linux-openblas-asan",
+      "configurePreset": "linux-openblas-asan"
     },
     {
       "name": "windows-openblas",
@@ -54,8 +78,22 @@
       }
     },
     {
+      "name": "macos-accelerate-asan",
+      "configurePreset": "macos-accelerate-asan",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
       "name": "linux-openblas",
       "configurePreset": "linux-openblas",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-openblas-asan",
+      "configurePreset": "linux-openblas-asan",
       "output": {
         "outputOnFailure": true
       }

@@ -104,3 +104,15 @@ QASR_TEST(ResolveServedModelIdNormalizesModelScopeName) {
         qasr::ResolveServedModelId("/tmp/Qwen3-ASR-1___7B"),
         std::string("Qwen/Qwen3-ASR-1.7B"));
 }
+
+QASR_TEST(BuildServerUsageIncludesProgramName) {
+    const std::string usage = qasr::BuildServerUsage("qasr_server");
+    QASR_EXPECT(usage.find("qasr_server") != std::string::npos);
+    QASR_EXPECT(usage.find("--model-dir") != std::string::npos);
+}
+
+QASR_TEST(RunServerRejectsMissingModelDir) {
+    qasr::ServerConfig config;
+    config.port = 8080;
+    QASR_EXPECT_EQ(qasr::RunServer(config), 1);
+}
