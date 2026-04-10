@@ -1,6 +1,7 @@
 build/
 qwen-asr-learn/
 whisper.cpp/
+Qwen3-ASR-*/
 .DS_Store
 *.log
 *.tmp
