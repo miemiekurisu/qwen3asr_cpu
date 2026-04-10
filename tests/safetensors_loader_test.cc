@@ -2,13 +2,14 @@
 #include "qasr/storage/safetensors_loader.h"
 
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <string>
 
 namespace {
 
 std::string CreateTempFile(const std::string & name, const void * data, std::size_t size) {
-    const std::string path = "/tmp/qasr_test_" + name;
+    const std::string path = (std::filesystem::temp_directory_path() / ("qasr_test_" + name)).string();
     std::ofstream out(path, std::ios::binary);
     out.write(static_cast<const char *>(data), static_cast<std::streamsize>(size));
     return path;
@@ -57,7 +58,8 @@ QASR_TEST(TensorElementCountMultiDim) {
 
 QASR_TEST(MappedFileOpenNonexistent) {
     qasr::MappedFile file;
-    qasr::Status s = qasr::MappedFile::Open("/tmp/qasr_does_not_exist_12345", &file);
+    const std::string nonexistent = (std::filesystem::temp_directory_path() / "qasr_does_not_exist_12345").string();
+    qasr::Status s = qasr::MappedFile::Open(nonexistent, &file);
     QASR_EXPECT(!s.ok());
     QASR_EXPECT(!file.is_open());
 }

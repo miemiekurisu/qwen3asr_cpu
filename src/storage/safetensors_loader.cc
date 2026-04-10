@@ -7,11 +7,16 @@
 #include <regex>
 #include <set>
 
-#ifndef _WIN32
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#else
+#  include <fcntl.h>
+#  include <sys/mman.h>
+#  include <sys/stat.h>
+#  include <unistd.h>
 #endif
 
 namespace qasr {
@@ -23,13 +28,18 @@ MappedFile::~MappedFile() { Close(); }
 
 MappedFile::MappedFile(MappedFile && other) noexcept
     : data_(other.data_), size_(other.size_)
-#ifndef _WIN32
+#ifdef _WIN32
+    , file_handle_(other.file_handle_), mapping_handle_(other.mapping_handle_)
+#else
     , fd_(other.fd_)
 #endif
 {
     other.data_ = nullptr;
     other.size_ = 0;
-#ifndef _WIN32
+#ifdef _WIN32
+    other.file_handle_ = nullptr;
+    other.mapping_handle_ = nullptr;
+#else
     other.fd_ = -1;
 #endif
 }
@@ -39,7 +49,12 @@ MappedFile & MappedFile::operator=(MappedFile && other) noexcept {
         Close();
         data_ = other.data_;
         size_ = other.size_;
-#ifndef _WIN32
+#ifdef _WIN32
+        file_handle_ = other.file_handle_;
+        mapping_handle_ = other.mapping_handle_;
+        other.file_handle_ = nullptr;
+        other.mapping_handle_ = nullptr;
+#else
         fd_ = other.fd_;
         other.fd_ = -1;
 #endif
@@ -50,7 +65,20 @@ MappedFile & MappedFile::operator=(MappedFile && other) noexcept {
 }
 
 void MappedFile::Close() noexcept {
-#ifndef _WIN32
+#ifdef _WIN32
+    if (data_ != nullptr) {
+        UnmapViewOfFile(data_);
+        data_ = nullptr;
+    }
+    if (mapping_handle_ != nullptr) {
+        CloseHandle(mapping_handle_);
+        mapping_handle_ = nullptr;
+    }
+    if (file_handle_ != nullptr && file_handle_ != INVALID_HANDLE_VALUE) {
+        CloseHandle(file_handle_);
+        file_handle_ = nullptr;
+    }
+#else
     if (data_ != nullptr) {
         munmap(data_, size_);
         data_ = nullptr;
@@ -68,7 +96,40 @@ Status MappedFile::Open(const std::string & path, MappedFile * out) {
         return Status(StatusCode::kInvalidArgument, "out must not be null");
     }
     out->Close();
-#ifndef _WIN32
+#ifdef _WIN32
+    HANDLE file_handle = CreateFileA(
+        path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file_handle == INVALID_HANDLE_VALUE) {
+        return Status(StatusCode::kNotFound, "failed to open file: " + path);
+    }
+    LARGE_INTEGER file_size_li;
+    if (!GetFileSizeEx(file_handle, &file_size_li)) {
+        CloseHandle(file_handle);
+        return Status(StatusCode::kInternal, "GetFileSizeEx failed: " + path);
+    }
+    const std::size_t file_size = static_cast<std::size_t>(file_size_li.QuadPart);
+    if (file_size == 0) {
+        CloseHandle(file_handle);
+        return Status(StatusCode::kInvalidArgument, "file is empty: " + path);
+    }
+    HANDLE mapping_handle = CreateFileMappingA(file_handle, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (mapping_handle == nullptr) {
+        CloseHandle(file_handle);
+        return Status(StatusCode::kInternal, "CreateFileMapping failed: " + path);
+    }
+    void * mapped = MapViewOfFile(mapping_handle, FILE_MAP_READ, 0, 0, 0);
+    if (mapped == nullptr) {
+        CloseHandle(mapping_handle);
+        CloseHandle(file_handle);
+        return Status(StatusCode::kInternal, "MapViewOfFile failed: " + path);
+    }
+    out->data_ = mapped;
+    out->size_ = file_size;
+    out->file_handle_ = file_handle;
+    out->mapping_handle_ = mapping_handle;
+    return OkStatus();
+#else
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         return Status(StatusCode::kNotFound, "failed to open file: " + path);
@@ -92,8 +153,6 @@ Status MappedFile::Open(const std::string & path, MappedFile * out) {
     out->size_ = file_size;
     out->fd_ = fd;
     return OkStatus();
-#else
-    return Status(StatusCode::kUnimplemented, "MappedFile not implemented on Windows");
 #endif
 }
 

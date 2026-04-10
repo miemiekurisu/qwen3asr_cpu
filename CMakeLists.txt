@@ -51,7 +51,7 @@ target_include_directories(qasr_core
 )
 
 if(MSVC)
-    target_compile_options(qasr_core PRIVATE /W4 /permissive-)
+    target_compile_options(qasr_core PRIVATE /W4 /permissive- /utf-8)
 else()
     target_compile_options(qasr_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 endif()
@@ -59,6 +59,10 @@ endif()
 if(QASR_ENABLE_ASAN AND NOT MSVC)
     target_compile_options(qasr_core PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_link_options(qasr_core PRIVATE -fsanitize=address,undefined)
+endif()
+
+if(WIN32)
+    target_link_libraries(qasr_core PUBLIC ws2_32)
 endif()
 
 include(QasrBlas)
@@ -114,7 +118,7 @@ target_link_libraries(qasr_cli PRIVATE qasr_core)
 target_include_directories(qasr_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 if(MSVC)
-    target_compile_options(qasr_cli PRIVATE /W4 /permissive-)
+    target_compile_options(qasr_cli PRIVATE /W4 /permissive- /utf-8)
 else()
     target_compile_options(qasr_cli PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 endif()
@@ -124,7 +128,7 @@ if(QASR_ENABLE_ASAN AND NOT MSVC)
     target_link_options(qasr_cli PRIVATE -fsanitize=address,undefined)
 endif()
 
-if(QASR_ENABLE_CPU_BACKEND AND NOT WIN32)
+if(QASR_ENABLE_CPU_BACKEND OR WIN32)
     add_executable(qasr_server
         app/qasr_server.cc
         src/service/server.cc
@@ -135,7 +139,7 @@ if(QASR_ENABLE_CPU_BACKEND AND NOT WIN32)
     )
 
     if(MSVC)
-        target_compile_options(qasr_server PRIVATE /W4 /permissive-)
+        target_compile_options(qasr_server PRIVATE /W4 /permissive- /utf-8)
     else()
         target_compile_options(qasr_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
@@ -186,7 +190,7 @@ if(QASR_ENABLE_TESTS)
     )
 
     if(MSVC)
-        target_compile_options(qasr_unit_tests PRIVATE /W4 /permissive-)
+        target_compile_options(qasr_unit_tests PRIVATE /W4 /permissive- /utf-8)
     else()
         target_compile_options(qasr_unit_tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()

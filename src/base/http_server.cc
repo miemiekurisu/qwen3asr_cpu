@@ -12,12 +12,46 @@
 #include <thread>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  pragma comment(lib, "ws2_32.lib")
+   using ssize_t = int;
+   using socklen_t_alias = int;
+#  define QASR_SHUT_RDWR SD_BOTH
+#  ifndef MSG_NOSIGNAL
+#    define MSG_NOSIGNAL 0
+#  endif
+#  ifndef POLLIN
+#    define POLLIN 0x0001
+#  endif
+   using qasr_socket_t = SOCKET;
+   static constexpr qasr_socket_t kInvalidSocket = INVALID_SOCKET;
+   inline int qasr_poll(WSAPOLLFD * fds, unsigned long nfds, int timeout) { return WSAPoll(fds, nfds, timeout); }
+   inline int qasr_close_socket(qasr_socket_t s) { return closesocket(s); }
+   inline int qasr_last_error() { return WSAGetLastError(); }
+   inline bool qasr_error_interrupted() { return WSAGetLastError() == WSAEINTR; }
+#else
+#  include <arpa/inet.h>
+#  include <netinet/in.h>
+#  include <netinet/tcp.h>
+#  include <poll.h>
+#  include <sys/socket.h>
+#  include <unistd.h>
+#  ifndef MSG_NOSIGNAL
+#    define MSG_NOSIGNAL 0
+#  endif
+#  define QASR_SHUT_RDWR SHUT_RDWR
+   using qasr_socket_t = int;
+   static constexpr qasr_socket_t kInvalidSocket = -1;
+   inline int qasr_poll(struct pollfd * fds, nfds_t nfds, int timeout) { return poll(fds, nfds, timeout); }
+   inline int qasr_close_socket(qasr_socket_t s) { return close(s); }
+   inline int qasr_last_error() { return errno; }
+   inline bool qasr_error_interrupted() { return errno == EINTR; }
+#endif
 
 namespace qasr {
 
@@ -115,13 +149,19 @@ std::string ToLower(std::string_view sv) {
     return result;
 }
 
-bool ReadLine(int fd, std::string & line, int timeout_ms) {
+bool ReadLine(qasr_socket_t fd, std::string & line, int timeout_ms) {
     line.clear();
     while (true) {
+#ifdef _WIN32
+        WSAPOLLFD pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+#else
         struct pollfd pfd{};
         pfd.fd = fd;
         pfd.events = POLLIN;
-        const int ret = poll(&pfd, 1, timeout_ms);
+#endif
+        const int ret = qasr_poll(&pfd, 1, timeout_ms);
         if (ret <= 0) return false;
         char ch = 0;
         const ssize_t n = recv(fd, &ch, 1, 0);
@@ -135,35 +175,37 @@ bool ReadLine(int fd, std::string & line, int timeout_ms) {
     }
 }
 
-bool ReadExact(int fd, std::string & buffer, std::size_t count, int timeout_ms) {
+bool ReadExact(qasr_socket_t fd, std::string & buffer, std::size_t count, int timeout_ms) {
     buffer.resize(count);
     std::size_t total = 0;
     while (total < count) {
+#ifdef _WIN32
+        WSAPOLLFD pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+#else
         struct pollfd pfd{};
         pfd.fd = fd;
         pfd.events = POLLIN;
-        const int ret = poll(&pfd, 1, timeout_ms);
+#endif
+        const int ret = qasr_poll(&pfd, 1, timeout_ms);
         if (ret <= 0) return false;
-        const ssize_t n = recv(fd, &buffer[total], count - total, 0);
+        const ssize_t n = recv(fd, &buffer[total], static_cast<int>(count - total), 0);
         if (n <= 0) return false;
         total += static_cast<std::size_t>(n);
     }
     return true;
 }
 
-bool SendAll(int fd, const std::string & data) {
+bool SendAll(qasr_socket_t fd, const std::string & data) {
     std::size_t total = 0;
     while (total < data.size()) {
-        const ssize_t n = send(fd, data.data() + total, data.size() - total, MSG_NOSIGNAL);
+        const ssize_t n = send(fd, data.data() + total, static_cast<int>(data.size() - total), MSG_NOSIGNAL);
         if (n <= 0) return false;
         total += static_cast<std::size_t>(n);
     }
     return true;
 }
-
-#ifndef MSG_NOSIGNAL
-#define MSG_NOSIGNAL 0
-#endif
 
 struct Route {
     std::string method;
@@ -275,7 +317,7 @@ struct HttpServer::Impl {
     int idle_interval_ms = 1000;
     std::size_t payload_max_length = 64ULL * 1024ULL * 1024ULL;
     std::atomic<bool> running{false};
-    int listen_fd = -1;
+    qasr_socket_t listen_fd = kInvalidSocket;
 
     bool MatchAndDispatch(const HttpRequest & req_in, HttpResponse & resp) {
         for (const auto & route : routes) {
@@ -291,7 +333,7 @@ struct HttpServer::Impl {
         return false;
     }
 
-    bool ParseRequest(int fd, HttpRequest & request) {
+    bool ParseRequest(qasr_socket_t fd, HttpRequest & request) {
         std::string request_line;
         if (!ReadLine(fd, request_line, read_timeout_ms)) return false;
 
@@ -351,7 +393,7 @@ struct HttpServer::Impl {
         return true;
     }
 
-    void HandleConnection(int client_fd) {
+    void HandleConnection(qasr_socket_t client_fd) {
         int requests_handled = 0;
         while (running.load() && requests_handled < keep_alive_max_count) {
             HttpRequest request;
@@ -391,7 +433,7 @@ struct HttpServer::Impl {
             ++requests_handled;
             if (!keep_alive) break;
         }
-        close(client_fd);
+        qasr_close_socket(client_fd);
     }
 };
 
@@ -435,27 +477,51 @@ void HttpServer::set_payload_max_length(std::size_t length) {
 }
 
 bool HttpServer::listen(const std::string & host, int port) {
-    const int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return false;
+#ifdef _WIN32
+    WSADATA wsa_data;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) return false;
+#endif
 
+    const qasr_socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == kInvalidSocket) {
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return false;
+    }
+
+#ifdef _WIN32
+    const char opt_val = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt_val, sizeof(opt_val));
+#else
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(static_cast<std::uint16_t>(port));
     if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
-        close(fd);
+        qasr_close_socket(fd);
+#ifdef _WIN32
+        WSACleanup();
+#endif
         return false;
     }
 
     if (::bind(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0) {
-        close(fd);
+        qasr_close_socket(fd);
+#ifdef _WIN32
+        WSACleanup();
+#endif
         return false;
     }
 
     if (::listen(fd, 128) < 0) {
-        close(fd);
+        qasr_close_socket(fd);
+#ifdef _WIN32
+        WSACleanup();
+#endif
         return false;
     }
 
@@ -465,22 +531,36 @@ bool HttpServer::listen(const std::string & host, int port) {
     ThreadPool pool(impl_->thread_pool_workers, impl_->thread_pool_queue_limit);
 
     while (impl_->running.load()) {
+#ifdef _WIN32
+        WSAPOLLFD pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+#else
         struct pollfd pfd{};
         pfd.fd = fd;
         pfd.events = POLLIN;
-        const int ret = poll(&pfd, 1, impl_->idle_interval_ms);
+#endif
+        const int ret = qasr_poll(&pfd, 1, impl_->idle_interval_ms);
         if (ret < 0) {
-            if (errno == EINTR) continue;
+            if (qasr_error_interrupted()) continue;
             break;
         }
         if (ret == 0) continue;
 
         struct sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
-        const int client_fd = accept(fd, reinterpret_cast<struct sockaddr *>(&client_addr), &client_len);
-        if (client_fd < 0) continue;
+        const qasr_socket_t client_fd = accept(fd, reinterpret_cast<struct sockaddr *>(&client_addr), &client_len);
+        if (client_fd == kInvalidSocket) continue;
 
         // Set timeouts on client socket
+#ifdef _WIN32
+        DWORD tv_recv = static_cast<DWORD>(impl_->read_timeout_ms);
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&tv_recv), sizeof(tv_recv));
+        DWORD tv_send = static_cast<DWORD>(impl_->write_timeout_ms);
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char *>(&tv_send), sizeof(tv_send));
+        const char nodelay = 1;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+#else
         struct timeval tv{};
         tv.tv_sec = impl_->read_timeout_ms / 1000;
         tv.tv_usec = (impl_->read_timeout_ms % 1000) * 1000;
@@ -488,31 +568,34 @@ bool HttpServer::listen(const std::string & host, int port) {
         tv.tv_sec = impl_->write_timeout_ms / 1000;
         tv.tv_usec = (impl_->write_timeout_ms % 1000) * 1000;
         setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
         int nodelay = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+#endif
 
         auto * impl = impl_.get();
         if (!pool.Submit([impl, client_fd]() { impl->HandleConnection(client_fd); })) {
             // Queue full — reject with 503
             const std::string reject =
                 "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            send(client_fd, reject.data(), reject.size(), MSG_NOSIGNAL);
-            close(client_fd);
+            send(client_fd, reject.data(), static_cast<int>(reject.size()), MSG_NOSIGNAL);
+            qasr_close_socket(client_fd);
         }
     }
 
-    close(fd);
-    impl_->listen_fd = -1;
+    qasr_close_socket(fd);
+    impl_->listen_fd = kInvalidSocket;
+#ifdef _WIN32
+    WSACleanup();
+#endif
     return true;
 }
 
 void HttpServer::stop() {
     impl_->running.store(false);
-    if (impl_->listen_fd >= 0) {
-        shutdown(impl_->listen_fd, SHUT_RDWR);
-        close(impl_->listen_fd);
-        impl_->listen_fd = -1;
+    if (impl_->listen_fd != kInvalidSocket) {
+        shutdown(impl_->listen_fd, QASR_SHUT_RDWR);
+        qasr_close_socket(impl_->listen_fd);
+        impl_->listen_fd = kInvalidSocket;
     }
 }
 

@@ -1192,6 +1192,8 @@ Json BuildRealtimeJson(
 }
 
 }  // namespace
+#else
+}  // namespace
 #endif
 
 Status ValidateServerConfig(const ServerConfig & config) {
