@@ -68,4 +68,5 @@ QASR_TEST(BuildCliUsageMentionsRequiredFlags) {
     QASR_EXPECT(usage.find("--model-dir") != std::string::npos);
     QASR_EXPECT(usage.find("--audio") != std::string::npos);
     QASR_EXPECT(usage.find("--emit-segments") != std::string::npos);
+    QASR_EXPECT(usage.find("max 128") != std::string::npos);
 }

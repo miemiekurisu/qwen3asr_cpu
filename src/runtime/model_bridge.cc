@@ -245,6 +245,11 @@ Status ValidateAsrRunOptions(const AsrRunOptions & options) {
     if (options.stream_max_new_tokens <= 0) {
         return Status(StatusCode::kInvalidArgument, "stream_max_new_tokens must be > 0");
     }
+    if (options.stream_max_new_tokens > kMaxStreamMaxNewTokens) {
+        return Status(
+            StatusCode::kInvalidArgument,
+            "stream_max_new_tokens must be <= " + std::to_string(kMaxStreamMaxNewTokens));
+    }
     if (options.segment_max_codepoints <= 0) {
         return Status(StatusCode::kInvalidArgument, "segment_max_codepoints must be > 0");
     }

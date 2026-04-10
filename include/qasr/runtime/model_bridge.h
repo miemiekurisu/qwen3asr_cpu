@@ -8,11 +8,14 @@
 
 namespace qasr {
 
+inline constexpr std::int32_t kDefaultStreamMaxNewTokens = 32;
+inline constexpr std::int32_t kMaxStreamMaxNewTokens = 128;
+
 struct AsrRunOptions {
     std::string model_dir;
     std::string audio_path;
     std::int32_t threads = 0;
-    std::int32_t stream_max_new_tokens = 32;
+    std::int32_t stream_max_new_tokens = kDefaultStreamMaxNewTokens;
     std::int32_t segment_max_codepoints = 48;
     std::int32_t verbosity = 0;
     bool stream = false;

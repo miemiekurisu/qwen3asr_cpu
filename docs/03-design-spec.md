@@ -90,6 +90,7 @@ CLI 长音频输出：
 - `--emit-tokens`：逐 token 输出。
 - `--emit-segments`：按标点或长度聚合输出。
 - `--segment-max-codepoints <n>`：无标点时强制分段阈值，默认 `48`。
+- `--stream-max-new-tokens <n>`：流式单 chunk 解码上限，默认 `32`，最大 `128`。长文件离线转写不得设大值模拟批量输出。
 
 ### `src/backend/qwen_cpu/qwen_asr_stream.h`
 

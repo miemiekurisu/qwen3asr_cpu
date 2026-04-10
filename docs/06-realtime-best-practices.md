@@ -65,6 +65,7 @@
 - rollback 默认 `5 token`。
 - `unfixed_chunks` 默认 `2`。
 - `max_new_tokens` 默认 `32`。
+- `max_new_tokens` 最大 `128`；更大值会拖慢每个实时 chunk，长音频应走离线分段而非流式路径。
 - 长流下会自动裁 `encoder history` 与 `decoder prefix`，使算量与内存有界。
 
 推论：

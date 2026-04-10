@@ -410,3 +410,21 @@ amd64 Docker/OpenBLAS 验收卡在 apt：
 - `QASR_APT_TIMEOUT` 控 HTTP/HTTPS timeout，默认 `20`
 
 本轮 Docker 未进入 CMake 构建，不能作为代码失败判据。
+
+### 30. 长音频不可用超大 stream max_new_tokens
+
+`%E9%A1%BE%E5%90%9B%E5%AD%90%EF%BC%8801%EF%BC%89.mp3` 时长 `1726.457s`，约 `864` 个 2 秒流式 chunk。
+
+用户命令设：
+
+- `--stream`
+- `--emit-tokens`
+- `--stream-max-new-tokens 512`
+
+这会使每个 chunk 最多解 `512` token，长时间无输出，看似卡死。此非 ffmpeg 死锁。
+
+处置：
+
+- CLI / bridge 限 `stream_max_new_tokens <= 128`
+- C 后端也硬限 `QWEN_STREAM_MAX_NEW_TOKENS_LIMIT=128`
+- 长文件离线测试应优先用非流式 `--emit-segments`

@@ -1220,6 +1220,9 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     int rollback = ctx->stream_rollback;
     int unfixed_chunks = ctx->stream_unfixed_chunks;
     int max_new_tokens = ctx->stream_max_new_tokens > 0 ? ctx->stream_max_new_tokens : 32;
+    if (max_new_tokens > QWEN_STREAM_MAX_NEW_TOKENS_LIMIT) {
+        max_new_tokens = QWEN_STREAM_MAX_NEW_TOKENS_LIMIT;
+    }
 
     const float *audio_samples = samples;
     int64_t audio_n_samples = n_samples;

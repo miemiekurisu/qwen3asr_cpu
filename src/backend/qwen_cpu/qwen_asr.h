@@ -21,6 +21,7 @@
 #define QWEN_HOP_LENGTH       160
 #define QWEN_WINDOW_SIZE      400
 #define QWEN_VOCAB_SIZE       151936
+#define QWEN_STREAM_MAX_NEW_TOKENS_LIMIT 128
 
 /* Maximum layer counts (for static array sizing) */
 #define QWEN_MAX_ENC_LAYERS   24

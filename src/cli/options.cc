@@ -177,7 +177,7 @@ std::string BuildCliUsage(std::string_view program_name) {
     usage += " --model-dir <dir> --audio <wav> [options]\n";
     usage += "  --threads <n>\n";
     usage += "  --stream\n";
-    usage += "  --stream-max-new-tokens <n>\n";
+    usage += "  --stream-max-new-tokens <n>  (default 32, max 128)\n";
     usage += "  --emit-segments\n";
     usage += "  --segment-max-codepoints <n>\n";
     usage += "  --prompt <text>\n";

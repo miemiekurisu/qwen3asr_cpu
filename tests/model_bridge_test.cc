@@ -75,6 +75,11 @@ QASR_TEST(ValidateAsrRunOptionsRejectsBrokenValues) {
     QASR_EXPECT_EQ(qasr::ValidateAsrRunOptions(options).code(), qasr::StatusCode::kInvalidArgument);
 
     options.threads = 0;
+    options.stream_max_new_tokens = qasr::kMaxStreamMaxNewTokens + 1;
+    QASR_EXPECT_EQ(qasr::ValidateAsrRunOptions(options).code(), qasr::StatusCode::kInvalidArgument);
+
+    options.stream_max_new_tokens = qasr::kMaxStreamMaxNewTokens;
+    options.threads = 0;
     options.segment_max_codepoints = 0;
     QASR_EXPECT_EQ(qasr::ValidateAsrRunOptions(options).code(), qasr::StatusCode::kInvalidArgument);
 
