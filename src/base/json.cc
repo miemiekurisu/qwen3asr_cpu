@@ -13,7 +13,8 @@ const Json kNullSentinel;
 
 void EscapeJsonString(const std::string & input, std::string & output) {
     output.push_back('"');
-    for (const unsigned char ch : input) {
+    for (const char c : input) {
+        const auto ch = static_cast<unsigned char>(c);
         switch (ch) {
             case '"':  output += "\\\""; break;
             case '\\': output += "\\\\"; break;
@@ -56,15 +57,7 @@ private:
     const char * pos_;
 
     static Json MakeDiscarded() {
-        Json j;
-        // Access private type_ via a friend-free hack: parse a sentinel.
-        // Instead, use a static helper via the public API to create discarded.
-        // We set the type by constructing then assigning.  The class exposes
-        // no public way to set kDiscarded, so we use a helper struct.
-        struct Hack : Json { void SetDiscarded() { type_ = Type::kDiscarded; } };
-        Hack h;
-        h.SetDiscarded();
-        return h;
+        return Json::MakeDiscarded();
     }
 
     bool AtEnd() const { return pos_ >= end_; }

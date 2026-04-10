@@ -41,6 +41,8 @@ add_library(qasr_core STATIC
     src/runtime/realtime_session.cc
     src/protocol/openai.cc
     src/protocol/vllm.cc
+    src/base/json.cc
+    src/base/http_server.cc
 )
 
 target_include_directories(qasr_core
@@ -130,7 +132,6 @@ if(QASR_ENABLE_CPU_BACKEND AND NOT WIN32)
     target_link_libraries(qasr_server PRIVATE qasr_core)
     target_include_directories(qasr_server PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/vendor/third_party
     )
 
     if(MSVC)
@@ -175,12 +176,13 @@ if(QASR_ENABLE_TESTS)
         tests/session_manager_test.cc
         tests/task_queue_test.cc
         tests/realtime_session_test.cc
+        tests/json_test.cc
+        tests/http_server_test.cc
     )
 
     target_link_libraries(qasr_unit_tests PRIVATE qasr_core)
     target_include_directories(qasr_unit_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/vendor/third_party
     )
 
     if(MSVC)

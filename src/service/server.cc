@@ -20,7 +20,7 @@
 #include <utility>
 #include <vector>
 
-#if defined(__linux__)
+#if !defined(_WIN32)
 #include <csignal>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -439,7 +439,7 @@ std::vector<float> DecodePcm16Le(const std::string & body) {
     return samples;
 }
 
-#if defined(QASR_CPU_BACKEND_ENABLED) && defined(__linux__)
+#if defined(QASR_CPU_BACKEND_ENABLED) && !defined(_WIN32)
 std::vector<float> DecodePcm16Le(const char * data, std::size_t size) {
     return DecodePcm16Le(std::string(data, size));
 }
@@ -947,7 +947,7 @@ struct ServerMetrics {
     std::atomic<std::uint64_t> host_capture_sessions_started{0};
 };
 
-#if defined(__linux__)
+#if !defined(_WIN32)
 struct HostCaptureSession {
     std::string id;
     std::string backend;
@@ -1030,13 +1030,24 @@ Status BuildCaptureCommand(
 
     const bool have_arecord = CommandExists("arecord");
     const bool have_parec = CommandExists("parec");
+    const bool have_ffmpeg = FfmpegAvailable();
     if (backend == "auto") {
+#if defined(__linux__)
         if (have_arecord) {
             backend = "arecord";
         } else if (have_parec) {
             backend = "parec";
-        } else {
-            return Status(StatusCode::kFailedPrecondition, "neither arecord nor parec is available");
+        } else if (have_ffmpeg) {
+            backend = "ffmpeg";
+        }
+#else
+        if (have_ffmpeg) {
+            backend = "ffmpeg";
+        }
+#endif
+        if (backend == "auto") {
+            return Status(StatusCode::kFailedPrecondition,
+                "no capture backend available (install ffmpeg, arecord, or parec)");
         }
     }
 
@@ -1065,6 +1076,31 @@ Status BuildCaptureCommand(
         return OkStatus();
     }
 
+    if (backend == "ffmpeg") {
+        if (!have_ffmpeg) {
+            return Status(StatusCode::kFailedPrecondition, "ffmpeg is not available");
+        }
+        *argv = {"ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"};
+#if defined(__APPLE__)
+        argv->insert(argv->end(), {"-f", "avfoundation", "-i",
+            device.empty() ? ":default" : (":" + device)});
+#elif defined(__linux__)
+        if (CommandExists("pulseaudio") || CommandExists("pipewire-pulse")) {
+            argv->insert(argv->end(), {"-f", "pulse", "-i",
+                device.empty() ? "default" : device});
+        } else {
+            argv->insert(argv->end(), {"-f", "alsa", "-i",
+                device.empty() ? "default" : device});
+        }
+#else
+        argv->insert(argv->end(), {"-f", "alsa", "-i",
+            device.empty() ? "default" : device});
+#endif
+        argv->insert(argv->end(), {"-ar", "16000", "-ac", "1", "-f", "s16le", "pipe:1"});
+        *selected_backend = "ffmpeg";
+        return OkStatus();
+    }
+
     return Status(StatusCode::kInvalidArgument, "unsupported capture backend: " + backend);
 }
 
@@ -1078,15 +1114,22 @@ void StopHostCaptureSession(const std::shared_ptr<HostCaptureSession> & capture)
         capture->stop_requested = true;
     }
 
+    // Send SIGTERM first, then SIGKILL as forceful fallback.
+    // On macOS, ffmpeg -f avfoundation may not respond to SIGTERM if stuck
+    // acquiring the audio device.  SIGKILL guarantees the child dies, which
+    // closes the pipe write-end and unblocks the reader thread's read().
     if (capture->child_pid > 0) {
         kill(capture->child_pid, SIGTERM);
-    }
-    if (capture->read_fd >= 0) {
-        close(capture->read_fd);
-        capture->read_fd = -1;
+        kill(capture->child_pid, SIGKILL);
     }
     if (capture->reader.joinable()) {
         capture->reader.join();
+    }
+    // Close the read-end only after the reader thread has exited to avoid
+    // closing an fd that another thread is actively read()ing from.
+    if (capture->read_fd >= 0) {
+        close(capture->read_fd);
+        capture->read_fd = -1;
     }
     if (capture->child_pid > 0) {
         int status = 0;
@@ -1097,7 +1140,7 @@ void StopHostCaptureSession(const std::shared_ptr<HostCaptureSession> & capture)
     std::lock_guard<std::mutex> lock(capture->mu);
     capture->active = false;
 }
-#endif
+#endif  // !defined(_WIN32)
 
 template <typename SessionLike>
 void AppendRealtimeSamples(
@@ -1320,7 +1363,7 @@ int RunServer(const ServerConfig & config) {
     std::mutex realtime_mu;
     std::unordered_map<std::string, OfflineJob> jobs;
     std::mutex jobs_mu;
-#if defined(__linux__)
+#if !defined(_WIN32)
     std::shared_ptr<HostCaptureSession> host_capture;
     std::mutex host_capture_mu;
 #endif
@@ -1394,7 +1437,7 @@ int RunServer(const ServerConfig & config) {
             std::lock_guard<std::mutex> lock(jobs_mu);
             queued_jobs = jobs.size();
         }
-#if defined(__linux__)
+#if !defined(_WIN32)
         {
             std::lock_guard<std::mutex> lock(host_capture_mu);
             host_capture_active = static_cast<bool>(host_capture && host_capture->active);
@@ -1795,7 +1838,7 @@ int RunServer(const ServerConfig & config) {
         SetJsonResponse(response, body);
     });
 
-#if defined(__linux__)
+#if !defined(_WIN32)
     server.Get("/api/capture/status", [&](const HttpRequest &, HttpResponse & response) {
         std::shared_ptr<HostCaptureSession> capture;
         {
@@ -1998,10 +2041,10 @@ int RunServer(const ServerConfig & config) {
         SetJsonResponse(response, Json::object({{"active", false}, {"supported", false}}));
     });
     server.Post("/api/capture/start", [&](const HttpRequest &, HttpResponse & response) {
-        SetErrorResponse(response, Status(StatusCode::kUnimplemented, "host capture backend is Linux-only"), 501);
+        SetErrorResponse(response, Status(StatusCode::kUnimplemented, "host capture requires a POSIX platform"), 501);
     });
     server.Post("/api/capture/stop", [&](const HttpRequest &, HttpResponse & response) {
-        SetErrorResponse(response, Status(StatusCode::kUnimplemented, "host capture backend is Linux-only"), 501);
+        SetErrorResponse(response, Status(StatusCode::kUnimplemented, "host capture requires a POSIX platform"), 501);
     });
 #endif
 

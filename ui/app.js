@@ -137,7 +137,7 @@ async function refreshHostCaptureStatus() {
 
   if (!supported) {
     stopHostCapturePoll();
-    hostCaptureStatus.textContent = "当前服务仅支持浏览器麦克风；宿主采音需 Linux。";
+    hostCaptureStatus.textContent = "当前服务无可用采音后端；请安装 ffmpeg。";
     hostCaptureResult.textContent = "尚无结果";
     return;
   }

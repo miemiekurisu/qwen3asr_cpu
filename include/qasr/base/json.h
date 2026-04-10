@@ -115,6 +115,13 @@ public:
     /// Compact JSON serialization.
     std::string dump() const;
 
+    /// Create a discarded (parse-error) value.
+    static Json MakeDiscarded() {
+        Json j;
+        j.type_ = Type::kDiscarded;
+        return j;
+    }
+
     /// Array iteration.
     Array::iterator begin() noexcept;
     Array::iterator end() noexcept;

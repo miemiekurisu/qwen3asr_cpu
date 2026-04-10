@@ -33,8 +33,6 @@ struct HttpRequest {
     std::string get_param_value(const std::string & name, std::size_t index = 0) const;
     std::size_t get_param_value_count(const std::string & name) const;
 
-private:
-    friend class HttpServer;
     std::unordered_map<std::string, std::vector<std::string>> params_;
     std::unordered_map<std::string, std::string> headers_;
 };
@@ -48,8 +46,6 @@ struct HttpResponse {
     void set_content(const std::string & body, const std::string & content_type);
     void set_header(const std::string & name, const std::string & value);
 
-private:
-    friend class HttpServer;
     std::string body_;
     std::string content_type_;
     std::vector<std::pair<std::string, std::string>> headers_;

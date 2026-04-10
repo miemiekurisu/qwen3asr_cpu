@@ -246,7 +246,8 @@ QASR_TEST(Json_IterateArray) {
 QASR_TEST(Json_IterateEmptyArray) {
     Json j = Json::array();
     int count = 0;
-    for (const Json & : j) {
+    for (const Json & item : j) {
+        (void)item;
         ++count;
     }
     QASR_EXPECT_EQ(count, 0);
@@ -476,7 +477,7 @@ QASR_TEST(Json_EmptyNull) {
     QASR_EXPECT(j.empty());
 }
 
-QASR_TEST(Json_EmptyString) {
+QASR_TEST(Json_EmptyStringValue) {
     Json j("");
     QASR_EXPECT(j.empty());
 }
