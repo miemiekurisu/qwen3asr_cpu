@@ -1,7 +1,6 @@
 build/
 qwen-asr-learn/
 whisper.cpp/
-testfile/
 .DS_Store
 *.log
 *.tmp
@@ -9,4 +8,7 @@ testfile/
 *.wav
 *.aiff
 *.mp3
+!testfile/
+!testfile/*.mp3
+!testfile/README.md
 *.dSYM/
