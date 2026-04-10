@@ -1,0 +1,325 @@
+# 经验录
+
+## 2026-04-10
+
+### 1. 二参考之分工极明
+
+- `qwen-asr-learn` 宜学“算法全链”
+- `whisper.cpp` 宜学“工程外壳”
+
+若二者混读不分层，易误入两端皆半。
+
+### 2. `qwen-asr-learn` 最值钱者，不仅 encoder/decoder
+
+最值钱处实为 `qwen_asr.c`：
+
+- prompt 装配
+- segment 切分
+- silence compaction
+- streaming rollback
+- stable frontier commit
+- 恢复性 re-anchor
+
+此文件近乎“官方推理策略简化版”。
+
+### 3. `whisper.cpp` 之价值，在 ABI 与 examples
+
+最该学：
+
+- context/state 分离
+- `include/whisper.h` 风格
+- `examples/server`
+- `examples/stream`
+- `tests/` + CTest
+
+不该误学：
+
+- 直接搬 Whisper 模型路径
+
+### 4. 官方文档有漂移迹象
+
+截至 2026-04-10：
+
+- 本地 `MODEL_CARD_OFFICIAL.md` 与 Hugging Face 官方模型卡均述 Qwen3-ASR 支持 30 语 + 22 方言，且官方工具包支持 vLLM、async serving、streaming、timestamp。
+- vLLM 的 Qwen3-ASR recipe 页面却写 11 语。
+
+此类漂移，后续须以官方模型卡与官方仓库为主，recipe 为辅。
+
+### 5. 当前环境事实
+
+- 宿主：macOS / arm64
+- 编译器：Apple clang 17.0.0
+- CMake：4.2.3
+- 本机未装 OpenBLAS
+- Docker 可用
+- Docker daemon 架构：`linux aarch64`
+
+故：
+
+- 本机可先验 macOS/Accelerate
+- Linux/OpenBLAS 可先验 `linux/arm64`
+- `linux/amd64` 须用 `docker run --platform linux/amd64`
+
+### 6. 先立规约，再迁模型
+
+若先搬模型代码，再补 runtime/protocol/tests，后患大。
+正序应为：
+
+1. 文档
+2. 骨架
+3. 测试基座
+4. 模型迁移
+5. 服务化
+
+### 7. Docker 双架构 OpenBLAS 已验
+
+于 2026-04-10 已实跑：
+
+- `linux/arm64 + OpenBLAS`
+- `linux/amd64 + OpenBLAS`
+
+结果：
+
+- CMake 配置通过
+- 编译通过
+- 单测通过
+
+故当前“平台/BLAS 约束 + 基础骨架”已具三路实证：
+
+- macOS/Accelerate
+- Linux arm64/OpenBLAS
+- Linux amd64/OpenBLAS
+
+### 8. ModelScope 本地模型目录名会转义
+
+用户口述路径为：
+
+- `Qwen3-ASR-1.7B`
+
+然本机实际目录为：
+
+- `Qwen3-ASR-1___7B`
+
+故模型发现逻辑不可只信“显示名”，须校：
+
+- 目录存在
+- `config.json`
+- `vocab.json`
+- `merges.txt`
+- `model.safetensors.index.json`
+- index 所列分片齐全
+
+### 9. Vendor 后端可作首个可运行基线
+
+为先达“主程序可启且可跑 ASR”，今采本仓 vendor CPU 后端：
+
+- 不改 `qwen-asr-learn`
+- 不从参考目录 include / link
+- 以 CMake 只编 `vendor/qasr_cpu/`
+- 由 `qasr/runtime/model_bridge.*` 封之
+- 由 `qasr_cli` 调之
+
+此法可先保：
+
+- 本工程可独立构建
+- 主程序可独立启动
+- 后续可逐模块替换 vendor 后端
+
+### 10. 本机已实跑 `qasr_cli`
+
+于 2026-04-10，macOS / arm64 / Accelerate，模型：
+
+- `/Users/kurisu/.cache/modelscope/hub/models/Qwen/Qwen3-ASR-1___7B`
+
+样音：
+
+- `qwen-asr-learn/samples/test_speech.wav`
+- `qwen-asr-learn/samples/jfk.wav`
+
+结果：
+
+- 载模成功
+- 转写成功
+- `jfk.wav` 输出为：`And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country.`
+
+此时“主程序可启且可跑 ASR”已成。
+
+### 11. 官方实时与时间戳，本就分路
+
+外部事实：
+
+- Qwen 官方模型卡称 streaming 仅 vLLM backend 支持
+- 且 streaming 不支持 batch，不支持 timestamps
+- 精细时间戳交 `Qwen3-ForcedAligner-0.6B`
+
+故：
+
+- 主实时路先求稳定字幕
+- 词级时间戳宜异步后补
+
+### 12. “无停顿”之核心，不是 VAD，而是稳定前缀
+
+AWS 文档与 Whisper-Streaming 皆指向同一结论：
+
+- partial 可先出
+- stable prefix 后提交
+- 尾巴允许少量改写
+
+此比“等停顿再整句冒出”更合字幕 UX。
+
+### 13. `qwen-asr-learn` 已隐含正确方向
+
+其 `--stream` 默认：
+
+- `2s` chunk
+- `8s` encoder window
+- `rollback 5`
+- `unfixed_chunks 2`
+- `max_new_tokens 32`
+- 长流自动裁历史
+
+这说明参考实现并未依赖停顿；其主法本就是“滑窗 + rollback + frontier commit”。
+
+### 14. vLLM 官方 realtime 默认分段偏保守
+
+vLLM `qwen3_asr_realtime` buffer 默认 `5s` 才吐一段。
+
+此足以保正确，不足以保字幕观感。
+若求“看似准实时”，须在我们自研 runtime 内把 cadence 压到亚秒级 tick，而非直接照搬 `5s`。
+
+### 15. 双路法值记，但不宜阻首版
+
+2025 年论文已示：
+
+- 快路 partial
+- 慢路 rerank / refine
+
+然其多赖额外训练或额外头。
+本项目首版当先把“无停顿滑窗 + 稳定前缀”做稳，再议双路增强。
+
+### 16. 实时接口第一版已改成三态文本
+
+现 `/api/realtime/*` 与 `/api/capture/*` 已不再只回一段 `partial_text`，而回：
+
+- `stable_text`
+- `partial_text`
+- `text`
+- `finalized`
+
+此使前端后续可做“稳定前缀不重绘”。
+
+### 17. decode cadence 不宜随包即跑
+
+原先每来一包即整段重解，浪费甚大。
+今改为固定最小样本门槛：
+
+- 默认 `800ms`
+
+故浏览器亦改 `800ms` flush 一次，与服务 cadence 对齐。
+
+### 18. stop 时应再跑一次终态 refine
+
+若 stop 只回最后一轮 partial，往往欠尾字。
+今 `stop` 改再跑一次非流式 full-audio decode，并强制 flush 尾巴，终稿更稳。
+
+### 19. “参考”与“依赖”须硬分
+
+用户已明令：
+
+- `qwen-asr-learn/`
+- `whisper.cpp/`
+
+只能参考，不得成编译或 include 依赖。
+
+故今已改：
+
+- 现用 C 核源码复制入 `vendor/qasr_cpu/`
+- `httplib.h` 与 `json.hpp` 复制入 `vendor/third_party/`
+- CMake 只指向 `vendor/`，不再指向参考目录
+
+后续仍须继续：
+
+- 从“vendor 快照”再走向“自研替换”
+
+### 20. 共享局部变量入 handler，极易生并发暗伤
+
+`RunServer` 中若以一枚外层 `Status status` 供多 handler 复用，则多请求并发时可互踩。
+今已尽改为各 handler 各自局部 `Status`，此类变量不得再上提到共享作用域。
+
+### 21. 命名也会形成依赖错觉
+
+即使构建已只指向 `vendor/`，若接口仍名 `legacy_bridge`，会误导后续开发继续按参考工程思路走。
+
+今已改：
+
+- `legacy_bridge` -> `model_bridge`
+- `LegacyAsr*` -> `AsrRun*`
+- `QASR_LEGACY_BRIDGE_ENABLED` -> `QASR_CPU_BACKEND_ENABLED`
+- `qasr_legacy_c` -> `qasr_cpu_c`
+
+经验：边界名须反映本项目所有权，不得反映来源。
+
+### 22. 实时长流必须限内存
+
+实时 ASR 不可假设用户会停，也不可令 `samples` 无限增长。
+
+今已改：
+
+- `RealtimePolicyConfig::max_decode_window_ms = 32000`
+- session 只保近 `32s` PCM
+- `sample_count` 记累计样本
+- `retained_sample_count` 记当前保留样本
+- stop 时若已裁旧 PCM，不以窗口结果覆盖既有全文
+
+经验：计时与解码窗口须分离；否则一裁样本，cadence 与稳定前缀都会漂。
+
+### 23. PCM chunk 必须明示二进制类型
+
+用 `curl --data-binary` 若不设 `Content-Type`，httplib 可能按表单体处理，触发 `413`。
+
+今后 `/api/realtime/chunk` 冒烟一律加：
+
+- `Content-Type: application/octet-stream`
+
+UI 已如此设置。
+
+### 24. Docker 验收依赖 daemon
+
+本轮执行 `tools/docker_linux_openblas.sh linux/arm64` 时，Docker API socket 不存在：
+
+- `/Users/kurisu/.docker/run/docker.sock`
+
+故 Linux/OpenBLAS 容器验收未能启动。
+此非代码失败；后续跑 Docker 前须先确认 Docker Desktop / daemon 已起。
+
+本机现状：
+
+- Docker CLI 存在：`/usr/local/bin/docker`
+- Docker client：`29.1.3`
+- 本机架构：`darwin/arm64`
+- context：`desktop-linux`
+- buildx 插件存在
+- daemon socket 缺：`/Users/kurisu/.docker/run/docker.sock`
+
+按脚本设计，`tools/docker_linux_openblas.sh linux/amd64` 可触发 amd64 Linux 容器；但须 daemon 起后才能确认 QEMU/binfmt 或 Docker Desktop emulation 实际可用。
+
+用户启动 Docker 后已验：
+
+- `docker buildx ls` 显示 `linux/amd64`
+- `docker run --rm --platform linux/amd64 ubuntu:24.04 uname -m` 输出 `x86_64`
+
+故 amd64 Linux 虚拟可行。
+后续 OpenBLAS 构建若失败，多半是 apt 源网络，不是架构虚拟失败。
+
+### 25. HTTP 服务须先限队列
+
+ASR 请求耗时远大于普通 HTTP。若 server 允许无限排队，CPU 慢时会堆内存并拖垮延迟。
+
+今已设：
+
+- httplib task queue 上限 `64`
+- read / write timeout `30s`
+- keepalive timeout `5s`
+- realtime 活跃会话上限 `64`
+
+后续还须给 async job 做 TTL 清理与硬上限。

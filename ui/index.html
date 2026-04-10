@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QASR Test UI</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <p class="eyebrow">Qwen3-ASR CPU Test Console</p>
+      <h1>离线上传与实时转写</h1>
+      <p class="lede">本页只作联调。离线走 WAV 上传，实时走浏览器麦克风分块推送。</p>
+      <div class="status-row">
+        <span id="healthBadge" class="badge">检查中</span>
+        <span id="runtimeHint" class="hint">服务未就绪</span>
+      </div>
+    </section>
+
+    <section class="grid">
+      <article class="panel">
+        <header class="panel-head">
+          <p class="panel-kicker">Offline</p>
+          <h2>音频上传</h2>
+        </header>
+        <form id="uploadForm" class="stack">
+          <label class="field">
+            <span>WAV 文件</span>
+            <input id="audioFile" type="file" accept=".wav,audio/wav">
+          </label>
+          <button class="action" type="submit">开始转写</button>
+        </form>
+        <pre id="offlineResult" class="output">尚无结果</pre>
+      </article>
+
+      <article class="panel realtime">
+        <header class="panel-head">
+          <p class="panel-kicker">Realtime</p>
+          <h2>实时转写</h2>
+        </header>
+        <div class="stack">
+          <div class="button-row">
+            <button id="startRealtime" class="action" type="button">启动</button>
+            <button id="stopRealtime" class="ghost" type="button" disabled>停止</button>
+          </div>
+          <p id="realtimeStatus" class="hint">未开始</p>
+          <pre id="realtimeResult" class="output">尚无结果</pre>
+        </div>
+      </article>
+
+      <article class="panel host">
+        <header class="panel-head">
+          <p class="panel-kicker">Host Audio</p>
+          <h2>宿主设备采音</h2>
+        </header>
+        <div class="stack">
+          <label class="field">
+            <span>后端</span>
+            <select id="hostBackend">
+              <option value="auto">auto</option>
+              <option value="arecord">arecord</option>
+              <option value="parec">parec</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>设备名</span>
+            <input id="hostDevice" type="text" placeholder="留空即默认设备">
+          </label>
+          <div class="button-row">
+            <button id="startHostCapture" class="action" type="button">启动</button>
+            <button id="stopHostCapture" class="ghost" type="button" disabled>停止</button>
+          </div>
+          <p id="hostCaptureStatus" class="hint">Linux 宿主采音未开始</p>
+          <pre id="hostCaptureResult" class="output">尚无结果</pre>
+        </div>
+      </article>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

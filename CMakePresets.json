@@ -1,0 +1,71 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "QASR_ENABLE_TESTS": "ON"
+      }
+    },
+    {
+      "name": "macos-accelerate",
+      "inherits": "base",
+      "description": "macOS / Apple Accelerate"
+    },
+    {
+      "name": "linux-openblas",
+      "inherits": "base",
+      "description": "Linux / OpenBLAS"
+    },
+    {
+      "name": "windows-openblas",
+      "inherits": "base",
+      "description": "Windows / OpenBLAS"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "macos-accelerate",
+      "configurePreset": "macos-accelerate"
+    },
+    {
+      "name": "linux-openblas",
+      "configurePreset": "linux-openblas"
+    },
+    {
+      "name": "windows-openblas",
+      "configurePreset": "windows-openblas"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "macos-accelerate",
+      "configurePreset": "macos-accelerate",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-openblas",
+      "configurePreset": "linux-openblas",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "windows-openblas",
+      "configurePreset": "windows-openblas",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
