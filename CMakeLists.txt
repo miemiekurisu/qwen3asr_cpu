@@ -23,12 +23,22 @@ add_library(qasr_core STATIC
     src/core/status.cc
     src/core/audio_types.cc
     src/core/timestamp.cc
+    src/core/state_machine.cc
+    src/storage/safetensors_loader.cc
+    src/model/tokenizer.cc
+    src/audio/frontend.cc
+    src/inference/encoder.cc
+    src/inference/decoder.cc
+    src/inference/streaming_policy.cc
     src/service/realtime.cc
     src/runtime/blas.cc
     src/runtime/config.cc
     src/runtime/task.cc
     src/runtime/engine.cc
     src/runtime/model_bridge.cc
+    src/runtime/session_manager.cc
+    src/runtime/task_queue.cc
+    src/runtime/realtime_session.cc
     src/protocol/openai.cc
     src/protocol/vllm.cc
 )
@@ -155,6 +165,16 @@ if(QASR_ENABLE_TESTS)
         tests/realtime_test.cc
         tests/openai_test.cc
         tests/vllm_test.cc
+        tests/state_machine_test.cc
+        tests/safetensors_loader_test.cc
+        tests/tokenizer_test.cc
+        tests/audio_frontend_test.cc
+        tests/encoder_test.cc
+        tests/decoder_test.cc
+        tests/streaming_policy_test.cc
+        tests/session_manager_test.cc
+        tests/task_queue_test.cc
+        tests/realtime_session_test.cc
     )
 
     target_link_libraries(qasr_unit_tests PRIVATE qasr_core)

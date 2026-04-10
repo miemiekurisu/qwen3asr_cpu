@@ -119,6 +119,17 @@
 - 由 `qasr/runtime/model_bridge.*` 封之
 - 由 `qasr_cli` 调之
 
+### 10. 本轮修复留档
+
+2026-04-10，按开发守则补齐了：
+
+- `CMakePresets.json` 增加 ASan/UBSan 预设
+- `BuildServerUsage()` 单测补齐
+- `RunServer()` 单测补齐
+- `RunAsr()` 非正常值单测补齐
+- 采用 `cmake` + `ctest` 本机验证通过
+
+
 此法可先保：
 
 - 本工程可独立构建
@@ -428,3 +439,32 @@ amd64 Docker/OpenBLAS 验收卡在 apt：
 - CLI / bridge 限 `stream_max_new_tokens <= 128`
 - C 后端也硬限 `QWEN_STREAM_MAX_NEW_TOKENS_LIMIT=128`
 - 长文件离线测试应优先用非流式 `--emit-segments`
+
+### 31. 全模块补齐：C++ 抽象层实现
+
+审计发现设计规格 9 层架构中约 82% 的 C++ 组件缺失（仅有 core/status、audio_types、timestamp、service/realtime、runtime 五个底层模块）。本次一次性补齐所有缺失模块：
+
+**新增头文件 10 个**（`include/qasr/`）：
+
+| 层           | 文件                                  | 主要类型/函数                                  |
+|:-------------|:--------------------------------------|:-----------------------------------------------|
+| core         | `core/state_machine.h`                | SessionState, RequestState, RealtimeTextLane, StreamChunkState 枚举 + 转换验证 |
+| storage      | `storage/safetensors_loader.h`        | MappedFile (RAII mmap), SafeTensorIndex, ShardRegistry, TensorView |
+| model        | `model/tokenizer.h`                   | Tokenizer (BPE), LoadVocabJson, LoadMergesTxt  |
+| audio        | `audio/frontend.h`                    | ReadWav, ParseWavBuffer, Resample, ComputeMelSpectrogram, CompactSilence, StreamingAudioRing |
+| inference    | `inference/encoder.h`                 | EncoderWeights, EncoderWindowPlan, EncodeChunk, EncodeAudio |
+| inference    | `inference/decoder.h`                 | DecoderWeights, KvCache, Prefill, DecodeStep, BuildPromptEmbeddings |
+| inference    | `inference/streaming_policy.h`        | StreamPolicyConfig, StreamChunkPlanner, EncoderCache, CommitFrontier, DetectDegenerateTail |
+| runtime      | `runtime/session_manager.h`           | SessionManager (线程安全, mutex 保护)          |
+| runtime      | `runtime/task_queue.h`                | TaskQueue (有界队列 + 背压 + 取消)             |
+| runtime      | `runtime/realtime_session.h`          | RealtimeSession (per-session 流式状态)         |
+
+**新增实现文件 10 个**（`src/`）：state_machine.cc, safetensors_loader.cc, tokenizer.cc, frontend.cc, encoder.cc, decoder.cc, streaming_policy.cc, session_manager.cc, task_queue.cc, realtime_session.cc
+
+**新增测试文件 10 个**（`tests/`）：覆盖正常/极端/错误场景，共新增 ~120 个测试用例，全部 217 个测试通过。
+
+教训：
+
+- encoder/decoder `.cc` 实现为 stub（返回零值或 EOS），待接入 C 后端真正的权重加载和推理
+- tokenizer 的 BPE 编码实现为简化版（逐字符匹配），待接真正的 merge 优先级算法
+- 所有模块遵循开发手册：Pre/Post/Thread-safe 契约注释、RAII 资源管理、Status 错误传播

@@ -89,6 +89,18 @@ QASR_TEST(ValidateAsrRunOptionsRejectsBrokenValues) {
     QASR_EXPECT_EQ(qasr::ValidateAsrRunOptions(options).code(), qasr::StatusCode::kInvalidArgument);
 }
 
+QASR_TEST(RunAsrRejectsMissingModelDir) {
+    qasr::AsrRunOptions options;
+    options.model_dir = "/tmp/does-not-exist-qwen-asr-provider";
+    options.audio_path = "/tmp/does-not-exist.wav";
+    options.stream_max_new_tokens = 1;
+    options.segment_max_codepoints = 32;
+    options.threads = 1;
+
+    const qasr::AsrRunResult result = qasr::RunAsr(options);
+    QASR_EXPECT_EQ(result.status.code(), qasr::StatusCode::kNotFound);
+}
+
 QASR_TEST(CpuBackendAvailabilityIsConsistent) {
 #ifdef QASR_CPU_BACKEND_ENABLED
     QASR_EXPECT(qasr::CpuBackendAvailable());
