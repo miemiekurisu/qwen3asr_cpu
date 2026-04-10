@@ -122,7 +122,7 @@ void qwen_argmax_bf16_range_neon(const float *x, const uint16_t *W_bf16,
     float best_val = -1e30f;
     int o = start;
 
-    /* Process 2 rows at a time, 32 elements/iter, 8 accumulators per row */
+    /* Process 2 rows at a time */
     for (; o + 1 < end; o += 2) {
         const uint16_t *w0 = W_bf16 + (size_t)o * in_dim;
         const uint16_t *w1 = W_bf16 + (size_t)(o + 1) * in_dim;

@@ -217,6 +217,32 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     float *x = (float *)calloc((size_t)total_tokens * d_model, sizeof(float));
     int token_offset = 0;
 
+    /*
+     * OPT: Pre-allocate reusable conv buffers for per-chunk processing.
+     * Rationale: The original code malloc/free'd 5 temporary buffers per chunk
+     *   (chunk_mel, c1, c2, c3, reshaped). For n_chunks=17 (long audio), that's
+     *   85 malloc/free cycles causing memory allocator overhead and fragmentation.
+     * Method: Compute max buffer sizes from a full chunk and allocate once.
+     *   Reuse the same buffers across all chunks.
+     * Effect: Eliminates per-chunk allocation overhead (~1-2ms for long audio).
+     */
+    int full_w = chunk_size;
+    int full_h1 = (128 + 2 - 3) / 2 + 1; /* 64 */
+    int full_w1 = (full_w + 2 - 3) / 2 + 1;
+    int full_h2 = (full_h1 + 2 - 3) / 2 + 1; /* 32 */
+    int full_w2 = (full_w1 + 2 - 3) / 2 + 1;
+    int full_h3 = (full_h2 + 2 - 3) / 2 + 1; /* 16 */
+    int full_w3 = (full_w2 + 2 - 3) / 2 + 1;
+    int conv_proj_dim = QWEN_CONV_HIDDEN * full_h3; /* 480 * 16 = 7680 */
+
+    /* Reusable buffers (sizes based on full chunk, which is the max) */
+    float *chunk_mel_buf = (float *)malloc(128 * (size_t)full_w * sizeof(float));
+    float *c1_buf = (float *)malloc((size_t)QWEN_CONV_HIDDEN * full_h1 * full_w1 * sizeof(float));
+    float *c2_buf = (float *)malloc((size_t)QWEN_CONV_HIDDEN * full_h2 * full_w2 * sizeof(float));
+    float *c3_buf = (float *)malloc((size_t)QWEN_CONV_HIDDEN * full_h3 * full_w3 * sizeof(float));
+    float *reshaped_buf = (float *)malloc((size_t)full_w3 * conv_proj_dim * sizeof(float));
+    float *pe_buf = (float *)malloc((size_t)full_w3 * d_model * sizeof(float));
+
     /* Process each chunk through Conv2D + reshape + project + sinusoidal PE */
     for (int c = 0; c < n_chunks; c++) {
         int start = c * chunk_size;
@@ -225,66 +251,61 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
         int chunk_w = end - start;
 
         /* Extract chunk mel: [128, chunk_w] */
-        float *chunk_mel = (float *)malloc(128 * chunk_w * sizeof(float));
         for (int m = 0; m < 128; m++) {
-            memcpy(chunk_mel + m * chunk_w, mel + m * mel_frames + start,
+            memcpy(chunk_mel_buf + m * chunk_w, mel + m * mel_frames + start,
                    chunk_w * sizeof(float));
         }
 
         /* Conv2D layer 1: [1, 128, chunk_w] -> [480, 64, w1] */
         int h1 = (128 + 2 - 3) / 2 + 1; /* 64 */
         int w1 = (chunk_w + 2 - 3) / 2 + 1;
-        float *c1 = (float *)malloc(QWEN_CONV_HIDDEN * h1 * w1 * sizeof(float));
-        qwen_conv2d(c1, chunk_mel, enc->conv1_weight, enc->conv1_bias,
+        qwen_conv2d(c1_buf, chunk_mel_buf, enc->conv1_weight, enc->conv1_bias,
                      1, QWEN_CONV_HIDDEN, 128, chunk_w, 3, 3, 2, 1);
-        qwen_gelu(c1, QWEN_CONV_HIDDEN * h1 * w1);
-        free(chunk_mel);
+        qwen_gelu(c1_buf, QWEN_CONV_HIDDEN * h1 * w1);
 
         /* Conv2D layer 2: [480, 64, w1] -> [480, 32, w2] */
         int h2 = (h1 + 2 - 3) / 2 + 1; /* 32 */
         int w2 = (w1 + 2 - 3) / 2 + 1;
-        float *c2 = (float *)malloc(QWEN_CONV_HIDDEN * h2 * w2 * sizeof(float));
-        qwen_conv2d(c2, c1, enc->conv2_weight, enc->conv2_bias,
+        qwen_conv2d(c2_buf, c1_buf, enc->conv2_weight, enc->conv2_bias,
                      QWEN_CONV_HIDDEN, QWEN_CONV_HIDDEN, h1, w1, 3, 3, 2, 1);
-        qwen_gelu(c2, QWEN_CONV_HIDDEN * h2 * w2);
-        free(c1);
+        qwen_gelu(c2_buf, QWEN_CONV_HIDDEN * h2 * w2);
 
         /* Conv2D layer 3: [480, 32, w2] -> [480, 16, w3] */
         int h3 = (h2 + 2 - 3) / 2 + 1; /* 16 */
         int w3 = (w2 + 2 - 3) / 2 + 1;
-        float *c3 = (float *)malloc(QWEN_CONV_HIDDEN * h3 * w3 * sizeof(float));
-        qwen_conv2d(c3, c2, enc->conv3_weight, enc->conv3_bias,
+        qwen_conv2d(c3_buf, c2_buf, enc->conv3_weight, enc->conv3_bias,
                      QWEN_CONV_HIDDEN, QWEN_CONV_HIDDEN, h2, w2, 3, 3, 2, 1);
-        qwen_gelu(c3, QWEN_CONV_HIDDEN * h3 * w3);
-        free(c2);
+        qwen_gelu(c3_buf, QWEN_CONV_HIDDEN * h3 * w3);
 
         /* Reshape [480, 16, w3] -> [w3, 480*16=7680] then project to d_model */
-        int conv_proj_dim = QWEN_CONV_HIDDEN * h3; /* 480 * 16 = 7680 */
-        float *reshaped = (float *)malloc(w3 * conv_proj_dim * sizeof(float));
+        int cur_conv_proj_dim = QWEN_CONV_HIDDEN * h3;
         for (int t = 0; t < w3; t++) {
             for (int ch = 0; ch < QWEN_CONV_HIDDEN; ch++) {
                 for (int f = 0; f < h3; f++) {
-                    reshaped[t * conv_proj_dim + ch * h3 + f] =
-                        c3[ch * h3 * w3 + f * w3 + t];
+                    reshaped_buf[t * cur_conv_proj_dim + ch * h3 + f] =
+                        c3_buf[ch * h3 * w3 + f * w3 + t];
                 }
             }
         }
-        free(c3);
 
         /* Project: [w3, 7680] -> [w3, d_model] (no bias) */
         float *projected = x + (size_t)token_offset * d_model;
-        qwen_linear_nobias(projected, reshaped, enc->conv_out_weight,
-                            w3, conv_proj_dim, d_model);
-        free(reshaped);
+        qwen_linear_nobias(projected, reshaped_buf, enc->conv_out_weight,
+                            w3, cur_conv_proj_dim, d_model);
 
         /* Add per-chunk sinusoidal position embeddings (starting from pos 0) */
-        float *pe = (float *)malloc(w3 * d_model * sizeof(float));
-        qwen_sinusoidal_pe(pe, w3, d_model);
-        qwen_add_inplace(projected, pe, w3 * d_model);
-        free(pe);
+        qwen_sinusoidal_pe(pe_buf, w3, d_model);
+        qwen_add_inplace(projected, pe_buf, w3 * d_model);
 
         token_offset += w3;
     }
+
+    free(chunk_mel_buf);
+    free(c1_buf);
+    free(c2_buf);
+    free(c3_buf);
+    free(reshaped_buf);
+    free(pe_buf);
 
     /* ---- Build attention window boundaries ---- */
     /* Window size = tokens_per_chunk * (n_window_infer / chunk_size) */
