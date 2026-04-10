@@ -110,7 +110,7 @@ std::size_t LongestCommonStablePrefix(std::string_view a, std::string_view b) no
     }
     // Walk back to UTF-8 character boundary
     // UTF-8 continuation bytes start with 10xxxxxx (0x80-0xBF)
-    while (i > 0 && (static_cast<unsigned char>(a[i]) & 0xC0) == 0x80) {
+    while (i > 0 && i < a.size() && (static_cast<unsigned char>(a[i]) & 0xC0) == 0x80) {
         --i;
     }
     return i;

@@ -3,6 +3,11 @@
 #include <exception>
 #include <iostream>
 
+#ifdef _WIN32
+#  include <crtdbg.h>
+#  include <cstdlib>
+#endif
+
 namespace qasr::test {
 
 std::vector<TestCase> & Registry() {
@@ -17,6 +22,14 @@ TestRegistrar::TestRegistrar(std::string name, TestFunction function) {
 }  // namespace qasr::test
 
 int main() {
+#ifdef _WIN32
+    // Redirect debug assertions to stderr and suppress modal dialogs.
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE | _CRTDBG_MODE_DEBUG);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE | _CRTDBG_MODE_DEBUG);
+    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
     int failed = 0;
     for (const auto & test_case : qasr::test::Registry()) {
         try {
