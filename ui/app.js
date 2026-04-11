@@ -39,28 +39,78 @@ let offlineState = {
   uploadedSourceFrames: 0,
 };
 
-function escapeHtml(text) {
-  return text
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
+function ensureTranscriptFrame(element) {
+  if (element._transcriptFrame) {
+    return element._transcriptFrame;
+  }
+
+  element.textContent = "";
+  const finalLine = document.createElement("span");
+  finalLine.className = "transcript-block final";
+
+  const historyLine = document.createElement("span");
+  historyLine.className = "transcript-block history";
+
+  const liveLine = document.createElement("span");
+  liveLine.className = "transcript-block live";
+  const stableLine = document.createElement("span");
+  stableLine.className = "stable";
+  const partialLine = document.createElement("span");
+  partialLine.className = "partial";
+  liveLine.append(stableLine, partialLine);
+
+  element.append(finalLine, historyLine, liveLine);
+  element._transcriptFrame = {
+    finalLine,
+    historyLine,
+    liveLine,
+    stableLine,
+    partialLine,
+  };
+  return element._transcriptFrame;
+}
+
+function resetTranscriptFrame(element, fallback) {
+  element._transcriptFrame = null;
+  element.textContent = fallback;
 }
 
 function renderTranscript(element, data, fallback) {
+  const recentSegments = Array.isArray(data?.recent_segments)
+    ? data.recent_segments.filter((segment) => typeof segment === "string" && segment)
+    : [];
+  const liveStable = data?.live_stable_text || "";
+  const livePartial = data?.live_partial_text || "";
   const stable = data?.stable_text || "";
   const partial = data?.partial_text || "";
   const text = data?.text || "";
-  if (!stable && !partial && !text) {
-    element.textContent = fallback;
+  const hasSegmentView = recentSegments.length > 0 || liveStable || livePartial;
+  if (!hasSegmentView && !stable && !partial && !text) {
+    resetTranscriptFrame(element, fallback);
     return;
   }
+
+  const frame = ensureTranscriptFrame(element);
   if (data?.finalized) {
-    element.innerHTML = `<span class=\"final\">${escapeHtml(text || stable)}</span>`;
+    frame.finalLine.textContent = text || stable || recentSegments.join("\n");
+    frame.finalLine.style.display = "block";
+    frame.historyLine.textContent = "";
+    frame.historyLine.style.display = "none";
+    frame.stableLine.textContent = "";
+    frame.partialLine.textContent = "";
+    frame.liveLine.style.display = "none";
     return;
   }
-  element.innerHTML =
-    `<span class=\"stable\">${escapeHtml(stable)}</span>` +
-    `<span class=\"partial\">${escapeHtml(partial || text)}</span>`;
+
+  const fallbackStable = hasSegmentView ? "" : stable;
+  const fallbackPartial = hasSegmentView ? "" : (partial || text);
+  frame.finalLine.textContent = "";
+  frame.finalLine.style.display = "none";
+  frame.historyLine.textContent = recentSegments.join("\n");
+  frame.historyLine.style.display = recentSegments.length > 0 ? "block" : "none";
+  frame.stableLine.textContent = liveStable || fallbackStable;
+  frame.partialLine.textContent = livePartial || fallbackPartial;
+  frame.liveLine.style.display = (frame.stableLine.textContent || frame.partialLine.textContent) ? "block" : "none";
 }
 
 function hasOfflineJob() {
@@ -604,7 +654,7 @@ stopRealtime.addEventListener("click", async () => {
 });
 
 clearRealtime.addEventListener("click", () => {
-  realtimeResult.textContent = "尚无结果";
+  resetTranscriptFrame(realtimeResult, "尚无结果");
   realtimeStatus.textContent = "未开始";
   clearRealtime.style.display = "none";
 });

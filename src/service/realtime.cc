@@ -10,6 +10,9 @@ namespace {
 constexpr std::size_t kNoPendingUnstable = std::numeric_limits<std::size_t>::max();
 constexpr std::size_t kForcedTailGuardCodepoints = 4;
 constexpr std::size_t kForcedTailMinCodepoints = 8;
+constexpr std::size_t kRecentSegmentLimit = 2;
+constexpr std::size_t kSoftSegmentCodepoints = 32;
+constexpr std::size_t kHardSegmentCodepoints = 64;
 
 bool IsUtf8Continuation(unsigned char byte) {
     return (byte & 0xC0U) == 0x80U;
@@ -37,6 +40,10 @@ std::string LongestCommonUtf8Prefix(std::string_view lhs, std::string_view rhs) 
 
 bool StartsWith(std::string_view text, std::string_view prefix) {
     return text.size() >= prefix.size() && text.substr(0, prefix.size()) == prefix;
+}
+
+bool EndsWith(std::string_view text, std::string_view suffix) {
+    return text.size() >= suffix.size() && text.substr(text.size() - suffix.size()) == suffix;
 }
 
 std::string TrimAsciiWordTail(std::string_view text) {
@@ -92,6 +99,97 @@ std::string DropLastUtf8Codepoints(std::string_view text, std::size_t count) {
 
 std::size_t MillisecondsToSamples(int sample_rate_hz, int milliseconds) {
     return static_cast<std::size_t>((static_cast<long long>(sample_rate_hz) * milliseconds) / 1000LL);
+}
+
+std::string_view TrimAsciiWhitespace(std::string_view text) {
+    std::size_t begin = 0;
+    while (begin < text.size()) {
+        const unsigned char byte = static_cast<unsigned char>(text[begin]);
+        if (!std::isspace(byte)) {
+            break;
+        }
+        ++begin;
+    }
+
+    std::size_t end = text.size();
+    while (end > begin) {
+        const unsigned char byte = static_cast<unsigned char>(text[end - 1U]);
+        if (!std::isspace(byte)) {
+            break;
+        }
+        --end;
+    }
+    return text.substr(begin, end - begin);
+}
+
+bool EndsWithAsciiWhitespace(std::string_view text) {
+    if (text.empty()) {
+        return false;
+    }
+    return std::isspace(static_cast<unsigned char>(text.back())) != 0;
+}
+
+bool EndsWithTerminalPunctuation(std::string_view text) {
+    const std::string_view trimmed = TrimAsciiWhitespace(text);
+    if (trimmed.empty()) {
+        return false;
+    }
+    return EndsWith(trimmed, ".") ||
+        EndsWith(trimmed, "!") ||
+        EndsWith(trimmed, "?") ||
+        EndsWith(trimmed, "。") ||
+        EndsWith(trimmed, "！") ||
+        EndsWith(trimmed, "？") ||
+        EndsWith(trimmed, "\n");
+}
+
+bool ShouldFinalizeStableSegment(std::string_view text, bool force_finalize) {
+    const std::string_view trimmed = TrimAsciiWhitespace(text);
+    if (trimmed.empty()) {
+        return false;
+    }
+    if (force_finalize || EndsWithTerminalPunctuation(trimmed)) {
+        return true;
+    }
+    const std::size_t codepoints = CountUtf8Codepoints(trimmed);
+    if (codepoints >= kHardSegmentCodepoints) {
+        return true;
+    }
+    return codepoints >= kSoftSegmentCodepoints && EndsWithAsciiWhitespace(text);
+}
+
+void PushRecentSegment(std::string segment, RealtimeDisplayState * state) {
+    if (state == nullptr) {
+        return;
+    }
+    const std::string_view trimmed = TrimAsciiWhitespace(segment);
+    if (trimmed.empty()) {
+        return;
+    }
+    state->recent_segments.push_back(std::string(trimmed));
+    while (state->recent_segments.size() > kRecentSegmentLimit) {
+        state->recent_segments.erase(state->recent_segments.begin());
+    }
+    ++state->total_finalized_segments;
+}
+
+std::string BuildDisplayText(const RealtimeDisplayState & state) {
+    std::string text;
+    for (const std::string & segment : state.recent_segments) {
+        if (!text.empty()) {
+            text.push_back('\n');
+        }
+        text += segment;
+    }
+
+    const std::string live_text = state.live_stable_text + state.live_partial_text;
+    if (!live_text.empty()) {
+        if (!text.empty()) {
+            text.push_back('\n');
+        }
+        text += live_text;
+    }
+    return text;
 }
 
 std::string ForceFreezePrefix(std::string_view text) {
@@ -255,6 +353,43 @@ Status AdvanceRealtimeTextState(
     }
 
     *update = BuildRealtimeTextUpdate(*state, latest_text, committed);
+    return OkStatus();
+}
+
+Status AdvanceRealtimeDisplayState(
+    const RealtimeTextUpdate & text_update,
+    bool force_finalize,
+    RealtimeDisplayState * state,
+    RealtimeDisplaySnapshot * snapshot) {
+    if (state == nullptr || snapshot == nullptr) {
+        return Status(StatusCode::kInvalidArgument, "state and snapshot must not be null");
+    }
+
+    if (StartsWith(text_update.stable_text, state->last_stable_text)) {
+        state->live_stable_text += std::string(text_update.stable_text.substr(state->last_stable_text.size()));
+        state->last_stable_text = text_update.stable_text;
+    } else if (state->last_stable_text.empty()) {
+        state->last_stable_text = text_update.stable_text;
+        state->live_stable_text = text_update.stable_text;
+    }
+
+    state->live_partial_text = text_update.partial_text;
+    if (force_finalize && !state->live_partial_text.empty()) {
+        state->live_stable_text += state->live_partial_text;
+        state->live_partial_text.clear();
+    }
+
+    if (ShouldFinalizeStableSegment(state->live_stable_text, force_finalize)) {
+        PushRecentSegment(state->live_stable_text, state);
+        state->live_stable_text.clear();
+    }
+
+    snapshot->recent_segments = state->recent_segments;
+    snapshot->live_stable_text = state->live_stable_text;
+    snapshot->live_partial_text = state->live_partial_text;
+    snapshot->live_text = state->live_stable_text + state->live_partial_text;
+    snapshot->display_text = BuildDisplayText(*state);
+    snapshot->total_finalized_segments = state->total_finalized_segments;
     return OkStatus();
 }
 

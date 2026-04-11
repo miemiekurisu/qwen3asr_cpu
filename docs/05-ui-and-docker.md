@@ -59,7 +59,7 @@ docker build -t qasr-ui:latest .
 2. 若为 `PCM + 16-bit`，则按块读取音频帧
 3. 浏览器端先下混为 mono，若采样率非 `16k` 则同步重采样到 `16k`
 4. 结果以 `PCM16` 小块推送到 `/api/realtime/start|chunk|stop`
-5. 前端复用 realtime 返回的 `stable_text` / `partial_text` / `final`
+5. 前端优先消费 realtime 返回的 `recent_segments + live_stable_text + live_partial_text`
 
 此法的收益：
 
@@ -77,14 +77,16 @@ docker build -t qasr-ui:latest .
 
 - 实时 UI 现走“浏览器麦克风 -> PCM16 分块 -> 服务端累积流式转写”
 - 离线 UI 现走“浏览器 WAV -> mono/resample -> PCM16 分块 -> 服务端 realtime 会话”
-- `/api/realtime/chunk` 已回 `stable_text`、`partial_text`、`text`
+- `/api/realtime/chunk` 兼回旧字段 `stable_text`、`partial_text`、`text`
+- `/api/realtime/chunk` 主显示字段改为：`recent_segments`、`live_stable_text`、`live_partial_text`、`live_text`、`display_text`
 - `/api/realtime/stop` 已做一次终态 flush，回 `finalized=true`
+- UI 实时主视图只示近段与活尾；终态仍示全量稿
 - 本地与 Docker 皆可测
 - 浏览器端分块目前仅覆盖 `PCM 16-bit WAV`
 - 若要支持压缩 WAV / float WAV / 其它音频容器，仍需浏览器端额外转码或服务端 chunk upload 会话
 
 ## 五、后续 UI 计划
 
-- UI 视觉层再显式区分 `partial` / `stable` / `final`
-- 稳定前缀不重绘；仅更新尾巴
+- UI 视觉层已显式区分“近段 / 稳定尾 / 不稳定尾 / 终稿”
+- 实时状态下不再以全文单串作主视图；只更新近段与尾巴
 - 若后续补服务端 upload session，可把“非 PCM16 WAV”也改为分块上传，彻底去掉大 multipart 回退

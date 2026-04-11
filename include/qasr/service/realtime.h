@@ -30,6 +30,23 @@ struct RealtimeTextUpdate {
     std::string text;
 };
 
+struct RealtimeDisplayState {
+    std::string last_stable_text;
+    std::vector<std::string> recent_segments;
+    std::string live_stable_text;
+    std::string live_partial_text;
+    std::size_t total_finalized_segments = 0;
+};
+
+struct RealtimeDisplaySnapshot {
+    std::vector<std::string> recent_segments;
+    std::string live_stable_text;
+    std::string live_partial_text;
+    std::string live_text;
+    std::string display_text;
+    std::size_t total_finalized_segments = 0;
+};
+
 Status ValidateRealtimePolicyConfig(const RealtimePolicyConfig & config);
 std::size_t RealtimeMaxDecodeSamples(const RealtimePolicyConfig & config);
 std::size_t TrimRealtimeSamples(std::vector<float> * samples, std::size_t max_samples);
@@ -45,5 +62,10 @@ Status AdvanceRealtimeTextState(
     bool force_finalize,
     RealtimeTextState * state,
     RealtimeTextUpdate * update);
+Status AdvanceRealtimeDisplayState(
+    const RealtimeTextUpdate & text_update,
+    bool force_finalize,
+    RealtimeDisplayState * state,
+    RealtimeDisplaySnapshot * snapshot);
 
 }  // namespace qasr

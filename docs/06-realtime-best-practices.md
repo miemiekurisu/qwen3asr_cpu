@@ -231,6 +231,12 @@
 - `/api/realtime/chunk`
 - `/api/realtime/stop`
 
+当前增量响应字段：
+
+- 兼容稿：`stable_text`、`partial_text`、`text`、`finalized`
+- 主显示稿：`recent_segments`、`live_stable_text`、`live_partial_text`、`live_text`、`display_text`
+- 其中 `recent_segments` 只保近段；`text` 留作终稿与全量记录
+
 二期映射：
 
 - `/v1/realtime` WebSocket
@@ -243,10 +249,10 @@
 
 ## 五、实现次序
 
-1. 先把现有 `/api/realtime/*` 改为“定周期滑窗 + 稳定前缀提交”。
-2. 再给服务端 session worker、bounded queue、指标。
-3. 再补 WebSocket `/v1/realtime`。
-4. 再补 `stable word` / `unstable word` UI。
+1. 已完成：现有 `/api/realtime/*` 走“定周期滑窗 + 稳定前缀提交 + `recent_segments/live_tail`”。
+2. 已完成：测试 UI 主视图改为“近段 + 活尾”，不再实时累加全文。
+3. 下一步：补服务端 session worker、bounded queue、指标。
+4. 再补 WebSocket `/v1/realtime`。
 5. 最后再看 forced aligner 流式后处理。
 
 ## 六、测试

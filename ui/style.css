@@ -188,8 +188,24 @@ select {
   color: #f8fafc;
 }
 
+.output .transcript-block {
+  display: block;
+}
+
+.output .history {
+  color: #cbd5e1;
+}
+
+.output .live {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed rgba(148, 163, 184, 0.35);
+}
+
 .output .partial {
   color: #93c5fd;
+  text-decoration: underline dotted rgba(147, 197, 253, 0.6);
+  text-underline-offset: 4px;
 }
 
 .output .final {

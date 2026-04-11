@@ -124,3 +124,88 @@ QASR_TEST(AdvanceRealtimeTextStateRejectsNullOutputs) {
         qasr::AdvanceRealtimeTextState(config, 0U, "", false, &state, nullptr).code(),
         qasr::StatusCode::kInvalidArgument);
 }
+
+QASR_TEST(AdvanceRealtimeDisplayStateBuildsLiveTail) {
+    qasr::RealtimeDisplayState state;
+    qasr::RealtimeDisplaySnapshot snapshot;
+    qasr::RealtimeTextUpdate update;
+
+    update.partial_text = "hello wor";
+    update.text = "hello wor";
+    QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
+    QASR_EXPECT(snapshot.recent_segments.empty());
+    QASR_EXPECT_EQ(snapshot.live_stable_text, std::string());
+    QASR_EXPECT_EQ(snapshot.live_partial_text, std::string("hello wor"));
+    QASR_EXPECT_EQ(snapshot.display_text, std::string("hello wor"));
+
+    update.stable_text = "hello ";
+    update.partial_text = "world";
+    update.text = "hello world";
+    QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
+    QASR_EXPECT_EQ(snapshot.live_stable_text, std::string("hello "));
+    QASR_EXPECT_EQ(snapshot.live_partial_text, std::string("world"));
+    QASR_EXPECT_EQ(snapshot.live_text, std::string("hello world"));
+}
+
+QASR_TEST(AdvanceRealtimeDisplayStateFinalizesPunctuatedSegment) {
+    qasr::RealtimeDisplayState state;
+    qasr::RealtimeDisplaySnapshot snapshot;
+    qasr::RealtimeTextUpdate update;
+
+    update.stable_text = "hello world. ";
+    update.text = update.stable_text;
+    QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
+    QASR_EXPECT_EQ(snapshot.recent_segments.size(), std::size_t(1));
+    QASR_EXPECT_EQ(snapshot.recent_segments[0], std::string("hello world."));
+    QASR_EXPECT_EQ(snapshot.live_stable_text, std::string());
+    QASR_EXPECT_EQ(snapshot.display_text, std::string("hello world."));
+}
+
+QASR_TEST(AdvanceRealtimeDisplayStateKeepsOnlyRecentSegments) {
+    qasr::RealtimeDisplayState state;
+    qasr::RealtimeDisplaySnapshot snapshot;
+    qasr::RealtimeTextUpdate update;
+
+    update.stable_text = "one. ";
+    update.text = update.stable_text;
+    QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
+
+    update.stable_text = "one. two. ";
+    update.text = update.stable_text;
+    QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
+
+    update.stable_text = "one. two. three. ";
+    update.text = update.stable_text;
+    QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
+
+    QASR_EXPECT_EQ(snapshot.total_finalized_segments, std::size_t(3));
+    QASR_EXPECT_EQ(snapshot.recent_segments.size(), std::size_t(2));
+    QASR_EXPECT_EQ(snapshot.recent_segments[0], std::string("two."));
+    QASR_EXPECT_EQ(snapshot.recent_segments[1], std::string("three."));
+}
+
+QASR_TEST(AdvanceRealtimeDisplayStateForceFinalizeFlushesTail) {
+    qasr::RealtimeDisplayState state;
+    qasr::RealtimeDisplaySnapshot snapshot;
+    qasr::RealtimeTextUpdate update;
+
+    update.stable_text = "hello world again";
+    update.text = update.stable_text;
+    QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, true, &state, &snapshot).ok());
+    QASR_EXPECT_EQ(snapshot.total_finalized_segments, std::size_t(1));
+    QASR_EXPECT_EQ(snapshot.recent_segments[0], std::string("hello world again"));
+    QASR_EXPECT(snapshot.live_text.empty());
+}
+
+QASR_TEST(AdvanceRealtimeDisplayStateRejectsNullOutputs) {
+    qasr::RealtimeDisplayState state;
+    qasr::RealtimeDisplaySnapshot snapshot;
+    qasr::RealtimeTextUpdate update;
+
+    QASR_EXPECT_EQ(
+        qasr::AdvanceRealtimeDisplayState(update, false, nullptr, &snapshot).code(),
+        qasr::StatusCode::kInvalidArgument);
+    QASR_EXPECT_EQ(
+        qasr::AdvanceRealtimeDisplayState(update, false, &state, nullptr).code(),
+        qasr::StatusCode::kInvalidArgument);
+}

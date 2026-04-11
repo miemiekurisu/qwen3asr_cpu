@@ -208,16 +208,15 @@ vLLM `qwen3_asr_realtime` buffer 默认 `5s` 才吐一段。
 然其多赖额外训练或额外头。
 本项目首版当先把“无停顿滑窗 + 稳定前缀”做稳，再议双路增强。
 
-### 17. 实时接口第一版已改成三态文本
+### 17. 实时接口已由“三态文本”进到“近段 + 活尾”
 
-现 `/api/realtime/*` 与 `/api/capture/*` 已不再只回一段 `partial_text`，而回：
+现 `/api/realtime/*` 与 `/api/capture/*`：
 
-- `stable_text`
-- `partial_text`
-- `text`
-- `finalized`
+- 仍兼回：`stable_text`、`partial_text`、`text`、`finalized`
+- 新主显示字段：`recent_segments`、`live_stable_text`、`live_partial_text`、`live_text`、`display_text`
+- `recent_segments` 只保近段，不再把全文累加态当实时主结构
 
-此使前端后续可做“稳定前缀不重绘”。
+此使前端可只绘近段与活尾，终态再落全量稿。
 
 ## 2026-04-11
 

@@ -985,6 +985,8 @@ struct RealtimeSession {
     std::size_t total_samples = 0;
     std::size_t retained_sample_offset = 0;
     RealtimeTextState text_state;
+    RealtimeDisplayState display_state;
+    RealtimeDisplaySnapshot display_snapshot;
     std::string text;
     std::string stable_text;
     std::string partial_text;
@@ -1010,6 +1012,8 @@ struct HostCaptureSession {
     std::size_t total_samples = 0;
     std::size_t retained_sample_offset = 0;
     RealtimeTextState text_state;
+    RealtimeDisplayState display_state;
+    RealtimeDisplaySnapshot display_snapshot;
     std::string text;
     std::string stable_text;
     std::string partial_text;
@@ -1310,6 +1314,7 @@ void ApplyRealtimeUpdate(
     const RealtimeTextUpdate & update,
     double inference_ms,
     bool decoded,
+    bool finalized,
     SessionLike * session) {
     if (session == nullptr) {
         return;
@@ -1317,6 +1322,7 @@ void ApplyRealtimeUpdate(
     session->stable_text = update.stable_text;
     session->partial_text = update.partial_text;
     session->text = update.text;
+    (void)AdvanceRealtimeDisplayState(update, finalized, &session->display_state, &session->display_snapshot);
     session->last_inference_ms = inference_ms;
     session->last_decode_ran = decoded;
 }
@@ -1327,6 +1333,10 @@ Json BuildRealtimeJson(
     bool finalized,
     bool supported) {
     Json body;
+    Json recent_segments = Json::array();
+    for (const std::string & segment : session.display_snapshot.recent_segments) {
+        recent_segments.push_back(segment);
+    }
     body["session_id"] = session.id;
     body["sample_count"] = session.total_samples;
     body["retained_sample_count"] = session.samples.size();
@@ -1337,6 +1347,12 @@ Json BuildRealtimeJson(
     body["stable_text"] = session.stable_text;
     body["partial_text"] = session.partial_text;
     body["text"] = session.text;
+    body["recent_segments"] = std::move(recent_segments);
+    body["finalized_segment_count"] = session.display_snapshot.total_finalized_segments;
+    body["live_stable_text"] = session.display_snapshot.live_stable_text;
+    body["live_partial_text"] = session.display_snapshot.live_partial_text;
+    body["live_text"] = session.display_snapshot.live_text;
+    body["display_text"] = session.display_snapshot.display_text;
     body["inference_ms"] = session.last_inference_ms;
     return body;
 }
@@ -2076,7 +2092,7 @@ int RunServer(const ServerConfig & config) {
                 SetErrorResponse(response, update_status, StatusToHttpCode(update_status));
                 return;
             }
-            ApplyRealtimeUpdate(update, result.total_ms, true, &it->second);
+            ApplyRealtimeUpdate(update, result.total_ms, true, false, &it->second);
             body = BuildRealtimeJson(it->second, false, true);
         }
         metrics.realtime_decode_runs.fetch_add(1);
@@ -2117,7 +2133,7 @@ int RunServer(const ServerConfig & config) {
                     &session.text_state,
                     &update);
                 if (update_status.ok()) {
-                    ApplyRealtimeUpdate(update, result.total_ms, true, &session);
+                    ApplyRealtimeUpdate(update, result.total_ms, true, true, &session);
                 }
             } else {
                 RealtimeTextUpdate update;
@@ -2129,7 +2145,7 @@ int RunServer(const ServerConfig & config) {
                     &session.text_state,
                     &update);
                 if (update_status.ok()) {
-                    ApplyRealtimeUpdate(update, session.last_inference_ms, false, &session);
+                    ApplyRealtimeUpdate(update, session.last_inference_ms, false, true, &session);
                 }
             }
         }
@@ -2275,7 +2291,7 @@ int RunServer(const ServerConfig & config) {
                     capture->error = update_status.message();
                     break;
                 }
-                ApplyRealtimeUpdate(update, result.total_ms, true, capture.get());
+                ApplyRealtimeUpdate(update, result.total_ms, true, false, capture.get());
             }
 
             bool stopped_by_request = false;
@@ -2336,7 +2352,7 @@ int RunServer(const ServerConfig & config) {
                         &capture->text_state,
                         &update);
                     if (update_status.ok()) {
-                        ApplyRealtimeUpdate(update, result.total_ms, true, capture.get());
+                        ApplyRealtimeUpdate(update, result.total_ms, true, true, capture.get());
                     }
                 } else if (capture->error.empty()) {
                     capture->error = result.status.message();
@@ -2351,7 +2367,7 @@ int RunServer(const ServerConfig & config) {
                     &capture->text_state,
                     &update);
                 if (update_status.ok()) {
-                    ApplyRealtimeUpdate(update, capture->last_inference_ms, false, capture.get());
+                    ApplyRealtimeUpdate(update, capture->last_inference_ms, false, true, capture.get());
                 }
             }
         }

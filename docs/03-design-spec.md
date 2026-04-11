@@ -293,6 +293,12 @@ CLI 长音频输出：
 
 `Unseen -> Partial -> Stable -> Final`
 
+首期增量返回契约：
+
+- 兼容旧字段：`stable_text`、`partial_text`、`text`、`finalized`
+- 主显示字段：`recent_segments`、`live_stable_text`、`live_partial_text`、`live_text`、`display_text`
+- `recent_segments` 仅保近段，供 UI 做有界字幕窗；`text` 留作全量稿与 stop 终稿
+
 ## 四、错误码原则
 
 | 码 | 用途 |
@@ -347,6 +353,13 @@ CLI 长音频输出：
 | `partial` | 本轮全文减去已稳定前缀 |
 | `stable` | 只向前增长；已提交前缀内的模型修正不再外发 |
 | `final` | stop / flush / align 完成后 |
+
+### 显示律
+
+- 服务端把稳定增量折成 `recent_segments + live_tail`
+- `recent_segments` 只保近段，避免实时响应体随会话线性涨
+- `live_tail = live_stable_text + live_partial_text`
+- UI 实时主视图只绘 `recent_segments + live_tail`；终态再回全量 `text`
 
 ### 失败保护
 
