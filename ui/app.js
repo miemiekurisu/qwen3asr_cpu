@@ -9,7 +9,11 @@ const offlineResult = document.getElementById("offlineResult");
 const startRealtime = document.getElementById("startRealtime");
 const stopRealtime = document.getElementById("stopRealtime");
 const clearRealtime = document.getElementById("clearRealtime");
+const exportRealtimeText = document.getElementById("exportRealtimeText");
+const exportRealtimeJson = document.getElementById("exportRealtimeJson");
 const realtimeResult = document.getElementById("realtimeResult");
+const realtimeConfirmed = document.getElementById("realtimeConfirmed");
+const realtimeArchiveHint = document.getElementById("realtimeArchiveHint");
 const realtimeStatus = document.getElementById("realtimeStatus");
 
 const wavUpload = globalThis.QasrWavUpload;
@@ -26,6 +30,14 @@ let realtimeState = {
   pending: [],
   sampleRate: 0,
   startedAt: 0,
+};
+
+let realtimeArchive = {
+  sessionId: "",
+  confirmedText: "",
+  lastPayload: null,
+  finalized: false,
+  updatedAt: "",
 };
 
 let offlineState = {
@@ -157,6 +169,126 @@ function offlineElapsedSeconds() {
 
 function formatSeconds(value) {
   return value.toFixed(1);
+}
+
+function escapeHtml(text) {
+  return String(text)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function countCodepoints(text) {
+  return Array.from(text || "").length;
+}
+
+function extractConfirmedRealtimeText(data) {
+  if (!data || typeof data !== "object") {
+    return "";
+  }
+  if (data.finalized && typeof data.text === "string") {
+    return data.text;
+  }
+  if (typeof data.stable_text === "string") {
+    return data.stable_text;
+  }
+  return "";
+}
+
+function updateRealtimeExportAvailability() {
+  const hasConfirmedText = Boolean(realtimeArchive.confirmedText.trim());
+  exportRealtimeText.disabled = !hasConfirmedText;
+  exportRealtimeJson.disabled = !hasConfirmedText;
+}
+
+function renderRealtimeArchive(fallback) {
+  const confirmedText = realtimeArchive.confirmedText;
+  if (!confirmedText) {
+    realtimeConfirmed.textContent = fallback;
+    realtimeArchiveHint.textContent = realtimeState.sessionId
+      ? "已确定文本会随着稳定前缀推进保存在此处。"
+      : "已确定文本会保存在此处，停止后可导出。";
+    updateRealtimeExportAvailability();
+    return;
+  }
+
+  realtimeConfirmed.textContent = confirmedText;
+  const chars = countCodepoints(confirmedText);
+  realtimeArchiveHint.textContent = realtimeArchive.finalized
+    ? `已保留终稿 ${chars} 字，可导出 TXT 或 JSON。`
+    : `已保留已确定文本 ${chars} 字，实时主视图仍只显示近段与活尾。`;
+  updateRealtimeExportAvailability();
+}
+
+function resetRealtimeArchive(fallback = "尚无已确定文本") {
+  realtimeArchive = {
+    sessionId: "",
+    confirmedText: "",
+    lastPayload: null,
+    finalized: false,
+    updatedAt: "",
+  };
+  renderRealtimeArchive(fallback);
+}
+
+function syncRealtimeArchive(data) {
+  realtimeArchive.sessionId = data?.session_id || realtimeState.sessionId || realtimeArchive.sessionId;
+  realtimeArchive.confirmedText = extractConfirmedRealtimeText(data);
+  realtimeArchive.lastPayload = data || null;
+  realtimeArchive.finalized = Boolean(data?.finalized);
+  realtimeArchive.updatedAt = new Date().toISOString();
+  renderRealtimeArchive("尚无已确定文本");
+}
+
+function buildRealtimeExportName(ext) {
+  const sessionId = (realtimeArchive.sessionId || "session").replace(/[^a-zA-Z0-9_-]+/g, "-");
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `qasr-realtime-${sessionId}-${stamp}.${ext}`;
+}
+
+function triggerDownload(filename, content, mimeType) {
+  const blob = new Blob([content], {type: mimeType});
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function exportRealtimeTranscript(format) {
+  if (!realtimeArchive.confirmedText.trim()) {
+    realtimeStatus.textContent = "暂无可导出的已确定文本";
+    return;
+  }
+
+  if (format === "txt") {
+    triggerDownload(
+      buildRealtimeExportName("txt"),
+      realtimeArchive.confirmedText,
+      "text/plain;charset=utf-8",
+    );
+    realtimeStatus.textContent = "已导出 TXT";
+    return;
+  }
+
+  const payload = {
+    exported_at: new Date().toISOString(),
+    session_id: realtimeArchive.sessionId,
+    finalized: realtimeArchive.finalized,
+    confirmed_text: realtimeArchive.confirmedText,
+    latest_response: realtimeArchive.lastPayload,
+  };
+  triggerDownload(
+    buildRealtimeExportName("json"),
+    `${JSON.stringify(payload, null, 2)}\n`,
+    "application/json;charset=utf-8",
+  );
+  realtimeStatus.textContent = "已导出 JSON";
 }
 
 async function checkHealth() {
@@ -519,6 +651,7 @@ async function flushRealtimeChunk(force) {
       throw new Error(data.error.message);
     }
     renderTranscript(realtimeResult, data, "尚无结果");
+    syncRealtimeArchive(data);
     const audioDur = (data.sample_count / 16000).toFixed(1);
     const wallElapsed = ((performance.now() - realtimeState.startedAt) / 1000).toFixed(1);
     const lag = (wallElapsed - audioDur).toFixed(1);
@@ -563,6 +696,9 @@ async function startRealtimeCapture() {
       sampleRate: audioContext.sampleRate,
       startedAt: performance.now(),
     };
+    resetRealtimeArchive("实时转写中，已确定文本会保存在此处。");
+    realtimeArchive.sessionId = sessionData.session_id;
+    updateRealtimeExportAvailability();
 
     processor.onaudioprocess = (event) => {
       const channel = event.inputBuffer.getChannelData(0);
@@ -613,9 +749,12 @@ async function stopRealtimeCapture() {
       body: "",
     });
     const data = await response.json();
-    if (response.ok && data.text) {
+    if (response.ok) {
       renderTranscript(realtimeResult, data, "尚无结果");
-      realtimeStatus.textContent = `会话 ${sessionId} 已停止，终稿已出`;
+      syncRealtimeArchive(data);
+      realtimeStatus.textContent = data.text
+        ? `会话 ${sessionId} 已停止，终稿已出`
+        : `会话 ${sessionId} 已停止`;
     } else {
       realtimeStatus.textContent = data.error ? data.error.message : "停止失败";
     }
@@ -655,9 +794,19 @@ stopRealtime.addEventListener("click", async () => {
 
 clearRealtime.addEventListener("click", () => {
   resetTranscriptFrame(realtimeResult, "尚无结果");
+  resetRealtimeArchive();
   realtimeStatus.textContent = "未开始";
   clearRealtime.style.display = "none";
 });
 
+exportRealtimeText.addEventListener("click", () => {
+  exportRealtimeTranscript("txt");
+});
+
+exportRealtimeJson.addEventListener("click", () => {
+  exportRealtimeTranscript("json");
+});
+
 updateControlAvailability();
+resetRealtimeArchive();
 checkHealth();

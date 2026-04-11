@@ -49,8 +49,16 @@
             <button id="stopRealtime" class="ghost" type="button" disabled>停止</button>
             <button id="clearRealtime" class="ghost" type="button" style="display:none">清空</button>
           </div>
+          <div class="button-row export-row">
+            <button id="exportRealtimeText" class="ghost" type="button" disabled>导出 TXT</button>
+            <button id="exportRealtimeJson" class="ghost" type="button" disabled>导出 JSON</button>
+          </div>
           <p id="realtimeStatus" class="hint">未开始</p>
           <pre id="realtimeResult" class="output">尚无结果</pre>
+          <div class="stack transcript-archive">
+            <p id="realtimeArchiveHint" class="hint">已确定文本会保存在此处，停止后可导出。</p>
+            <pre id="realtimeConfirmed" class="output archive">尚无已确定文本</pre>
+          </div>
         </div>
       </article>
     </section>

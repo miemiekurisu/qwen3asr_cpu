@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "qasr/core/status.h"
 
@@ -12,6 +13,22 @@ enum class TranscriptionResponseFormat {
     kJson = 0,
     kText,
     kVerboseJson,
+};
+
+enum class OpenAiRealtimeAction {
+    kSessionCreate = 0,
+    kInputAudioBufferAppend,
+    kInputAudioBufferCommit,
+};
+
+struct OpenAiRealtimeRequest {
+    OpenAiRealtimeAction action = OpenAiRealtimeAction::kSessionCreate;
+    std::string session_id;
+    std::string model;
+    std::string language;
+    std::string input_audio_format = "pcm16le";
+    std::string audio;
+    bool stream = true;
 };
 
 struct ServerConfig {
@@ -29,6 +46,14 @@ Status ParseTranscriptionResponseFormat(
     TranscriptionResponseFormat * format);
 Status ValidateTimestampGranularities(bool want_segment_timestamps, bool want_word_timestamps);
 std::string ResolveServedModelId(std::string_view model_dir);
+bool IsTerminalJobState(std::string_view state) noexcept;
+bool ShouldEvictCompletedJob(
+    std::string_view state,
+    std::int64_t updated_at_seconds,
+    std::int64_t now_seconds,
+    std::int64_t ttl_seconds) noexcept;
+Status ParseOpenAiRealtimeRequest(std::string_view body, OpenAiRealtimeRequest * request);
+Status DecodeBase64Pcm16Le(std::string_view encoded, std::vector<float> * samples);
 
 Status ValidateServerConfig(const ServerConfig & config);
 Status ParseServerArguments(int argc, const char * const argv[], ServerConfig * config, bool * show_help);

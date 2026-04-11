@@ -87,6 +87,10 @@ h2 {
   margin-top: 18px;
 }
 
+.export-row {
+  margin-top: -4px;
+}
+
 .grid {
   display: grid;
   grid-template-columns: 2fr 1fr;
@@ -212,6 +216,19 @@ select {
   color: #fde68a;
 }
 
+.transcript-archive {
+  padding-top: 6px;
+  border-top: 1px solid rgba(31, 41, 51, 0.08);
+}
+
+.output.archive {
+  min-height: 180px;
+  background: rgba(255, 252, 245, 0.92);
+  color: var(--ink);
+  border: 1px solid rgba(31, 41, 51, 0.08);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+}
+
 .badge {
   display: inline-flex;
   align-items: center;
@@ -235,6 +252,15 @@ select {
 @media (max-width: 880px) {
   .grid {
     grid-template-columns: 1fr;
+  }
+
+  .button-row {
+    align-items: stretch;
+  }
+
+  .action,
+  .ghost {
+    width: 100%;
   }
 }
 

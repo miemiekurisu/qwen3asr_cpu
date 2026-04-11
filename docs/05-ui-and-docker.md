@@ -80,7 +80,8 @@ docker build -t qasr-ui:latest .
 - `/api/realtime/chunk` 兼回旧字段 `stable_text`、`partial_text`、`text`
 - `/api/realtime/chunk` 主显示字段改为：`recent_segments`、`live_stable_text`、`live_partial_text`、`live_text`、`display_text`
 - `/api/realtime/stop` 已做一次终态 flush，回 `finalized=true`
-- UI 实时主视图只示近段与活尾；终态仍示全量稿
+- UI 实时主视图只示近段与活尾；另设“已确定文本”区保留 `stable_text`/终稿
+- UI 已可把“已确定文本”导出为 `TXT` 或 `JSON`
 - 本地与 Docker 皆可测
 - 浏览器端分块目前仅覆盖 `PCM 16-bit WAV`
 - 若要支持压缩 WAV / float WAV / 其它音频容器，仍需浏览器端额外转码或服务端 chunk upload 会话
@@ -89,4 +90,5 @@ docker build -t qasr-ui:latest .
 
 - UI 视觉层已显式区分“近段 / 稳定尾 / 不稳定尾 / 终稿”
 - 实时状态下不再以全文单串作主视图；只更新近段与尾巴
+- 已确定文本单独留存于页面，可在 stop 前后导出
 - 若后续补服务端 upload session，可把“非 PCM16 WAV”也改为分块上传，彻底去掉大 multipart 回退

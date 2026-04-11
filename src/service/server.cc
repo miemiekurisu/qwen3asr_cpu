@@ -20,6 +20,9 @@
 #include <utility>
 #include <vector>
 
+#include "qasr/base/json.h"
+#include "qasr/protocol/openai.h"
+
 #if !defined(_WIN32)
 #include <csignal>
 #include <sys/types.h>
@@ -35,7 +38,6 @@ extern "C" {
 #include "qwen_asr_kernels.h"
 }
 #include "qasr/base/http_server.h"
-#include "qasr/base/json.h"
 #endif
 
 #include "qasr/runtime/model_bridge.h"
@@ -143,6 +145,201 @@ std::string ResolveServedModelId(std::string_view model_dir) {
     return normalized;
 }
 
+bool IsTerminalJobState(std::string_view state) noexcept {
+    return state == "completed" || state == "failed" || state == "cancelled";
+}
+
+bool ShouldEvictCompletedJob(
+    std::string_view state,
+    std::int64_t updated_at_seconds,
+    std::int64_t now_seconds,
+    std::int64_t ttl_seconds) noexcept {
+    if (!IsTerminalJobState(state) || ttl_seconds <= 0 || now_seconds < updated_at_seconds) {
+        return false;
+    }
+    return now_seconds - updated_at_seconds >= ttl_seconds;
+}
+
+namespace {
+
+std::string NormalizeAsciiLower(std::string_view text) {
+    std::string normalized;
+    normalized.reserve(text.size());
+    for (const char ch : text) {
+        if (ch >= 'A' && ch <= 'Z') {
+            normalized.push_back(static_cast<char>(ch - 'A' + 'a'));
+        } else {
+            normalized.push_back(ch);
+        }
+    }
+    return normalized;
+}
+
+bool IsAsciiWhitespace(char ch) noexcept {
+    return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t';
+}
+
+int DecodeBase64Value(char ch) noexcept {
+    if (ch >= 'A' && ch <= 'Z') {
+        return ch - 'A';
+    }
+    if (ch >= 'a' && ch <= 'z') {
+        return ch - 'a' + 26;
+    }
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0' + 52;
+    }
+    if (ch == '+') {
+        return 62;
+    }
+    if (ch == '/') {
+        return 63;
+    }
+    return -1;
+}
+
+}  // namespace
+
+Status ParseOpenAiRealtimeRequest(std::string_view body, OpenAiRealtimeRequest * request) {
+    if (request == nullptr) {
+        return Status(StatusCode::kInvalidArgument, "request output must not be null");
+    }
+
+    Json json_body = body.empty() ? Json::object() : Json::parse(std::string(body));
+    if (json_body.is_discarded() || !json_body.is_object()) {
+        return Status(StatusCode::kInvalidArgument, "request body must be a JSON object");
+    }
+
+    *request = OpenAiRealtimeRequest{};
+
+    const std::string type = NormalizeAsciiLower(json_body.value("type", std::string("session.create")));
+    if (type == "session.create") {
+        request->action = OpenAiRealtimeAction::kSessionCreate;
+    } else if (type == "input_audio_buffer.append") {
+        request->action = OpenAiRealtimeAction::kInputAudioBufferAppend;
+    } else if (type == "input_audio_buffer.commit") {
+        request->action = OpenAiRealtimeAction::kInputAudioBufferCommit;
+    } else {
+        return Status(StatusCode::kInvalidArgument, "unsupported realtime request type: " + type);
+    }
+
+    request->stream = json_body.value("stream", true);
+
+    const Json * session = nullptr;
+    if (json_body.contains("session") && json_body["session"].is_object()) {
+        session = &json_body["session"];
+    }
+
+    request->session_id = json_body.value("session_id", std::string());
+    if (request->session_id.empty() && session != nullptr) {
+        request->session_id = session->value("id", std::string());
+    }
+
+    request->model = json_body.value("model", std::string());
+    if (request->model.empty() && session != nullptr) {
+        request->model = session->value("model", std::string());
+    }
+
+    request->language = json_body.value("language", std::string());
+    if (request->language.empty() && session != nullptr) {
+        request->language = session->value("language", std::string());
+    }
+
+    request->input_audio_format = json_body.value("input_audio_format", std::string());
+    if (request->input_audio_format.empty() && session != nullptr) {
+        request->input_audio_format = session->value("input_audio_format", std::string());
+    }
+    if (request->input_audio_format.empty()) {
+        request->input_audio_format = "pcm16le";
+    }
+    request->input_audio_format = NormalizeAsciiLower(request->input_audio_format);
+    if (request->input_audio_format == "pcm16") {
+        request->input_audio_format = "pcm16le";
+    }
+    if (request->input_audio_format != "pcm16le") {
+        return Status(StatusCode::kFailedPrecondition, "realtime path currently supports only input_audio_format=pcm16le");
+    }
+
+    request->audio = json_body.value("audio", std::string());
+    if (request->audio.empty() &&
+        json_body.contains("input_audio_buffer") &&
+        json_body["input_audio_buffer"].is_object()) {
+        request->audio = json_body["input_audio_buffer"].value("audio", std::string());
+    }
+
+    if (request->action != OpenAiRealtimeAction::kSessionCreate && request->session_id.empty()) {
+        return Status(StatusCode::kInvalidArgument, "session_id is required");
+    }
+    if (request->action == OpenAiRealtimeAction::kInputAudioBufferAppend && request->audio.empty()) {
+        return Status(StatusCode::kInvalidArgument, "audio is required for input_audio_buffer.append");
+    }
+    return OkStatus();
+}
+
+Status DecodeBase64Pcm16Le(std::string_view encoded, std::vector<float> * samples) {
+    if (samples == nullptr) {
+        return Status(StatusCode::kInvalidArgument, "samples output must not be null");
+    }
+
+    std::string compact;
+    compact.reserve(encoded.size());
+    for (const char ch : encoded) {
+        if (!IsAsciiWhitespace(ch)) {
+            compact.push_back(ch);
+        }
+    }
+
+    if (compact.empty()) {
+        return Status(StatusCode::kInvalidArgument, "audio must be a base64-encoded pcm16le payload");
+    }
+    if (compact.size() % 4U != 0U) {
+        return Status(StatusCode::kInvalidArgument, "audio base64 payload must be padded to 4-byte groups");
+    }
+
+    std::string bytes;
+    bytes.reserve((compact.size() / 4U) * 3U);
+    for (std::size_t index = 0; index < compact.size(); index += 4U) {
+        const char c0 = compact[index + 0U];
+        const char c1 = compact[index + 1U];
+        const char c2 = compact[index + 2U];
+        const char c3 = compact[index + 3U];
+        const int v0 = DecodeBase64Value(c0);
+        const int v1 = DecodeBase64Value(c1);
+        const int v2 = (c2 == '=') ? 0 : DecodeBase64Value(c2);
+        const int v3 = (c3 == '=') ? 0 : DecodeBase64Value(c3);
+        if (v0 < 0 || v1 < 0 || (c2 != '=' && v2 < 0) || (c3 != '=' && v3 < 0)) {
+            return Status(StatusCode::kInvalidArgument, "audio contains invalid base64 characters");
+        }
+        if (c2 == '=' && c3 != '=') {
+            return Status(StatusCode::kInvalidArgument, "audio base64 padding is malformed");
+        }
+
+        bytes.push_back(static_cast<char>((v0 << 2) | (v1 >> 4)));
+        if (c2 != '=') {
+            bytes.push_back(static_cast<char>(((v1 & 0x0F) << 4) | (v2 >> 2)));
+        }
+        if (c3 != '=') {
+            bytes.push_back(static_cast<char>(((v2 & 0x03) << 6) | v3));
+        }
+    }
+
+    if (bytes.size() % 2U != 0U) {
+        return Status(StatusCode::kInvalidArgument, "pcm16le audio must contain an even number of bytes");
+    }
+
+    samples->clear();
+    samples->reserve(bytes.size() / 2U);
+    for (std::size_t index = 0; index < bytes.size(); index += 2U) {
+        const std::uint8_t lo = static_cast<std::uint8_t>(bytes[index + 0U]);
+        const std::uint8_t hi = static_cast<std::uint8_t>(bytes[index + 1U]);
+        const std::int16_t sample = static_cast<std::int16_t>(
+            static_cast<std::uint16_t>(lo) |
+            (static_cast<std::uint16_t>(hi) << 8U));
+        samples->push_back(static_cast<float>(sample) / 32768.0f);
+    }
+    return OkStatus();
+}
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -153,6 +350,8 @@ using Json = qasr::Json;
 
 constexpr std::size_t kHttpWorkerQueueLimit = 64;
 constexpr std::size_t kMaxRealtimeSessions = 64;
+constexpr std::int64_t kAsyncJobCleanupIntervalSeconds = 60;
+constexpr std::int64_t kCompletedAsyncJobTtlSeconds = 3600;
 
 Status ParseInt32Argument(std::string_view text, const char * field_name, std::int32_t * value) {
     if (value == nullptr) {
@@ -878,6 +1077,26 @@ Json BuildJobJson(const OfflineJob & job) {
     return body;
 }
 
+std::size_t CleanupExpiredJobs(
+    std::unordered_map<std::string, OfflineJob> * jobs,
+    std::int64_t now_seconds,
+    std::int64_t ttl_seconds) {
+    if (jobs == nullptr) {
+        return 0U;
+    }
+
+    std::size_t removed = 0U;
+    for (auto it = jobs->begin(); it != jobs->end();) {
+        if (ShouldEvictCompletedJob(it->second.state, it->second.updated_at, now_seconds, ttl_seconds)) {
+            it = jobs->erase(it);
+            ++removed;
+            continue;
+        }
+        ++it;
+    }
+    return removed;
+}
+
 class SseStreamState {
 public:
     void Push(std::string event) {
@@ -981,6 +1200,8 @@ Json BuildChatCompletionResponse(
 
 struct RealtimeSession {
     std::string id;
+    std::string model;
+    std::string language;
     std::vector<float> samples;
     std::size_t total_samples = 0;
     std::size_t retained_sample_offset = 0;
@@ -997,6 +1218,8 @@ struct RealtimeSession {
 struct ServerMetrics {
     std::atomic<std::uint64_t> offline_requests{0};
     std::atomic<std::uint64_t> async_jobs_submitted{0};
+    std::atomic<std::uint64_t> async_job_cleanup_runs{0};
+    std::atomic<std::uint64_t> async_jobs_evicted{0};
     std::atomic<std::uint64_t> chat_requests{0};
     std::atomic<std::uint64_t> realtime_sessions_started{0};
     std::atomic<std::uint64_t> realtime_decode_runs{0};
@@ -1357,6 +1580,38 @@ Json BuildRealtimeJson(
     return body;
 }
 
+Json BuildOpenAiRealtimeSessionJson(
+    const RealtimeSession & session,
+    std::string_view model_id,
+    const RealtimePolicyConfig & realtime_policy) {
+    Json body = Json::object({
+        {"id", session.id},
+        {"object", "realtime.session"},
+        {"model", std::string(model_id)},
+        {"language", session.language},
+        {"input_audio_format", "pcm16le"},
+        {"max_decode_window_ms", realtime_policy.max_decode_window_ms},
+        {"supported", true},
+    });
+    return body;
+}
+
+Json BuildOpenAiRealtimeEventJson(
+    const RealtimeSession & session,
+    std::string_view type,
+    bool finalized,
+    std::string_view model_id,
+    const RealtimePolicyConfig & realtime_policy) {
+    Json body = Json::object({
+        {"object", "realtime.response"},
+        {"type", std::string(type)},
+        {"session_id", session.id},
+        {"session", BuildOpenAiRealtimeSessionJson(session, model_id, realtime_policy)},
+        {"state", BuildRealtimeJson(session, finalized, true)},
+    });
+    return body;
+}
+
 }  // namespace
 #else
 }  // namespace
@@ -1529,60 +1784,15 @@ int RunServer(const ServerConfig & config) {
     const auto server_start = std::chrono::steady_clock::now();
     ServerMetrics metrics;
     std::atomic<std::uint64_t> session_counter{1};
-    enum class ActiveWorkloadKind {
-        kNone,
-        kOffline,
-        kRealtime,
-        kHostCapture,
-    };
-    struct ActiveWorkload {
-        ActiveWorkloadKind kind = ActiveWorkloadKind::kNone;
-        std::string id;
-    };
     std::unordered_map<std::string, RealtimeSession> realtime_sessions;
     std::mutex realtime_mu;
     std::unordered_map<std::string, OfflineJob> jobs;
     std::mutex jobs_mu;
     std::shared_ptr<HostCaptureSession> host_capture;
     std::mutex host_capture_mu;
-    ActiveWorkload active_workload;
-    std::mutex active_workload_mu;
-
-    auto DescribeActiveWorkload = [](ActiveWorkloadKind kind) -> std::string_view {
-        switch (kind) {
-            case ActiveWorkloadKind::kOffline:
-                return "offline transcription";
-            case ActiveWorkloadKind::kRealtime:
-                return "realtime transcription";
-            case ActiveWorkloadKind::kHostCapture:
-                return "host capture";
-            case ActiveWorkloadKind::kNone:
-            default:
-                return "workload";
-        }
-    };
-    auto TryAcquireActiveWorkload = [&](ActiveWorkloadKind kind, const std::string & id, HttpResponse & response) -> bool {
-        std::lock_guard<std::mutex> lock(active_workload_mu);
-        if (active_workload.kind != ActiveWorkloadKind::kNone) {
-            SetErrorResponse(
-                response,
-                Status(
-                    StatusCode::kFailedPrecondition,
-                    std::string(DescribeActiveWorkload(active_workload.kind)) + " is already active"),
-                409);
-            return false;
-        }
-        active_workload.kind = kind;
-        active_workload.id = id;
-        return true;
-    };
-    auto ReleaseActiveWorkload = [&](ActiveWorkloadKind kind, const std::string & id) {
-        std::lock_guard<std::mutex> lock(active_workload_mu);
-        if (active_workload.kind == kind && active_workload.id == id) {
-            active_workload.kind = ActiveWorkloadKind::kNone;
-            active_workload.id.clear();
-        }
-    };
+    std::mutex maintenance_mu;
+    std::condition_variable maintenance_cv;
+    bool stop_maintenance = false;
 
     HttpServer server;
     {
@@ -1596,6 +1806,167 @@ int RunServer(const ServerConfig & config) {
     server.set_write_timeout(30, 0);
     server.set_idle_interval(1, 0);
     server.set_payload_max_length(64ULL * 1024ULL * 1024ULL);
+
+    std::thread job_cleanup_thread([&]() {
+        std::unique_lock<std::mutex> lock(maintenance_mu);
+        while (!stop_maintenance) {
+            const bool stopping = maintenance_cv.wait_for(
+                lock,
+                std::chrono::seconds(kAsyncJobCleanupIntervalSeconds),
+                [&]() { return stop_maintenance; });
+            if (stopping) {
+                break;
+            }
+
+            lock.unlock();
+            const std::int64_t now_seconds = CurrentUnixSeconds();
+            std::size_t removed = 0U;
+            {
+                std::lock_guard<std::mutex> jobs_lock(jobs_mu);
+                removed = CleanupExpiredJobs(&jobs, now_seconds, kCompletedAsyncJobTtlSeconds);
+            }
+            metrics.async_job_cleanup_runs.fetch_add(1);
+            metrics.async_jobs_evicted.fetch_add(static_cast<std::uint64_t>(removed));
+            lock.lock();
+        }
+    });
+
+    auto CreateRealtimeSession = [&](std::string model_id, std::string language, RealtimeSession * created) -> Status {
+        if (created == nullptr) {
+            return Status(StatusCode::kInvalidArgument, "created session output must not be null");
+        }
+
+        RealtimeSession session;
+        session.id = std::to_string(session_counter.fetch_add(1));
+        session.model = std::move(model_id);
+        session.language = std::move(language);
+        {
+            std::lock_guard<std::mutex> lock(realtime_mu);
+            if (realtime_sessions.size() >= kMaxRealtimeSessions) {
+                return Status(StatusCode::kFailedPrecondition, "too many realtime sessions");
+            }
+            realtime_sessions.emplace(session.id, session);
+        }
+        metrics.realtime_sessions_started.fetch_add(1);
+        *created = std::move(session);
+        return OkStatus();
+    };
+
+    auto AppendRealtimeChunk = [&](const std::string & session_id, const std::vector<float> & chunk, RealtimeSession * snapshot) -> Status {
+        if (snapshot == nullptr) {
+            return Status(StatusCode::kInvalidArgument, "session snapshot output must not be null");
+        }
+
+        std::vector<float> samples;
+        std::size_t total_samples = 0U;
+        std::string language;
+        {
+            std::lock_guard<std::mutex> lock(realtime_mu);
+            auto it = realtime_sessions.find(session_id);
+            if (it == realtime_sessions.end()) {
+                return Status(StatusCode::kNotFound, "session not found");
+            }
+            AppendRealtimeSamples(realtime_policy, chunk, &it->second);
+            if (!RealtimeShouldDecode(
+                    realtime_policy,
+                    it->second.total_samples,
+                    it->second.text_state.last_decode_samples,
+                    false)) {
+                it->second.last_decode_ran = false;
+                *snapshot = it->second;
+                return OkStatus();
+            }
+            samples = it->second.samples;
+            total_samples = it->second.total_samples;
+            language = it->second.language;
+        }
+
+        ModelDecodeOptions decode;
+        decode.use_stream_path = true;
+        decode.language = std::move(language);
+        const AsrRunResult result = model.TranscribeRealtime(samples, decode);
+        if (!result.status.ok()) {
+            return result.status;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(realtime_mu);
+            auto it = realtime_sessions.find(session_id);
+            if (it == realtime_sessions.end()) {
+                return Status(StatusCode::kNotFound, "session not found");
+            }
+            RealtimeTextUpdate update;
+            const Status update_status = AdvanceRealtimeTextState(
+                realtime_policy,
+                total_samples,
+                result.text,
+                false,
+                &it->second.text_state,
+                &update);
+            if (!update_status.ok()) {
+                return update_status;
+            }
+            ApplyRealtimeUpdate(update, result.total_ms, true, false, &it->second);
+            *snapshot = it->second;
+        }
+        metrics.realtime_decode_runs.fetch_add(1);
+        return OkStatus();
+    };
+
+    auto FinalizeRealtimeSession = [&](const std::string & session_id, RealtimeSession * snapshot) -> Status {
+        if (snapshot == nullptr) {
+            return Status(StatusCode::kInvalidArgument, "session snapshot output must not be null");
+        }
+
+        RealtimeSession session;
+        {
+            std::lock_guard<std::mutex> lock(realtime_mu);
+            auto it = realtime_sessions.find(session_id);
+            if (it == realtime_sessions.end()) {
+                return Status(StatusCode::kNotFound, "session not found");
+            }
+            session = it->second;
+            realtime_sessions.erase(it);
+        }
+
+        if (!session.samples.empty()) {
+            ModelDecodeOptions decode;
+            decode.use_stream_path = false;
+            decode.language = session.language;
+            const AsrRunResult result = model.TranscribeRealtime(session.samples, decode);
+            if (result.status.ok()) {
+                const std::string latest_text =
+                    (session.retained_sample_offset == 0U || session.text.empty()) ? result.text : session.text;
+                RealtimeTextUpdate update;
+                const Status update_status = AdvanceRealtimeTextState(
+                    realtime_policy,
+                    session.total_samples,
+                    latest_text,
+                    true,
+                    &session.text_state,
+                    &update);
+                if (update_status.ok()) {
+                    ApplyRealtimeUpdate(update, result.total_ms, true, true, &session);
+                }
+            } else {
+                RealtimeTextUpdate update;
+                const Status update_status = AdvanceRealtimeTextState(
+                    realtime_policy,
+                    session.total_samples,
+                    session.text.empty() ? session.text_state.last_text : session.text,
+                    true,
+                    &session.text_state,
+                    &update);
+                if (update_status.ok()) {
+                    ApplyRealtimeUpdate(update, session.last_inference_ms, false, true, &session);
+                }
+            }
+        }
+
+        metrics.realtime_finalizations.fetch_add(1);
+        *snapshot = std::move(session);
+        return OkStatus();
+    };
 
     server.Get("/", [&](const HttpRequest &, HttpResponse & response) {
         const std::string body = LoadTextFile(ui_dir / "index.html");
@@ -1671,6 +2042,8 @@ int RunServer(const ServerConfig & config) {
         payload["uptime_ms"] = uptime_ms;
         payload["offline_requests"] = metrics.offline_requests.load();
         payload["async_jobs_submitted"] = metrics.async_jobs_submitted.load();
+        payload["async_job_cleanup_runs"] = metrics.async_job_cleanup_runs.load();
+        payload["async_jobs_evicted"] = metrics.async_jobs_evicted.load();
         payload["chat_requests"] = metrics.chat_requests.load();
         payload["realtime_sessions_started"] = metrics.realtime_sessions_started.load();
         payload["realtime_decode_runs"] = metrics.realtime_decode_runs.load();
@@ -1711,18 +2084,11 @@ int RunServer(const ServerConfig & config) {
             return;
         }
 
-        const std::string request_id = "offline-" + std::to_string(session_counter.fetch_add(1));
-        if (!TryAcquireActiveWorkload(ActiveWorkloadKind::kOffline, request_id, response)) {
-            CleanupPreparedAudio(&prepared);
-            return;
-        }
-
         ModelDecodeOptions decode;
         decode.prompt = options.prompt;
         decode.language = options.language;
         const AsrRunResult result = model.TranscribeFile(prepared.wav_path, decode);
         CleanupPreparedAudio(&prepared);
-        ReleaseActiveWorkload(ActiveWorkloadKind::kOffline, request_id);
         if (!result.status.ok()) {
             SetErrorResponse(response, result.status, StatusToHttpCode(result.status));
             return;
@@ -1763,10 +2129,6 @@ int RunServer(const ServerConfig & config) {
         job.cancel_flag = std::make_shared<std::atomic<bool>>(false);
         job.created_at = CurrentUnixSeconds();
         job.updated_at = job.created_at;
-        if (!TryAcquireActiveWorkload(ActiveWorkloadKind::kOffline, job.id, response)) {
-            CleanupPreparedAudio(&prepared);
-            return;
-        }
         {
             std::lock_guard<std::mutex> lock(jobs_mu);
             jobs.emplace(job.id, job);
@@ -1790,7 +2152,6 @@ int RunServer(const ServerConfig & config) {
 
             if (cancel_before_start) {
                 CleanupPreparedAudio(&prepared);
-                ReleaseActiveWorkload(ActiveWorkloadKind::kOffline, job_id);
                 return;
             }
 
@@ -1835,7 +2196,6 @@ int RunServer(const ServerConfig & config) {
                     current.text = result.text;
                 }
             }
-            ReleaseActiveWorkload(ActiveWorkloadKind::kOffline, job_id);
         }).detach();
 
         response.status = 202;
@@ -1918,18 +2278,11 @@ int RunServer(const ServerConfig & config) {
             return;
         }
 
-        const std::string request_id = "openai-audio-" + std::to_string(session_counter.fetch_add(1));
-        if (!TryAcquireActiveWorkload(ActiveWorkloadKind::kOffline, request_id, response)) {
-            CleanupPreparedAudio(&prepared);
-            return;
-        }
-
         ModelDecodeOptions decode;
         decode.prompt = options.prompt;
         decode.language = options.language;
         const AsrRunResult result = model.TranscribeFile(prepared.wav_path, decode);
         CleanupPreparedAudio(&prepared);
-        ReleaseActiveWorkload(ActiveWorkloadKind::kOffline, request_id);
         if (!result.status.ok()) {
             SetErrorResponse(response, result.status, StatusToHttpCode(result.status));
             return;
@@ -1967,17 +2320,11 @@ int RunServer(const ServerConfig & config) {
 
         const std::string model_id = options.model.empty() ? served_model_id : options.model;
         const std::string request_id = "chatcmpl-" + std::to_string(session_counter.fetch_add(1));
-        if (!TryAcquireActiveWorkload(ActiveWorkloadKind::kOffline, request_id, response)) {
-            CleanupPreparedAudio(&prepared);
-            return;
-        }
-
         ModelDecodeOptions decode;
         decode.prompt = options.prompt;
         decode.language = options.language;
         const AsrRunResult result = model.TranscribeFile(prepared.wav_path, decode);
         CleanupPreparedAudio(&prepared);
-        ReleaseActiveWorkload(ActiveWorkloadKind::kOffline, request_id);
         if (!result.status.ok()) {
             SetErrorResponse(response, result.status, StatusToHttpCode(result.status));
             return;
@@ -1998,21 +2345,91 @@ int RunServer(const ServerConfig & config) {
         response.set_content(sse, "text/event-stream");
     });
 
-    server.Post("/api/realtime/start", [&](const HttpRequest &, HttpResponse & response) {
-        RealtimeSession session;
-        session.id = std::to_string(session_counter.fetch_add(1));
-        if (!TryAcquireActiveWorkload(ActiveWorkloadKind::kRealtime, session.id, response)) {
+    server.Post("/v1/realtime", [&](const HttpRequest & request, HttpResponse & response) {
+        OpenAiRealtimeRequest realtime_request;
+        const Status parse_status = ParseOpenAiRealtimeRequest(request.body, &realtime_request);
+        if (!parse_status.ok()) {
+            SetErrorResponse(response, parse_status, StatusToHttpCode(parse_status));
             return;
         }
-        metrics.realtime_sessions_started.fetch_add(1);
-        {
-            std::lock_guard<std::mutex> lock(realtime_mu);
-            if (realtime_sessions.size() >= kMaxRealtimeSessions) {
-                ReleaseActiveWorkload(ActiveWorkloadKind::kRealtime, session.id);
-                SetErrorResponse(response, Status(StatusCode::kFailedPrecondition, "too many realtime sessions"), 429);
+
+        DecodeRequestOptions decode_request;
+        decode_request.task_mode = TaskMode::kStreaming;
+        const Status validate_status = ValidateOpenAiRequest(
+            OpenAiEndpoint::kRealtimeSessions,
+            decode_request,
+            realtime_request.stream);
+        if (!validate_status.ok()) {
+            SetErrorResponse(response, validate_status, StatusToHttpCode(validate_status));
+            return;
+        }
+
+        const std::string model_id = realtime_request.model.empty() ? served_model_id : realtime_request.model;
+        if (realtime_request.action == OpenAiRealtimeAction::kSessionCreate) {
+            RealtimeSession session;
+            const Status status = CreateRealtimeSession(model_id, realtime_request.language, &session);
+            if (!status.ok()) {
+                SetErrorResponse(response, status, StatusToHttpCode(status));
                 return;
             }
-            realtime_sessions.emplace(session.id, session);
+            SetJsonResponse(
+                response,
+                BuildOpenAiRealtimeEventJson(
+                    session,
+                    "session.created",
+                    false,
+                    session.model.empty() ? model_id : session.model,
+                    realtime_policy));
+            return;
+        }
+
+        if (realtime_request.action == OpenAiRealtimeAction::kInputAudioBufferAppend) {
+            std::vector<float> chunk;
+            const Status decode_status = DecodeBase64Pcm16Le(realtime_request.audio, &chunk);
+            if (!decode_status.ok()) {
+                SetErrorResponse(response, decode_status, StatusToHttpCode(decode_status));
+                return;
+            }
+
+            RealtimeSession session;
+            const Status status = AppendRealtimeChunk(realtime_request.session_id, chunk, &session);
+            if (!status.ok()) {
+                SetErrorResponse(response, status, StatusToHttpCode(status));
+                return;
+            }
+            SetJsonResponse(
+                response,
+                BuildOpenAiRealtimeEventJson(
+                    session,
+                    session.last_decode_ran ? "transcription.delta" : "input_audio_buffer.appended",
+                    false,
+                    session.model.empty() ? model_id : session.model,
+                    realtime_policy));
+            return;
+        }
+
+        RealtimeSession session;
+        const Status status = FinalizeRealtimeSession(realtime_request.session_id, &session);
+        if (!status.ok()) {
+            SetErrorResponse(response, status, StatusToHttpCode(status));
+            return;
+        }
+        SetJsonResponse(
+            response,
+            BuildOpenAiRealtimeEventJson(
+                session,
+                "transcription.done",
+                true,
+                session.model.empty() ? model_id : session.model,
+                realtime_policy));
+    });
+
+    server.Post("/api/realtime/start", [&](const HttpRequest &, HttpResponse & response) {
+        RealtimeSession session;
+        const Status status = CreateRealtimeSession(served_model_id, "", &session);
+        if (!status.ok()) {
+            SetErrorResponse(response, status, StatusToHttpCode(status));
+            return;
         }
         SetJsonResponse(response, Json::object({
             {"session_id", session.id},
@@ -2040,63 +2457,13 @@ int RunServer(const ServerConfig & config) {
             return;
         }
 
-        std::vector<float> samples;
-        std::size_t total_samples = 0;
-        Json body;
-        {
-            std::lock_guard<std::mutex> lock(realtime_mu);
-            auto it = realtime_sessions.find(session_id);
-            if (it == realtime_sessions.end()) {
-                SetErrorResponse(response, Status(StatusCode::kNotFound, "session not found"), 404);
-                return;
-            }
-            AppendRealtimeSamples(realtime_policy, chunk, &it->second);
-            if (!RealtimeShouldDecode(
-                    realtime_policy,
-                    it->second.total_samples,
-                    it->second.text_state.last_decode_samples,
-                    false)) {
-                it->second.last_decode_ran = false;
-                body = BuildRealtimeJson(it->second, false, true);
-                SetJsonResponse(response, body);
-                return;
-            }
-            samples = it->second.samples;
-            total_samples = it->second.total_samples;
-        }
-
-        ModelDecodeOptions decode;
-        decode.use_stream_path = true;
-        const AsrRunResult result = model.TranscribeRealtime(samples, decode);
-        if (!result.status.ok()) {
-            SetErrorResponse(response, result.status, StatusToHttpCode(result.status));
+        RealtimeSession session;
+        const Status status = AppendRealtimeChunk(session_id, chunk, &session);
+        if (!status.ok()) {
+            SetErrorResponse(response, status, StatusToHttpCode(status));
             return;
         }
-
-        {
-            std::lock_guard<std::mutex> lock(realtime_mu);
-            auto it = realtime_sessions.find(session_id);
-            if (it == realtime_sessions.end()) {
-                SetErrorResponse(response, Status(StatusCode::kNotFound, "session not found"), 404);
-                return;
-            }
-            RealtimeTextUpdate update;
-            const Status update_status = AdvanceRealtimeTextState(
-                realtime_policy,
-                total_samples,
-                result.text,
-                false,
-                &it->second.text_state,
-                &update);
-            if (!update_status.ok()) {
-                SetErrorResponse(response, update_status, StatusToHttpCode(update_status));
-                return;
-            }
-            ApplyRealtimeUpdate(update, result.total_ms, true, false, &it->second);
-            body = BuildRealtimeJson(it->second, false, true);
-        }
-        metrics.realtime_decode_runs.fetch_add(1);
-        SetJsonResponse(response, body);
+        SetJsonResponse(response, BuildRealtimeJson(session, false, true));
     });
 
     server.Post("/api/realtime/stop", [&](const HttpRequest & request, HttpResponse & response) {
@@ -2106,52 +2473,11 @@ int RunServer(const ServerConfig & config) {
         }
         const std::string session_id = request.get_param_value("session_id");
         RealtimeSession session;
-        {
-            std::lock_guard<std::mutex> lock(realtime_mu);
-            auto it = realtime_sessions.find(session_id);
-            if (it == realtime_sessions.end()) {
-                SetErrorResponse(response, Status(StatusCode::kNotFound, "session not found"), 404);
-                return;
-            }
-            session = it->second;
-            realtime_sessions.erase(it);
+        const Status status = FinalizeRealtimeSession(session_id, &session);
+        if (!status.ok()) {
+            SetErrorResponse(response, status, StatusToHttpCode(status));
+            return;
         }
-
-        if (!session.samples.empty()) {
-            ModelDecodeOptions decode;
-            decode.use_stream_path = false;
-            const AsrRunResult result = model.TranscribeRealtime(session.samples, decode);
-            if (result.status.ok()) {
-                const std::string latest_text =
-                    (session.retained_sample_offset == 0U || session.text.empty()) ? result.text : session.text;
-                RealtimeTextUpdate update;
-                const Status update_status = AdvanceRealtimeTextState(
-                    realtime_policy,
-                    session.total_samples,
-                    latest_text,
-                    true,
-                    &session.text_state,
-                    &update);
-                if (update_status.ok()) {
-                    ApplyRealtimeUpdate(update, result.total_ms, true, true, &session);
-                }
-            } else {
-                RealtimeTextUpdate update;
-                const Status update_status = AdvanceRealtimeTextState(
-                    realtime_policy,
-                    session.total_samples,
-                    session.text.empty() ? session.text_state.last_text : session.text,
-                    true,
-                    &session.text_state,
-                    &update);
-                if (update_status.ok()) {
-                    ApplyRealtimeUpdate(update, session.last_inference_ms, false, true, &session);
-                }
-            }
-        }
-
-        metrics.realtime_finalizations.fetch_add(1);
-        ReleaseActiveWorkload(ActiveWorkloadKind::kRealtime, session.id);
         Json body = BuildRealtimeJson(session, true, true);
         SetJsonResponse(response, body);
     });
@@ -2214,9 +2540,6 @@ int RunServer(const ServerConfig & config) {
         capture->id = std::to_string(session_counter.fetch_add(1));
         capture->device = device;
         capture->backend = selected_backend;
-        if (!TryAcquireActiveWorkload(ActiveWorkloadKind::kHostCapture, capture->id, response)) {
-            return;
-        }
 
 #if defined(_WIN32)
         const Status spawn_status = SpawnCaptureProcess(argv, &capture->child_process, &capture->read_handle);
@@ -2224,13 +2547,12 @@ int RunServer(const ServerConfig & config) {
         const Status spawn_status = SpawnCaptureProcess(argv, &capture->child_pid, &capture->read_fd);
 #endif
         if (!spawn_status.ok()) {
-            ReleaseActiveWorkload(ActiveWorkloadKind::kHostCapture, capture->id);
             SetErrorResponse(response, spawn_status, StatusToHttpCode(spawn_status));
             return;
         }
         metrics.host_capture_sessions_started.fetch_add(1);
 
-        capture->reader = std::thread([capture, &ReleaseActiveWorkload, &model, realtime_policy]() {
+        capture->reader = std::thread([capture, &model, realtime_policy]() {
             std::vector<char> buffer(6400);
             while (true) {
 #if defined(_WIN32)
@@ -2300,14 +2622,10 @@ int RunServer(const ServerConfig & config) {
                 capture->active = false;
                 stopped_by_request = capture->stop_requested;
             }
-            if (!stopped_by_request) {
-                ReleaseActiveWorkload(ActiveWorkloadKind::kHostCapture, capture->id);
-            }
+            (void)stopped_by_request;
         });
 
         {
-
-        ReleaseActiveWorkload(ActiveWorkloadKind::kHostCapture, capture->id);
             std::lock_guard<std::mutex> lock(host_capture_mu);
             host_capture = capture;
         }
@@ -2384,6 +2702,14 @@ int RunServer(const ServerConfig & config) {
 
     std::fprintf(stderr, "qasr_server listening on %s:%d\n", config.host.c_str(), config.port);
     const bool ok = server.listen(config.host, config.port);
+    {
+        std::lock_guard<std::mutex> lock(maintenance_mu);
+        stop_maintenance = true;
+    }
+    maintenance_cv.notify_all();
+    if (job_cleanup_thread.joinable()) {
+        job_cleanup_thread.join();
+    }
     if (!ok) {
         std::fprintf(stderr, "qasr_server listen failed on %s:%d\n", config.host.c_str(), config.port);
         return 1;

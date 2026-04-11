@@ -321,6 +321,15 @@ Apple 旧实验仍保留一条参考：
 - 这说明 Apple/prefill 的主要收益来自“多线程 BF16->F32 转换”而不只是“减少 BLAS 次数”；结构优化与执行级优化必须拆开看。
 - 此结论只作 Apple/prefill 参考，不可直接套为 Intel/Windows 的主线判断。
 
+### 服务并发与清理
+
+- 先前 `server.cc` 以单一 `active_workload` 把 offline / realtime / host capture 串成一把总锁；此与设计中“realtime 会话上限 64”相悖。
+- 现已去除此总锁：
+   - realtime 仍由会话表限流
+   - host capture 仍只允 1 路
+   - offline / chat / realtime 不再互相以 409 硬阻
+- async job 先前只增不删；现已补后台维护线程，按固定周期清理终态 job，免长跑服务内存线性涨。
+
 实验性探索账本：
 
 - `[已验证]` encoder QKV 加载期预打包：成立，现为 Windows/Intel 保留方案。

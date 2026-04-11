@@ -105,6 +105,71 @@ QASR_TEST(ResolveServedModelIdNormalizesModelScopeName) {
         std::string("Qwen/Qwen3-ASR-1.7B"));
 }
 
+QASR_TEST(IsTerminalJobStateRecognizesTerminalStates) {
+    QASR_EXPECT(qasr::IsTerminalJobState("completed"));
+    QASR_EXPECT(qasr::IsTerminalJobState("failed"));
+    QASR_EXPECT(qasr::IsTerminalJobState("cancelled"));
+    QASR_EXPECT(!qasr::IsTerminalJobState("queued"));
+    QASR_EXPECT(!qasr::IsTerminalJobState("running"));
+    QASR_EXPECT(!qasr::IsTerminalJobState("cancelling"));
+}
+
+QASR_TEST(ShouldEvictCompletedJobMatchesTtlRules) {
+    QASR_EXPECT(qasr::ShouldEvictCompletedJob("completed", 100, 3700, 3600));
+    QASR_EXPECT(qasr::ShouldEvictCompletedJob("failed", 100, 3700, 3600));
+    QASR_EXPECT(qasr::ShouldEvictCompletedJob("cancelled", 100, 3700, 3600));
+    QASR_EXPECT(!qasr::ShouldEvictCompletedJob("running", 100, 3700, 3600));
+    QASR_EXPECT(!qasr::ShouldEvictCompletedJob("completed", 100, 3699, 3600));
+    QASR_EXPECT(!qasr::ShouldEvictCompletedJob("completed", 500, 400, 3600));
+    QASR_EXPECT(!qasr::ShouldEvictCompletedJob("completed", 100, 3700, 0));
+}
+
+QASR_TEST(ParseOpenAiRealtimeRequestDefaultsToSessionCreate) {
+    qasr::OpenAiRealtimeRequest request;
+    QASR_EXPECT(qasr::ParseOpenAiRealtimeRequest("{}", &request).ok());
+    QASR_EXPECT_EQ(request.action, qasr::OpenAiRealtimeAction::kSessionCreate);
+    QASR_EXPECT(request.stream);
+    QASR_EXPECT_EQ(request.input_audio_format, std::string("pcm16le"));
+}
+
+QASR_TEST(ParseOpenAiRealtimeRequestAcceptsNestedSessionFields) {
+    qasr::OpenAiRealtimeRequest request;
+    const char * body =
+        "{\"type\":\"input_audio_buffer.append\",\"session\":{\"id\":\"sess-1\",\"model\":\"Qwen/Qwen3-ASR-1.7B\",\"language\":\"zh\",\"input_audio_format\":\"pcm16\"},\"audio\":\"AIAAAP9/\"}";
+    QASR_EXPECT(qasr::ParseOpenAiRealtimeRequest(body, &request).ok());
+    QASR_EXPECT_EQ(request.action, qasr::OpenAiRealtimeAction::kInputAudioBufferAppend);
+    QASR_EXPECT_EQ(request.session_id, std::string("sess-1"));
+    QASR_EXPECT_EQ(request.model, std::string("Qwen/Qwen3-ASR-1.7B"));
+    QASR_EXPECT_EQ(request.language, std::string("zh"));
+    QASR_EXPECT_EQ(request.input_audio_format, std::string("pcm16le"));
+    QASR_EXPECT_EQ(request.audio, std::string("AIAAAP9/"));
+}
+
+QASR_TEST(ParseOpenAiRealtimeRequestRejectsMissingAppendAudio) {
+    qasr::OpenAiRealtimeRequest request;
+    QASR_EXPECT_EQ(
+        qasr::ParseOpenAiRealtimeRequest(
+            "{\"type\":\"input_audio_buffer.append\",\"session_id\":\"sess-1\"}",
+            &request).code(),
+        qasr::StatusCode::kInvalidArgument);
+}
+
+QASR_TEST(DecodeBase64Pcm16LeConvertsSamples) {
+    std::vector<float> samples;
+    QASR_EXPECT(qasr::DecodeBase64Pcm16Le("AIAAAP9/", &samples).ok());
+    QASR_EXPECT_EQ(samples.size(), std::size_t{3});
+    QASR_EXPECT(samples[0] < -0.99f);
+    QASR_EXPECT(samples[1] == 0.0f);
+    QASR_EXPECT(samples[2] > 0.99f);
+}
+
+QASR_TEST(DecodeBase64Pcm16LeRejectsOddByteLength) {
+    std::vector<float> samples;
+    QASR_EXPECT_EQ(
+        qasr::DecodeBase64Pcm16Le("AA==", &samples).code(),
+        qasr::StatusCode::kInvalidArgument);
+}
+
 QASR_TEST(BuildServerUsageIncludesProgramName) {
     const std::string usage = qasr::BuildServerUsage("qasr_server");
     QASR_EXPECT(usage.find("qasr_server") != std::string::npos);

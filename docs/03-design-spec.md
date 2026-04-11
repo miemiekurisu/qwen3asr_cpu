@@ -253,7 +253,7 @@ CLI 长音频输出：
 | `HandleAudioTranscriptions` | 处理 `/v1/audio/transcriptions` |
 | `HandleModels` | 处理 `/v1/models` |
 | `HandleMetrics` | 处理 `/api/metrics` |
-| `HandleRealtimeSession` | 处理 `/v1/realtime`，二期 |
+| `HandleRealtimeSession` | 处理 `/v1/realtime` 最小 JSON 控制面；WS 二期 |
 | `WriteSseDelta` | SSE 输出 delta |
 | `FormatVerboseJson` | 产 verbose_json |
 
@@ -266,6 +266,9 @@ CLI 长音频输出：
 - keepalive timeout `5s`
 - keepalive max count `100`
 - realtime 活跃会话上限 `64`
+- host capture 同时仅允 `1` 路
+- 终态 async job 以后台维护线程按 `60s` 周期清理，默认 TTL `3600s`
+- 不再以单一全局 busy 锁串行封死 offline / realtime / chat；host capture 另保单例约束
 
 ### `qasr/protocol/vllm_server`
 
@@ -318,7 +321,7 @@ CLI 长音频输出：
 |---|---|
 | chat/completions | 支持文本转写；timestamp 暂不走此面 |
 | audio/transcriptions | 支持离线与 timestamp |
-| realtime | 私有 `/api/realtime/*` 先行；标准 `/v1/realtime` 二期 |
+| realtime | 已补 `/v1/realtime` HTTP JSON 控制面；WebSocket 二期 |
 
 ### vLLM
 
