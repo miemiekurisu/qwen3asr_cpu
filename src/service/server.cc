@@ -1597,6 +1597,14 @@ int RunServer(const ServerConfig & config) {
         }
         response.set_content(body, "application/javascript; charset=utf-8");
     });
+    server.Get("/wav_stream_upload.js", [&](const HttpRequest &, HttpResponse & response) {
+        const std::string body = LoadTextFile(ui_dir / "wav_stream_upload.js");
+        if (body.empty()) {
+            SetErrorResponse(response, Status(StatusCode::kInternal, "failed to load wav_stream_upload.js"), 500);
+            return;
+        }
+        response.set_content(body, "application/javascript; charset=utf-8");
+    });
     server.Get("/style.css", [&](const HttpRequest &, HttpResponse & response) {
         const std::string body = LoadTextFile(ui_dir / "style.css");
         if (body.empty()) {

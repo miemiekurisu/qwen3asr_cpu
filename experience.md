@@ -291,6 +291,43 @@ vLLM `qwen3_asr_realtime` buffer 默认 `5s` 才吐一段。
 
 ### 21. 命名也会形成依赖错觉
 
+### 22. 大 multipart 上传，不仅吃带宽，也吃双份内存
+
+这轮排查 `208MB WAV -> 前端 Failed to fetch` 后确认：
+
+- HTTP server 先把整个 body 读入 `request.body`
+- multipart 解析再把文件 part 复制到 `MultipartFormData.content`
+- 离线路径随后还会再落一份 tmp 文件
+
+故“大文件整包上传”的真实成本不是 `1x 文件大小`，而是：
+
+- 网络：整包一次打满
+- 服务端内存：至少 `2x body`
+- 磁盘：再加 `1x tmp`
+
+若只把上限从 `64MiB` 提到 `500MiB`，只是把风险放大，不是正解。
+
+### 23. 对离线 WAV，正解是浏览器端先变成 `16k mono PCM16`
+
+当前离线 UI 已改为：
+
+- 浏览器解析 WAV 头
+- 按块读帧
+- 先下混 mono
+- 若非 `16k` 则在浏览器侧重采样
+- 结果按小块推送到现有 `/api/realtime/*`
+
+这样得到三重收益：
+
+- 单请求很小，不再撞 multipart 上限
+- 服务端不再为离线大文件写 tmp
+- 对 stereo `16k` WAV，网络流量约减半
+
+此法仍有边界：
+
+- 目前浏览器端只支持 `PCM 16-bit WAV`
+- 其它 WAV 编码仍需回退整包上传或后续补 upload session
+
 即使构建已只指向 `vendor/`，若接口仍名 `legacy_bridge`，会误导后续开发继续按参考工程思路走。
 
 今已改：
