@@ -194,7 +194,19 @@ void qwen_set_threads(int n) {
     }
 
     tp.n_threads = n;
-    if (n <= 1) return;
+
+#if defined(USE_OPENBLAS)
+    /* Keep OpenBLAS thread count in sync so that
+     * qwen_get_prefill_threads() does not override the user's choice
+     * with OpenBLAS's independent default (which may equal all CPUs). */
+    openblas_set_num_threads(n);
+#endif
+
+    if (n <= 1) {
+        if (qwen_verbose >= 2)
+            fprintf(stderr, "Thread pool: %d threads\n", n);
+        return;
+    }
 
     for (int i = 0; i < n - 1; i++) {
         tp.tids[i] = i + 1;
@@ -314,7 +326,16 @@ void qwen_set_threads(int n) {
     }
 
     tp.n_threads = n;
-    if (n <= 1) return;
+
+#if defined(USE_OPENBLAS)
+    openblas_set_num_threads(n);
+#endif
+
+    if (n <= 1) {
+        if (qwen_verbose >= 2)
+            fprintf(stderr, "Thread pool: %d threads\n", n);
+        return;
+    }
 
     for (int i = 0; i < n - 1; i++) {
         tp.tids[i] = i + 1;
