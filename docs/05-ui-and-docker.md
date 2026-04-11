@@ -20,11 +20,10 @@ cmake --build build/macos-accelerate-cli -j4
 - `http://127.0.0.1:3458/`
 - `http://127.0.0.1:3458/api/metrics`
 
-当前 UI 三路：
+当前 UI 两路：
 
-- 离线：WAV 上传
+- 离线：浏览器端读取 WAV，并优先转成 `16k mono PCM16` 小块推送
 - 实时：浏览器麦克风分块 PCM16 推送
-- Host Audio：Linux / Docker 宿主设备直采
 
 ## 二、Docker Linux 启动
 
@@ -52,19 +51,40 @@ docker build -t qasr-ui:latest .
 - `http://127.0.0.1:8080/`
 - `http://127.0.0.1:8080/api/metrics`
 
-## 三、现阶段约束
+## 三、离线上传策略
+
+当前离线面板不再默认走整包 multipart 上传，而改为：
+
+1. 浏览器先解析 WAV 头
+2. 若为 `PCM + 16-bit`，则按块读取音频帧
+3. 浏览器端先下混为 mono，若采样率非 `16k` 则同步重采样到 `16k`
+4. 结果以 `PCM16` 小块推送到 `/api/realtime/start|chunk|stop`
+5. 前端复用 realtime 返回的 `stable_text` / `partial_text` / `final`
+
+此法的收益：
+
+- 避免单个大 multipart 请求触发 `64MiB` 上传上限
+- 避免服务端先整包入内存、再复制 multipart part、再落 tmp 文件
+- 对立体声 `16k` WAV，可在浏览器侧先降到 mono，网络流量约减半
+- 上传过程中即可增量显示转写结果
+
+当前回退策略：
+
+- 若浏览器端无法解析或转换该 WAV，且文件不超过 `64MiB`，则回退到 `/api/transcriptions/async`
+- 若文件已超过 `64MiB` 且又不满足前端分块条件，则前端直接报错，提示先转为 `16-bit PCM WAV`
+
+## 四、现阶段约束
 
 - 实时 UI 现走“浏览器麦克风 -> PCM16 分块 -> 服务端累积流式转写”
+- 离线 UI 现走“浏览器 WAV -> mono/resample -> PCM16 分块 -> 服务端 realtime 会话”
 - `/api/realtime/chunk` 已回 `stable_text`、`partial_text`、`text`
 - `/api/realtime/stop` 已做一次终态 flush，回 `finalized=true`
-- 此路本地与 Docker 皆可测
-- Linux 容器音频设备映射已备好启动脚本
-- Linux 宿主设备服务端采集 backend 已落 `arecord` / `parec` 骨架
-- macOS 下 `Host Audio` 面仅示 unsupported
-- 容器内“真接宿主声卡并稳定取流”仍须实体设备回归
+- 本地与 Docker 皆可测
+- 浏览器端分块目前仅覆盖 `PCM 16-bit WAV`
+- 若要支持压缩 WAV / float WAV / 其它音频容器，仍需浏览器端额外转码或服务端 chunk upload 会话
 
-## 四、后续 UI 计划
+## 五、后续 UI 计划
 
 - UI 视觉层再显式区分 `partial` / `stable` / `final`
 - 稳定前缀不重绘；仅更新尾巴
-- Host Audio 与浏览器麦克风共用同一会话语义
+- 若后续补服务端 upload session，可把“非 PCM16 WAV”也改为分块上传，彻底去掉大 multipart 回退

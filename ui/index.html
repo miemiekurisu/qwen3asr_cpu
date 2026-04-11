@@ -11,7 +11,7 @@
     <section class="hero">
       <p class="eyebrow">Qwen3-ASR CPU Test Console</p>
       <h1>离线上传与实时转写</h1>
-      <p class="lede">本页只作联调。离线走 WAV 上传，实时走浏览器麦克风分块推送。</p>
+      <p class="lede">本页只作联调。离线 WAV 优先在浏览器端分块转成 16k mono PCM 推送，实时走浏览器麦克风分块推送。</p>
       <div class="status-row">
         <span id="healthBadge" class="badge">检查中</span>
         <span id="runtimeHint" class="hint">服务未就绪</span>
@@ -55,6 +55,7 @@
       </article>
     </section>
   </main>
+  <script src="/wav_stream_upload.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>
