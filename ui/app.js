@@ -26,6 +26,7 @@ let realtimeState = {
   mediaStream: null,
   sessionId: "",
   sendTimer: null,
+  pollTimer: null,
   sending: false,
   pending: [],
   sampleRate: 0,
@@ -653,15 +654,40 @@ async function flushRealtimeChunk(force) {
     renderTranscript(realtimeResult, data, "尚无结果");
     syncRealtimeArchive(data);
     const audioDur = (data.sample_count / 16000).toFixed(1);
+    const decodedDur = (data.decoded_samples / 16000).toFixed(1);
     const wallElapsed = ((performance.now() - realtimeState.startedAt) / 1000).toFixed(1);
-    const lag = (wallElapsed - audioDur).toFixed(1);
+    const lag = (wallElapsed - decodedDur).toFixed(1);
     const infMs = data.inference_ms !== undefined ? data.inference_ms.toFixed(0) : "-";
     const decodeLabel = data.decoded ? "已解码" : "待下轮";
-    realtimeStatus.textContent = `音频 ${audioDur}s / 耗时 ${wallElapsed}s / 滞后 ${lag}s / 推理 ${infMs}ms / ${decodeLabel}`;
+    realtimeStatus.textContent = `音频 ${audioDur}s / 已解码 ${decodedDur}s / 耗时 ${wallElapsed}s / 滞后 ${lag}s / 推理 ${infMs}ms / ${decodeLabel}`;
   } catch (error) {
     realtimeStatus.textContent = `失败：${error.message}`;
   } finally {
     realtimeState.sending = false;
+  }
+}
+
+async function pollRealtimeStatus() {
+  if (!realtimeState.sessionId || realtimeState.sending) {
+    return;
+  }
+  try {
+    const response = await fetch(`/api/realtime/status?session_id=${encodeURIComponent(realtimeState.sessionId)}`);
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error?.message || "查询实时状态失败");
+    }
+    renderTranscript(realtimeResult, data, "尚无结果");
+    syncRealtimeArchive(data);
+    const audioDur = (data.sample_count / 16000).toFixed(1);
+    const decodedDur = (data.decoded_samples / 16000).toFixed(1);
+    const wallElapsed = ((performance.now() - realtimeState.startedAt) / 1000).toFixed(1);
+    const lag = (wallElapsed - decodedDur).toFixed(1);
+    const infMs = data.inference_ms !== undefined ? data.inference_ms.toFixed(0) : "-";
+    const decodeLabel = data.decoded ? "已解码" : "待下轮";
+    realtimeStatus.textContent = `音频 ${audioDur}s / 已解码 ${decodedDur}s / 耗时 ${wallElapsed}s / 滞后 ${lag}s / 推理 ${infMs}ms / ${decodeLabel}`;
+  } catch (error) {
+    realtimeStatus.textContent = `失败：${error.message}`;
   }
 }
 
@@ -690,7 +716,8 @@ async function startRealtimeCapture() {
       processor,
       mediaStream,
       sessionId: sessionData.session_id,
-      sendTimer: window.setInterval(() => flushRealtimeChunk(false), 800),
+      sendTimer: window.setInterval(() => flushRealtimeChunk(false), 400),
+      pollTimer: window.setInterval(() => pollRealtimeStatus(), 150),
       sending: false,
       pending: [],
       sampleRate: audioContext.sampleRate,
@@ -736,6 +763,7 @@ async function stopRealtimeCapture() {
   }
   const sessionId = realtimeState.sessionId;
   window.clearInterval(realtimeState.sendTimer);
+  window.clearInterval(realtimeState.pollTimer);
   await flushRealtimeChunk(true);
 
   realtimeState.processor.disconnect();
@@ -766,6 +794,7 @@ async function stopRealtimeCapture() {
       mediaStream: null,
       sessionId: "",
       sendTimer: null,
+      pollTimer: null,
       sending: false,
       pending: [],
       sampleRate: 0,

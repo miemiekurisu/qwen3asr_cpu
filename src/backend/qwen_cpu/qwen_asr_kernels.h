@@ -49,16 +49,23 @@ void qwen_linear_qkv_f32(float *q, float *k, float *v,
                          const float *bq, const float *bk, const float *bv,
                          int seq_len, int in_dim, int q_dim, int kv_dim);
 
-            /* Encoder/prefill QKV fusion for pre-packed contiguous float32 weights.
-             * Precondition: qkv_out_scratch[seq_len, q_dim + 2 * kv_dim],
-             * W_qkv_packed[q_dim + 2 * kv_dim, in_dim],
-             * b_qkv_packed[q_dim + 2 * kv_dim]. */
-            void qwen_linear_qkv_f32_packed(float *q, float *k, float *v,
+/* Encoder/prefill QKV fusion for pre-packed contiguous float32 weights.
+ * Precondition: qkv_out_scratch[seq_len, q_dim + 2 * kv_dim],
+ * W_qkv_packed[q_dim + 2 * kv_dim, in_dim],
+ * b_qkv_packed[q_dim + 2 * kv_dim]. */
+void qwen_linear_qkv_f32_packed(float *q, float *k, float *v,
                                 float *qkv_out_scratch,
                                 const float *x,
                                 const float *W_qkv_packed,
                                 const float *b_qkv_packed,
                                 int seq_len, int in_dim, int q_dim, int kv_dim);
+
+/* Same as qwen_linear_qkv_f32_packed, but for no-bias decoder QKV paths. */
+void qwen_linear_nobias_qkv_f32_packed(float *q, float *k, float *v,
+                                       float *qkv_out_scratch,
+                                       const float *x,
+                                       const float *W_qkv_packed,
+                                       int seq_len, int in_dim, int q_dim, int kv_dim);
 
 /* bf16 weight variants */
 void qwen_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
@@ -66,6 +73,16 @@ void qwen_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
 
 void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                               int seq_len, int in_dim, int out_dim);
+
+/* Prefill helper: caller-owned F32 scratch avoids global conversion scratch.
+ * seq_len==1 falls back to the decode-optimized path. */
+void qwen_linear_nobias_bf16_scratch(float *y,
+                                     const float *x,
+                                     const uint16_t *W_bf16,
+                                     float *W_f32_scratch,
+                                     int seq_len,
+                                     int in_dim,
+                                     int out_dim);
 
 /* seq=1 decoder fast path: compute Q/K/V matvecs with one threaded dispatch */
 void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
@@ -77,7 +94,10 @@ void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
 /* Prefill QKV fusion: fuses Wq/Wk/Wv into one BLAS sgemm for seq_len > 1.
  * Saves 2 BLAS call overheads per layer and reduces input re-reads. */
 void qwen_linear_nobias_bf16_qkv_prefill(
-    float *q, float *k, float *v, const float *x,
+    float *q, float *k, float *v,
+    float *qkv_out_scratch,
+    float *W_qkv_scratch,
+    const float *x,
     const uint16_t *Wq_bf16, const uint16_t *Wk_bf16, const uint16_t *Wv_bf16,
     int seq_len, int in_dim, int q_dim, int kv_dim);
 

@@ -534,6 +534,27 @@ void qwen_linear_qkv_f32_packed(float *q, float *k, float *v,
     }
 }
 
+void qwen_linear_nobias_qkv_f32_packed(float *q, float *k, float *v,
+                                       float *qkv_out_scratch,
+                                       const float *x,
+                                       const float *W_qkv_packed,
+                                       int seq_len, int in_dim, int q_dim, int kv_dim) {
+    const int total_out = q_dim + 2 * kv_dim;
+
+    if (!q || !k || !v || !qkv_out_scratch || !x || !W_qkv_packed ||
+        seq_len <= 0 || in_dim <= 0 || q_dim <= 0 || kv_dim <= 0) {
+        return;
+    }
+
+    qwen_linear_nobias(qkv_out_scratch, x, W_qkv_packed, seq_len, in_dim, total_out);
+    for (int s = 0; s < seq_len; s++) {
+        const float *row = qkv_out_scratch + (size_t)s * total_out;
+        memcpy(q + (size_t)s * q_dim, row, (size_t)q_dim * sizeof(float));
+        memcpy(k + (size_t)s * kv_dim, row + q_dim, (size_t)kv_dim * sizeof(float));
+        memcpy(v + (size_t)s * kv_dim, row + q_dim + kv_dim, (size_t)kv_dim * sizeof(float));
+    }
+}
+
 /* Convert bf16 buffer to f32 buffer */
 static void bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
     /*
@@ -847,6 +868,24 @@ void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
     qwen_linear_nobias(y, x, W_f32, seq_len, in_dim, out_dim);
 }
 
+void qwen_linear_nobias_bf16_scratch(float *y,
+                                     const float *x,
+                                     const uint16_t *W_bf16,
+                                     float *W_f32_scratch,
+                                     int seq_len,
+                                     int in_dim,
+                                     int out_dim) {
+    if (seq_len == 1) {
+        qwen_linear_nobias_bf16(y, x, W_bf16, seq_len, in_dim, out_dim);
+        return;
+    }
+    if (!y || !x || !W_bf16 || !W_f32_scratch || seq_len <= 0 || in_dim <= 0 || out_dim <= 0) {
+        return;
+    }
+    bf16_to_f32_buf_threaded(W_f32_scratch, W_bf16, (size_t)out_dim * (size_t)in_dim);
+    qwen_linear_nobias(y, x, W_f32_scratch, seq_len, in_dim, out_dim);
+}
+
 /* Fused QKV prefill: converts Wq/Wk/Wv into one contiguous F32 block,
  * does a single BLAS sgemm, then splits the output into q/k/v.
  * Saves 2 BLAS call overheads per layer and reduces input matrix re-reads. */
@@ -897,7 +936,10 @@ static void qkv_cvt_worker(int tid, int n_threads, void *arg) {
 }
 
 void qwen_linear_nobias_bf16_qkv_prefill(
-    float *q, float *k, float *v, const float *x,
+    float *q, float *k, float *v,
+    float *qkv_out_scratch,
+    float *W_qkv_scratch,
+    const float *x,
     const uint16_t *Wq_bf16, const uint16_t *Wk_bf16, const uint16_t *Wv_bf16,
     int seq_len, int in_dim, int q_dim, int kv_dim)
 {
@@ -908,14 +950,19 @@ void qwen_linear_nobias_bf16_qkv_prefill(
         return;
     }
 
+    if (!q || !k || !v || !qkv_out_scratch || !W_qkv_scratch || !x ||
+        !Wq_bf16 || !Wk_bf16 || !Wv_bf16 ||
+        seq_len <= 0 || in_dim <= 0 || q_dim <= 0 || kv_dim <= 0) {
+        return;
+    }
+
     int total_out = q_dim + 2 * kv_dim;
     size_t wq_n = (size_t)q_dim * in_dim;
     size_t wk_n = (size_t)kv_dim * in_dim;
     size_t w_total = wq_n + 2 * wk_n;
 
-    /* Reuse scratch for fused weight [total_out, in_dim] in F32 */
-    float *W_fused = bf16_get_scratch(w_total);
-    if (!W_fused) return;
+    /* Caller provides scratch for fused weight [total_out, in_dim] in F32. */
+    float *W_fused = W_qkv_scratch;
 
     /* Convert all three BF16 weight matrices in one threaded dispatch */
     if (tp.n_threads > 1) {
@@ -935,26 +982,15 @@ void qwen_linear_nobias_bf16_qkv_prefill(
         bf16_to_f32_buf(W_fused + wq_n + wk_n, Wv_bf16, wk_n);
     }
 
-    /* Reusable scratch for fused output [seq_len, total_out] */
-    static float *qkv_out = NULL;
-    static size_t qkv_out_cap = 0;
-    size_t out_n = (size_t)seq_len * total_out;
-    if (out_n > qkv_out_cap) {
-        free(qkv_out);
-        qkv_out = (float *)malloc(out_n * sizeof(float));
-        qkv_out_cap = qkv_out ? out_n : 0;
-    }
-    if (!qkv_out) return;
-
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 seq_len, total_out, in_dim,
                 1.0f, x, in_dim, W_fused, in_dim,
-                0.0f, qkv_out, total_out);
+                0.0f, qkv_out_scratch, total_out);
 #else
     for (int s = 0; s < seq_len; s++) {
         const float *x_row = x + s * in_dim;
-        float *y_row = qkv_out + s * total_out;
+        float *y_row = qkv_out_scratch + s * total_out;
         for (int o = 0; o < total_out; o++) {
             const float *w_row = W_fused + (size_t)o * in_dim;
             float sum = 0.0f;
@@ -967,7 +1003,7 @@ void qwen_linear_nobias_bf16_qkv_prefill(
 
     /* Split fused output into separate q, k, v buffers */
     for (int s = 0; s < seq_len; s++) {
-        const float *row = qkv_out + (size_t)s * total_out;
+        const float *row = qkv_out_scratch + (size_t)s * total_out;
         memcpy(q + (size_t)s * q_dim,  row,                    (size_t)q_dim * sizeof(float));
         memcpy(k + (size_t)s * kv_dim, row + q_dim,            (size_t)kv_dim * sizeof(float));
         memcpy(v + (size_t)s * kv_dim, row + q_dim + kv_dim,   (size_t)kv_dim * sizeof(float));

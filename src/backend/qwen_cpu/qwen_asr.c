@@ -169,6 +169,7 @@ extern int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
                               const qwen_config_t *cfg);
 extern int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
                               const qwen_config_t *cfg);
+extern int qwen_decoder_prepare_runtime(qwen_ctx_t *ctx);
 
 /* ========================================================================
  * Config Detection
@@ -241,6 +242,7 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
     qwen_ctx_t *ctx = (qwen_ctx_t *)calloc(1, sizeof(qwen_ctx_t));
     if (!ctx) return NULL;
     snprintf(ctx->model_dir, sizeof(ctx->model_dir), "%s", model_dir);
+    ctx->owns_model_data = 1;
 
     /* Open safetensors (multi-shard) */
     if (qwen_verbose >= 1)
@@ -256,6 +258,14 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
 
     /* Detect model configuration */
     detect_config(ctx);
+    ctx->runtime_profile = *qwen_get_runtime_profile_config();
+    if (qwen_verbose >= 1) {
+        fprintf(stderr,
+                "Runtime profile: %s (dec_prefill_qkv_persist=%d, budget=%.1f MB)\n",
+                qwen_runtime_profile_name(ctx->runtime_profile.kind),
+                ctx->runtime_profile.decoder_prefill_qkv_persist_f32,
+                (double)ctx->runtime_profile.decoder_prefill_qkv_budget_bytes / (1024.0 * 1024.0));
+    }
 
     /* Load encoder weights */
     if (qwen_verbose >= 1) fprintf(stderr, "Loading encoder weights...\n");
@@ -272,6 +282,7 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
         qwen_free(ctx);
         return NULL;
     }
+    qwen_decoder_prepare_runtime(ctx);
 
     /* Default transcription mode: full-audio offline decode (no splitting). */
     ctx->segment_sec = 0.0f;
@@ -289,6 +300,111 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
     return ctx;
 }
 
+qwen_ctx_t *qwen_clone_shared(const qwen_ctx_t *src) {
+    if (!src) return NULL;
+
+    qwen_ctx_t *ctx = (qwen_ctx_t *)calloc(1, sizeof(qwen_ctx_t));
+    if (!ctx) return NULL;
+
+    ctx->config = src->config;
+    ctx->encoder = src->encoder;
+    ctx->decoder = src->decoder;
+    ctx->runtime_profile = src->runtime_profile;
+    ctx->runtime_perf = src->runtime_perf;
+    ctx->safetensors = src->safetensors;
+    snprintf(ctx->model_dir, sizeof(ctx->model_dir), "%s", src->model_dir);
+    ctx->owns_model_data = 0;
+
+    ctx->segment_sec = src->segment_sec;
+    ctx->search_sec = src->search_sec;
+    ctx->stream_chunk_sec = src->stream_chunk_sec;
+    ctx->stream_rollback = src->stream_rollback;
+    ctx->stream_unfixed_chunks = src->stream_unfixed_chunks;
+    ctx->stream_max_new_tokens = src->stream_max_new_tokens;
+    ctx->past_text_conditioning = src->past_text_conditioning;
+    ctx->skip_silence = src->skip_silence;
+
+    /* Cloned live contexts share model weights, but should not reuse prepared
+     * prefill caches from the source context. Keep the clone on the plain BF16
+     * prefill path to avoid sharing large prepared buffers across session state. */
+    ctx->runtime_profile.decoder_prefill_qkv_persist_f32 = 0;
+    ctx->runtime_profile.decoder_prefill_qkv_budget_bytes = 0;
+    ctx->runtime_profile.decoder_prefill_gate_up_persist_f32 = 0;
+    ctx->runtime_profile.decoder_prefill_gate_up_budget_bytes = 0;
+    ctx->runtime_perf.decoder_prefill_qkv_bytes = 0;
+    ctx->runtime_perf.decoder_prefill_qkv_layers = 0;
+    ctx->runtime_perf.decoder_prefill_gate_up_bytes = 0;
+    ctx->runtime_perf.decoder_prefill_gate_up_layers = 0;
+    for (int layer = 0; layer < ctx->config.dec_layers; layer++) {
+        ctx->decoder.layers[layer].prefill_qkv_prepared.f32_data = NULL;
+        ctx->decoder.layers[layer].prefill_qkv_prepared.rows = 0;
+        ctx->decoder.layers[layer].prefill_qkv_prepared.cols = 0;
+        ctx->decoder.layers[layer].prefill_qkv_prepared.bytes = 0;
+        ctx->decoder.layers[layer].prefill_gate_up_prepared.f32_data = NULL;
+        ctx->decoder.layers[layer].prefill_gate_up_prepared.rows = 0;
+        ctx->decoder.layers[layer].prefill_gate_up_prepared.cols = 0;
+        ctx->decoder.layers[layer].prefill_gate_up_prepared.bytes = 0;
+    }
+
+    ctx->token_cb = NULL;
+    ctx->token_cb_userdata = NULL;
+    ctx->cancel_cb = NULL;
+    ctx->cancel_cb_userdata = NULL;
+    ctx->last_run_cancelled = 0;
+    ctx->prompt = NULL;
+    ctx->force_language = NULL;
+    ctx->prompt_tokens = NULL;
+    ctx->n_prompt_tokens = 0;
+    ctx->force_prompt_tokens = NULL;
+    ctx->n_force_prompt_tokens = 0;
+    ctx->prompt_tokens_ready = 0;
+
+    ctx->kv_cache_k = NULL;
+    ctx->kv_cache_v = NULL;
+    ctx->kv_cache_len = 0;
+    ctx->kv_cache_max = 0;
+
+    ctx->dec_x = NULL;
+    ctx->dec_x_norm = NULL;
+    ctx->dec_q = NULL;
+    ctx->dec_k = NULL;
+    ctx->dec_v = NULL;
+    ctx->dec_attn_out = NULL;
+    ctx->dec_proj_out = NULL;
+    ctx->dec_gate = NULL;
+    ctx->dec_up = NULL;
+    ctx->dec_ffn_out = NULL;
+    ctx->dec_rope_cos = NULL;
+    ctx->dec_rope_sin = NULL;
+
+    ctx->pref_x = NULL;
+    ctx->pref_x_norm = NULL;
+    ctx->pref_q = NULL;
+    ctx->pref_k = NULL;
+    ctx->pref_v = NULL;
+    ctx->pref_attn_out = NULL;
+    ctx->pref_proj_out = NULL;
+    ctx->pref_ffn_out = NULL;
+    ctx->pref_gate = NULL;
+    ctx->pref_gate_up = NULL;
+    ctx->pref_seq_cap = 0;
+    memset(&ctx->prefill_scratch, 0, sizeof(ctx->prefill_scratch));
+
+    ctx->rope_cache_cos = NULL;
+    ctx->rope_cache_sin = NULL;
+    ctx->rope_inv_freq = NULL;
+    ctx->rope_cache_cap = 0;
+    ctx->rope_inv_freq_half = 0;
+
+    ctx->perf_total_ms = 0.0;
+    ctx->perf_text_tokens = 0;
+    ctx->perf_audio_ms = 0.0;
+    ctx->perf_encode_ms = 0.0;
+    ctx->perf_decode_ms = 0.0;
+
+    return ctx;
+}
+
 /* ========================================================================
  * Free
  * ======================================================================== */
@@ -298,53 +414,57 @@ void qwen_free(qwen_ctx_t *ctx) {
 
     #define FREE0(p) do { free(p); (p) = NULL; } while (0)
 
-    /* Encoder conv stem */
-    FREE0(ctx->encoder.conv1_weight); FREE0(ctx->encoder.conv1_bias);
-    FREE0(ctx->encoder.conv2_weight); FREE0(ctx->encoder.conv2_bias);
-    FREE0(ctx->encoder.conv3_weight); FREE0(ctx->encoder.conv3_bias);
-    FREE0(ctx->encoder.conv_out_weight);
+    if (ctx->owns_model_data) {
+        /* Encoder conv stem */
+        FREE0(ctx->encoder.conv1_weight); FREE0(ctx->encoder.conv1_bias);
+        FREE0(ctx->encoder.conv2_weight); FREE0(ctx->encoder.conv2_bias);
+        FREE0(ctx->encoder.conv3_weight); FREE0(ctx->encoder.conv3_bias);
+        FREE0(ctx->encoder.conv_out_weight);
 
-    /* Encoder layers (weights are pre-converted f32, all allocated) */
-    for (int i = 0; i < ctx->config.enc_layers; i++) {
-        qwen_enc_layer_t *l = &ctx->encoder.layers[i];
-        if (l->qkv_weight_packed) {
-            FREE0(l->qkv_weight_packed);
-            l->wq_weight = NULL;
-            l->wk_weight = NULL;
-            l->wv_weight = NULL;
-        } else {
-            FREE0(l->wq_weight);
-            FREE0(l->wk_weight);
-            FREE0(l->wv_weight);
+        /* Encoder layers (weights are pre-converted f32, all allocated) */
+        for (int i = 0; i < ctx->config.enc_layers; i++) {
+            qwen_enc_layer_t *l = &ctx->encoder.layers[i];
+            if (l->qkv_weight_packed) {
+                FREE0(l->qkv_weight_packed);
+                l->wq_weight = NULL;
+                l->wk_weight = NULL;
+                l->wv_weight = NULL;
+            } else {
+                FREE0(l->wq_weight);
+                FREE0(l->wk_weight);
+                FREE0(l->wv_weight);
+            }
+            if (l->qkv_bias_packed) {
+                FREE0(l->qkv_bias_packed);
+                l->wq_bias = NULL;
+                l->wk_bias = NULL;
+                l->wv_bias = NULL;
+            } else {
+                FREE0(l->wq_bias);
+                FREE0(l->wk_bias);
+                FREE0(l->wv_bias);
+            }
+            FREE0(l->wo_weight); FREE0(l->wo_bias);
+            FREE0(l->attn_norm_weight); FREE0(l->attn_norm_bias);
+            FREE0(l->fc1_weight); FREE0(l->fc1_bias);
+            FREE0(l->fc2_weight); FREE0(l->fc2_bias);
+            FREE0(l->ffn_norm_weight); FREE0(l->ffn_norm_bias);
         }
-        if (l->qkv_bias_packed) {
-            FREE0(l->qkv_bias_packed);
-            l->wq_bias = NULL;
-            l->wk_bias = NULL;
-            l->wv_bias = NULL;
-        } else {
-            FREE0(l->wq_bias);
-            FREE0(l->wk_bias);
-            FREE0(l->wv_bias);
-        }
-        FREE0(l->wo_weight); FREE0(l->wo_bias);
-        FREE0(l->attn_norm_weight); FREE0(l->attn_norm_bias);
-        FREE0(l->fc1_weight); FREE0(l->fc1_bias);
-        FREE0(l->fc2_weight); FREE0(l->fc2_bias);
-        FREE0(l->ffn_norm_weight); FREE0(l->ffn_norm_bias);
-    }
-    FREE0(ctx->encoder.ln_post_weight); FREE0(ctx->encoder.ln_post_bias);
-    FREE0(ctx->encoder.proj1_weight); FREE0(ctx->encoder.proj1_bias);
-    FREE0(ctx->encoder.proj2_weight); FREE0(ctx->encoder.proj2_bias);
+        FREE0(ctx->encoder.ln_post_weight); FREE0(ctx->encoder.ln_post_bias);
+        FREE0(ctx->encoder.proj1_weight); FREE0(ctx->encoder.proj1_bias);
+        FREE0(ctx->encoder.proj2_weight); FREE0(ctx->encoder.proj2_bias);
 
-    /* Decoder layers */
-    for (int i = 0; i < ctx->config.dec_layers; i++) {
-        qwen_dec_layer_t *l = &ctx->decoder.layers[i];
-        FREE0(l->q_norm_weight); FREE0(l->k_norm_weight);
-        FREE0(l->input_norm); FREE0(l->post_attn_norm);
-        FREE0(l->gate_up_fused_bf16);
+        /* Decoder layers */
+        for (int i = 0; i < ctx->config.dec_layers; i++) {
+            qwen_dec_layer_t *l = &ctx->decoder.layers[i];
+            FREE0(l->q_norm_weight); FREE0(l->k_norm_weight);
+            FREE0(l->input_norm); FREE0(l->post_attn_norm);
+            FREE0(l->gate_up_fused_bf16);
+            FREE0(l->prefill_qkv_prepared.f32_data);
+            FREE0(l->prefill_gate_up_prepared.f32_data);
+        }
+        FREE0(ctx->decoder.norm);
     }
-    FREE0(ctx->decoder.norm);
 
     #undef FREE0
 
@@ -364,6 +484,7 @@ void qwen_free(qwen_ctx_t *ctx) {
     free(ctx->pref_q); free(ctx->pref_k); free(ctx->pref_v);
     free(ctx->pref_attn_out); free(ctx->pref_proj_out); free(ctx->pref_ffn_out);
     free(ctx->pref_gate); free(ctx->pref_gate_up);
+    qwen_float_arena_free(&ctx->prefill_scratch);
 
     /* Decoder RoPE caches */
     free(ctx->rope_cache_cos); free(ctx->rope_cache_sin);
@@ -376,7 +497,7 @@ void qwen_free(qwen_ctx_t *ctx) {
     free(ctx->force_prompt_tokens);
 
     /* Close safetensors */
-    if (ctx->safetensors) {
+    if (ctx->owns_model_data && ctx->safetensors) {
         multi_safetensors_close((multi_safetensors_t *)ctx->safetensors);
     }
 
@@ -420,17 +541,26 @@ static void tok_embed_bf16_to_f32(float *dst, const uint16_t *tok_emb_bf16,
 }
 
 static double get_time_ms(void) {
-#ifdef _WIN32
-    static LARGE_INTEGER freq = {0};
-    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    return (double)now.QuadPart * 1000.0 / (double)freq.QuadPart;
-#else
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
-#endif
+    return qwen_perf_now_ms();
+}
+
+static void reset_runtime_perf_stats(qwen_ctx_t *ctx) {
+    const double prepare_ms = ctx->runtime_perf.decoder_prefill_qkv_prepare_ms;
+    const double gate_up_prepare_ms = ctx->runtime_perf.decoder_prefill_gate_up_prepare_ms;
+    memset(&ctx->runtime_perf, 0, sizeof(ctx->runtime_perf));
+    ctx->runtime_perf.decoder_prefill_qkv_prepare_ms = prepare_ms;
+    ctx->runtime_perf.decoder_prefill_gate_up_prepare_ms = gate_up_prepare_ms;
+    for (int layer = 0; layer < ctx->config.dec_layers; layer++) {
+        const qwen_dec_layer_t *dec_layer = &ctx->decoder.layers[layer];
+        if (dec_layer->prefill_qkv_prepared.f32_data) {
+            ctx->runtime_perf.decoder_prefill_qkv_bytes += dec_layer->prefill_qkv_prepared.bytes;
+            ctx->runtime_perf.decoder_prefill_qkv_layers += 1;
+        }
+        if (dec_layer->prefill_gate_up_prepared.f32_data) {
+            ctx->runtime_perf.decoder_prefill_gate_up_bytes += dec_layer->prefill_gate_up_prepared.bytes;
+            ctx->runtime_perf.decoder_prefill_gate_up_layers += 1;
+        }
+    }
 }
 
 static int cmp_float_asc(const void *a, const void *b) {
@@ -922,6 +1052,7 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
     ctx->perf_audio_ms = 1000.0 * (double)n_samples / (double)QWEN_SAMPLE_RATE;
     ctx->perf_encode_ms = 0;
     ctx->perf_decode_ms = 0;
+    reset_runtime_perf_stats(ctx);
 
     if (qwen_should_cancel(ctx)) return qwen_alloc_empty_text();
 
@@ -1281,6 +1412,223 @@ static int stream_reanchor_text_state(qwen_ctx_t *ctx,
 }
 
 /* ========================================================================
+ * Background Encoder Pipeline (Plan A: encoder-decoder overlap)
+ *
+ * In live streaming mode, the background encoder thread pre-computes
+ * encoder windows ahead of the decoder to overlap encode and decode work.
+ * The encoder thread uses a cloned context (shared read-only weights,
+ * independent scratch) and communicates via a simple work-queue protocol.
+ * ======================================================================== */
+
+/* Synchronization macros for background encoder */
+#ifdef _WIN32
+#define BG_LOCK(bg)    EnterCriticalSection(&(bg)->mutex)
+#define BG_UNLOCK(bg)  LeaveCriticalSection(&(bg)->mutex)
+#define BG_SIGNAL(bg)  WakeAllConditionVariable(&(bg)->cond)
+#define BG_WAIT(bg)    SleepConditionVariableCS(&(bg)->cond, &(bg)->mutex, INFINITE)
+#else
+#define BG_LOCK(bg)    pthread_mutex_lock(&(bg)->mutex)
+#define BG_UNLOCK(bg)  pthread_mutex_unlock(&(bg)->mutex)
+#define BG_SIGNAL(bg)  pthread_cond_broadcast(&(bg)->cond)
+#define BG_WAIT(bg)    pthread_cond_wait(&(bg)->cond, &(bg)->mutex)
+#endif
+
+typedef struct {
+    qwen_ctx_t *enc_ctx;         /* clone for encoder-only use */
+
+    /* Work item input (set by submitter, consumed by worker) */
+    float *work_samples;         /* owned audio copy */
+    int work_n_samples;
+    int64_t work_start_sample;   /* global sample offset of this window */
+
+    /* Result (set by worker, consumed by main thread) */
+    float *result_enc;           /* encoded output [seq_len, dim] */
+    int result_seq_len;
+    int64_t result_start_sample; /* which window this result is for */
+    int result_n_samples;
+
+    /* Control flags */
+    int has_work;                /* 1 = new work submitted */
+    int has_result;              /* 1 = result available for collection */
+    int stop;                    /* 1 = thread should exit */
+
+#ifdef _WIN32
+    HANDLE thread;
+    CRITICAL_SECTION mutex;
+    CONDITION_VARIABLE cond;
+#else
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+#endif
+} stream_bg_encoder_t;
+
+#ifdef _WIN32
+static DWORD WINAPI stream_bg_encoder_fn(LPVOID arg) {
+#else
+static void *stream_bg_encoder_fn(void *arg) {
+#endif
+    stream_bg_encoder_t *bg = (stream_bg_encoder_t *)arg;
+
+    while (1) {
+        BG_LOCK(bg);
+        while (!bg->has_work && !bg->stop)
+            BG_WAIT(bg);
+
+        if (bg->stop) {
+            BG_UNLOCK(bg);
+            break;
+        }
+
+        /* Take the work item */
+        float *samples = bg->work_samples;
+        int n_samples = bg->work_n_samples;
+        int64_t start_sample = bg->work_start_sample;
+        bg->work_samples = NULL;
+        bg->has_work = 0;
+        BG_UNLOCK(bg);
+
+        /* Encode outside the lock */
+        float *enc_output = NULL;
+        int seq_len = 0;
+        int err = stream_encode_span(bg->enc_ctx, samples, n_samples,
+                                     &enc_output, &seq_len);
+
+        BG_LOCK(bg);
+        if (err == 0 && enc_output && seq_len > 0) {
+            free(bg->result_enc); /* discard any stale result */
+            bg->result_enc = enc_output;
+            bg->result_seq_len = seq_len;
+            bg->result_start_sample = start_sample;
+            bg->result_n_samples = n_samples;
+            bg->has_result = 1;
+        } else {
+            free(enc_output);
+        }
+        free(samples);
+        BG_SIGNAL(bg);
+        BG_UNLOCK(bg);
+    }
+
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static int stream_bg_encoder_init(stream_bg_encoder_t *bg, const qwen_ctx_t *src_ctx) {
+    memset(bg, 0, sizeof(*bg));
+    bg->enc_ctx = qwen_clone_shared(src_ctx);
+    if (!bg->enc_ctx) return -1;
+
+#ifdef _WIN32
+    InitializeCriticalSection(&bg->mutex);
+    InitializeConditionVariable(&bg->cond);
+    bg->thread = CreateThread(NULL, 0, stream_bg_encoder_fn, bg, 0, NULL);
+    if (!bg->thread) {
+        DeleteCriticalSection(&bg->mutex);
+        qwen_free(bg->enc_ctx);
+        bg->enc_ctx = NULL;
+        return -1;
+    }
+#else
+    pthread_mutex_init(&bg->mutex, NULL);
+    pthread_cond_init(&bg->cond, NULL);
+    if (pthread_create(&bg->thread, NULL, stream_bg_encoder_fn, bg) != 0) {
+        pthread_mutex_destroy(&bg->mutex);
+        pthread_cond_destroy(&bg->cond);
+        qwen_free(bg->enc_ctx);
+        bg->enc_ctx = NULL;
+        return -1;
+    }
+#endif
+    return 0;
+}
+
+static void stream_bg_encoder_destroy(stream_bg_encoder_t *bg) {
+    if (!bg) return;
+
+    BG_LOCK(bg);
+    bg->stop = 1;
+    BG_SIGNAL(bg);
+    BG_UNLOCK(bg);
+
+#ifdef _WIN32
+    if (bg->thread) {
+        WaitForSingleObject(bg->thread, INFINITE);
+        CloseHandle(bg->thread);
+    }
+    DeleteCriticalSection(&bg->mutex);
+#else
+    pthread_join(bg->thread, NULL);
+    pthread_mutex_destroy(&bg->mutex);
+    pthread_cond_destroy(&bg->cond);
+#endif
+
+    free(bg->work_samples);
+    free(bg->result_enc);
+    if (bg->enc_ctx) qwen_free(bg->enc_ctx);
+}
+
+/* Submit a window for background encoding. Copies the audio data.
+ * If a previous work item is pending, it is replaced. */
+static void stream_bg_encoder_submit(stream_bg_encoder_t *bg,
+                                     const float *samples, int n_samples,
+                                     int64_t start_sample) {
+    if (!bg || n_samples <= 0) return;
+
+    float *copy = (float *)malloc((size_t)n_samples * sizeof(float));
+    if (!copy) return;
+    memcpy(copy, samples, (size_t)n_samples * sizeof(float));
+
+    BG_LOCK(bg);
+    free(bg->work_samples);
+    bg->work_samples = copy;
+    bg->work_n_samples = n_samples;
+    bg->work_start_sample = start_sample;
+    bg->has_work = 1;
+    BG_SIGNAL(bg);
+    BG_UNLOCK(bg);
+}
+
+/* Try to collect a pre-computed result. Non-blocking.
+ * Returns 1 if a matching result is available, 0 otherwise.
+ * On success, ownership of *out_enc is transferred to caller. */
+static int stream_bg_encoder_collect(stream_bg_encoder_t *bg,
+                                     int64_t expected_start,
+                                     int expected_n_samples,
+                                     float **out_enc, int *out_seq_len) {
+    if (!bg) return 0;
+    *out_enc = NULL;
+    *out_seq_len = 0;
+
+    BG_LOCK(bg);
+    if (bg->has_result &&
+        bg->result_start_sample == expected_start &&
+        bg->result_n_samples == expected_n_samples) {
+        *out_enc = bg->result_enc;
+        *out_seq_len = bg->result_seq_len;
+        bg->result_enc = NULL;
+        bg->has_result = 0;
+        BG_UNLOCK(bg);
+        return 1;
+    }
+    BG_UNLOCK(bg);
+    return 0;
+}
+
+/* Invalidate any stale results (used after encoder cache resets). */
+static void stream_bg_encoder_invalidate(stream_bg_encoder_t *bg) {
+    if (!bg) return;
+    BG_LOCK(bg);
+    free(bg->result_enc);
+    bg->result_enc = NULL;
+    bg->has_result = 0;
+    BG_UNLOCK(bg);
+}
+
+/* ========================================================================
  * Streaming Transcription (chunked rollback + encoder window cache)
  *
  * Decoder-side behavior follows the official streaming policy:
@@ -1298,6 +1646,9 @@ static int stream_reanchor_text_state(qwen_ctx_t *ctx,
  *   partial tail window.
  * - Decoder prefill still consumes all encoder tokens
  *   ([cached windows] + [current partial window]).
+ *
+ * In live mode, a background encoder thread pre-computes windows ahead
+ * of the decoder to overlap encoder and decoder work.
  * ======================================================================== */
 
 /* Internal streaming implementation. When live!=NULL, audio is read
@@ -1382,6 +1733,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     ctx->perf_audio_ms = live ? 0.0 : 1000.0 * (double)n_samples / (double)QWEN_SAMPLE_RATE;
     ctx->perf_encode_ms = 0;
     ctx->perf_decode_ms = 0;
+    reset_runtime_perf_stats(ctx);
     int enc_window_frames = ctx->config.enc_n_window_infer;
     if (enc_window_frames < 100) enc_window_frames = 100;
     if (enc_window_frames > 800) enc_window_frames = 800;
@@ -1528,6 +1880,22 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     int prefill_total_tokens = 0;
     int prefill_reused_tokens = 0;
 
+    /* Background encoder pipeline for live mode (Plan A: encoder-decoder overlap).
+     * The background thread pre-computes complete encoder windows while the
+     * decoder is busy, so window encoding is off the critical path. */
+    stream_bg_encoder_t bg_enc_storage;
+    stream_bg_encoder_t *bg_enc = NULL;
+    if (live && use_enc_cache) {
+        if (stream_bg_encoder_init(&bg_enc_storage, ctx) == 0) {
+            bg_enc = &bg_enc_storage;
+            if (qwen_verbose >= 1) {
+                fprintf(stderr, "Streaming (live): background encoder thread started\n");
+            }
+        } else if (qwen_verbose >= 1) {
+            fprintf(stderr, "Streaming (live): background encoder init failed, using inline encoding\n");
+        }
+    }
+
     while (audio_cursor < audio_n_samples || (live && !live_eof)) {
         /* Live mode: wait until we have enough data for the next chunk. */
         if (live) {
@@ -1647,14 +2015,34 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 }
                 float *win_enc = NULL;
                 int win_seq = 0;
-                if (stream_encode_span(ctx,
-                                       audio_samples + (size_t)ws_local_off,
-                                       enc_window_samples,
-                                       &win_enc, &win_seq) != 0 ||
-                    !win_enc || win_seq <= 0) {
-                    free(win_enc);
-                    enc_failed = 1;
-                    break;
+
+                /* Try background pre-computed result first */
+                int bg_hit = bg_enc &&
+                    stream_bg_encoder_collect(bg_enc, ws, enc_window_samples,
+                                             &win_enc, &win_seq);
+                if (bg_hit) {
+                    if (qwen_verbose >= 2) {
+                        fprintf(stderr,
+                                "  Encoder: bg-hit window at %.1f s (%d tokens)\n",
+                                (float)ws / QWEN_SAMPLE_RATE, win_seq);
+                    }
+                    if (qwen_monitor) {
+                        fprintf(stderr, "\xe2\x9a\xa1"); /* ⚡ = bg encoder hit */
+                        fflush(stderr);
+                    }
+                }
+
+                if (!bg_hit) {
+                    /* Fallback: encode inline */
+                    if (stream_encode_span(ctx,
+                                           audio_samples + (size_t)ws_local_off,
+                                           enc_window_samples,
+                                           &win_enc, &win_seq) != 0 ||
+                        !win_enc || win_seq <= 0) {
+                        free(win_enc);
+                        enc_failed = 1;
+                        break;
+                    }
                 }
 
                 if (n_enc_cache == enc_cache_cap) {
@@ -2081,6 +2469,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                                        &enc_cached_seq_total,
                                        &next_window_start,
                                        full_end);
+                stream_bg_encoder_invalidate(bg_enc);
                 stagnant_chunks = 0;
                 did_recovery_reset = 1;
                 if (qwen_monitor) {
@@ -2199,6 +2588,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                                            &enc_cached_seq_total,
                                            &next_window_start,
                                            full_end);
+                    stream_bg_encoder_invalidate(bg_enc);
                     did_periodic_reset = 1;
                 }
             }
@@ -2215,6 +2605,13 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             }
             fprintf(stderr, "  Commit: candidate=%d tokens, emitted_total=%d\n",
                     candidate_len, n_stable_text_tokens);
+        }
+
+        /* Update decoded cursor so the caller can compute true decode lag. */
+        if (live) {
+            LA_LOCK(live);
+            live->decoded_cursor = audio_cursor;
+            LA_UNLOCK(live);
         }
 
         if (live && use_enc_cache) {
@@ -2237,8 +2634,40 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             }
         }
 
+        /* Submit next window for background pre-encoding if audio is available.
+         * The background encoder can work during the next chunk's wait + decode. */
+        if (bg_enc && !is_final && !did_recovery_reset && !did_periodic_reset) {
+            int64_t next_full_end = ((audio_cursor + chunk_samples) / enc_window_samples)
+                                   * (int64_t)enc_window_samples;
+            if (next_window_start < next_full_end) {
+                int64_t ws_local_off = next_window_start - local_base_sample;
+                if (ws_local_off >= 0 &&
+                    ws_local_off + enc_window_samples <= local_n_samples) {
+                    stream_bg_encoder_submit(
+                        bg_enc,
+                        audio_samples + (size_t)ws_local_off,
+                        enc_window_samples,
+                        next_window_start);
+                    if (qwen_verbose >= 2) {
+                        fprintf(stderr,
+                                "  BG-Encoder: submitted window at %.1f s\n",
+                                (float)next_window_start / QWEN_SAMPLE_RATE);
+                    }
+                }
+            }
+        }
+
         ctx->perf_total_ms += get_time_ms() - chunk_t0;
         chunk_idx++;
+    }
+
+    /* Shut down background encoder */
+    if (bg_enc) {
+        stream_bg_encoder_destroy(bg_enc);
+        bg_enc = NULL;
+        if (qwen_verbose >= 1) {
+            fprintf(stderr, "Streaming (live): background encoder thread stopped\n");
+        }
     }
 
     free(tmp_embed);

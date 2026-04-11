@@ -347,6 +347,66 @@ Apple 旧实验仍保留一条参考：
 - `[已证伪为默认方案]` decoder 侧持久 packed weight cache：microbench 有收益，但额外 cache 内存不可接受，不进入默认路径。
 - `[已延后]` OpenBLAS BF16 API 实验：可跟踪，但在 packed weight 与 shape dispatch 之前优先级不高。
 
+围绕 `docs/enhancement2.md` 再做一轮后，现结论再细化如下：
+
+- 本轮已落三件基础设施：
+   - `RuntimeProfile`：统一控制 realtime / balanced / offline / lowmem 档位
+   - `PreparedWeight`：decoder layer 增 `prefill_qkv_prepared`
+   - `ScratchArena`：decoder prefill QKV 改走 `ctx->prefill_scratch`
+- 本轮又续补两层：
+   - decoder layer 再增 `prefill_gate_up_prepared`
+   - decoder prefill 的 `WO / GateUp / Down` 在 `seq_len>1` 时改走显式 `BF16->F32` scratch，不再借全局静态 scratch
+- 当前生产默认仍只固化 **decoder prefill QKV**；GateUp 虽已具同型 prepared 路，但默认预算仍关。
+- 现默认预算：`QWEN_DEC_PREFILL_QKV_BUDGET_MB=512`。
+   - 0.6B 形状：`(2048 + 2*1024) * 1024 * 4 * 28 = 448MB`，可落预算，故默认启 prepared QKV。
+   - 1.7B 形状：同式为 `896MB`，超预算，故默认仍走 BF16 热路。
+- 这样做之意不在“所有模型都强上 persistent F32”，而在“只把 0.6B 这类实时档位收益稳、内存尚可受者固化”。
+
+1.7B 真模启动实测亦已补：
+
+- 默认：`QWEN_RUNTIME_PROFILE=balanced`，server 可正常起；无 prepared QKV 日志，符合 `512MB` 预算挡下 1.7B 之预期。
+- 强开：`QWEN_RUNTIME_PROFILE=realtime` + `QWEN_DEC_PREFILL_QKV_BUDGET_MB=1024`
+   - `qasr_server` 成功起服
+   - 日志：`decoder: prepared prefill QKV layers=28 bytes=896.0 MB profile=realtime ms=360.132`
+- 结论：
+   - 1.7B prepared QKV 在当前机可真实载入，不止停留于 shape bench
+   - 其代价约额外 `896MB` 常驻与约 `360ms` 启动准备时间
+   - 故仍不宜作默认；但对单实例低延时档，可作为显式 runtime profile 选项
+
+Windows + OpenBLAS + SkylakeX，`qasr_cpu_bench` 新一轮数据：
+
+- 12 线程：
+   - `dec_prefill_qkv_seq32_h1024`：`2.108ms -> 1.243ms`，约 `1.696x`
+   - `dec_prefill_qkv_seq64_h2048`：`6.820ms -> 3.793ms`，约 `1.798x`
+- 4 线程：
+   - `dec_prefill_qkv_seq32_h1024`：`2.846ms -> 2.358ms`，约 `1.207x`
+   - `dec_prefill_qkv_seq64_h2048`：`8.162ms -> 6.080ms`，约 `1.342x`
+- 结论：
+   - 0.6B 形状收益成立，且在 4 线程与 12 线程皆为正收益。
+   - 1.7B 形状 microbench 亦有益，但因总 prepared cache 约 `896MB`，默认不固化。
+   - 故“QKV prepared + budget gating”成立；“全模型无差别持久化”不成立。
+
+本轮尚未固化者：
+
+- GateUp prepared F32：
+   - 12 线程 `dec_gate_up_seq32_h1024_i3072` 为 `3.575ms -> 1.479ms`，约 `2.417x`
+   - 但 0.6B 全层 cache 约 `672MB`，与 QKV 叠加后过重，故不进默认
+- 1.7B GateUp 若全层 prepared，约 `2.6GB+`，风险过高，本轮未强行真机尝试。
+- 通用 BF16 热路仍有旧 `bf16_scratch/cache`；但 decoder prefill 主热路已进一步收口：`QKV + WO + GateUp + Down` 在 `seq_len>1` 时已不再依赖全局静态 scratch。其余 encoder / 通用 fallback 后续再收。
+
+验证与边界：
+
+- 本轮新增单测覆盖：
+   - `qwen_linear_nobias_qkv_f32_packed`
+   - `qwen_linear_nobias_bf16_qkv_prefill` 新 scratch 语义
+   - `qwen_linear_nobias_bf16_scratch`
+   - `qwen_should_prepare_decoder_prefill_qkv/gate_up`
+   - `qwen_decoder_prepare_runtime`
+   - `qwen_float_arena_*`
+   - `qwen_perf_now_ms`
+- Windows/OpenBLAS 全量单测已过。
+- 当前 workspace 仍无 `Qwen3-ASR-0.6B` 真模型目录，故本轮“0.6B realtime 提升”证据仍是 **0.6B shape microbench 代理**，不是端到端 live run；此限制须留档，不可写成已完成 0.6B 实流实测。
+
 重复提醒：VS Code 的 CMake Tools 在当前环境下仍可能因未注入完整 MSVC 标准库环境而报 `stddef.h` / `cstdint` / `functional` 缺失；Windows 真正验证请优先走 `tools/build_windows_openblas.cmd` / `.ps1`。
 
 ### 流式服务与资源边界
@@ -440,3 +500,21 @@ Apple 旧实验仍保留一条参考：
 - `[重复环境]` Windows 重建时若 `qasr_server.exe` 仍在运行，会反复触发 `LNK1168`；重编前须先停占用进程。
 - `[重复兼容]` Win32 `max` 宏会破坏 `std::max`；Windows 代码路径必须坚持 `NOMINMAX` 或 `(std::max)` 规避。
 - `[重复误判]` 大文件上传失败不应再靠“单纯提高 multipart 上限”处理；后续一律优先流式上传或浏览器端转码。
+
+### Benchmark、PowerShell 与 realtime 指标
+
+- `[已成功]` 已补 `tools/run_benchmark.ps1` 作为统一入口，可串起 `0.6B / 1.7B × realtime / batch` 四组 benchmark：自动发现 ModelScope 模型目录、自动选取 `testfile/` 中最大 `.wav`、自动起停 `qasr_server`、自动汇总 JSON 与 Markdown 报表。
+- `[已成功]` realtime benchmark 现采用“长音频裁固定时长 + 抖动 chunk + 实时 pacing”法：默认截取长音频前 `120s`，chunk 在 `200-600ms` 间随机，按累计音频时长限速发送。若目标是测吞吐、lag 与稳定前缀，这比人为设计复杂分布更稳，也更便于复现。
+- `[已确认环境事实]` `testfile/` 中文长音频在 Windows 实盘文件名可能是 URL 编码形式；脚本不可写死展示名，应按目录扫描结果取真实路径。
+- `[已确认环境事实]` 当前长样音已是 `16kHz / mono / PCM16`；对此类输入应走“直接复制 PCM”快路，不应在 PowerShell 内逐采样重采样，否则 benchmark 会先被预处理本身拖慢。
+- `[已踩坑]` PowerShell 5.1 兼容性比 PowerShell 7 更严格；benchmark 脚本若包含较激进的内联表达式或依赖较新的库行为，容易在 Windows 实机翻车。Windows 路径上的工具必须按 PowerShell 5.1 实测，而不能只在新版本 shell 上看起来可跑。
+- `[已证伪]` PowerShell 5.1 下直接用 `System.Net.Http.HttpClient` 组 multipart 上传，不足以稳定满足本项目 `cpp-httplib` 对文件字段的识别；服务端会报 `multipart field 'audio' or 'file' is required`。改为手工拼 `multipart/form-data` boundary 并走 `Invoke-WebRequest` 后，batch benchmark 才稳定通过。
+- `[已确认修正]` realtime 报表原先把 `wall / audio_duration` 直接记作 `RTF`，此值天然包含实时 pacing 的等待时间，必然 `>= 1`，不能与 batch 直接比较。现应明确区分：`Processing RTF = lag / audio_duration`，`E2E RTF = wall / audio_duration`。
+- `[已成功]` 2026-04-11 的 10s 快速验证结果如下：
+   - `Qwen3-ASR-0.6B`：realtime `Processing RTF = 0.551`，batch `RTF = 0.36`
+   - `Qwen3-ASR-1.7B`：realtime `Processing RTF = 2.64`，batch `RTF = 0.782`
+- `[当前判断]` 0.6B 在当前 Windows / OpenBLAS / 16 logical CPUs 环境上，realtime 额外成本主要来自 chunk-by-chunk 的反复 encode/decode、session 管理与 polling 开销；batch 明显更快，但 realtime 仍处于可讨论优化区间。1.7B 则已明显算力不足，无法在当前机型上跟住严格实时输入。
+- `[已成功]` 当前 benchmark 主脚本已支持“realtime 崩后重启 server，再继续跑 batch”，这样即使流式链路仍不稳，也能把 batch 结果保住，避免四组 benchmark 全部中断。
+- `[已失败但必须留档]` 0.6B 在 Windows 上跑 `180s` 级 realtime 长流时，`qasr_server` 仍可能在 `/api/realtime/stop` 前后触发 `0xC0000005 (ACCESS_VIOLATION)`。`12s` smoke 可过，但长流不稳；故在 backend 未修稳之前，不宜把 `120s` 或 `180s` realtime 结果直接当作最终结论。
+- `[已尝试但未根治]` 在 `qwen_clone_shared()` 中把 prepared prefill cache 指针清空，可排除一类 clone 共享可变状态问题，且对短时 smoke 有帮助；但它未能根治长时 realtime crash，说明尚有第二条崩溃路径，后续应优先检查 live session 的 finalize / cleanup、长窗口状态裁剪以及 stop 路径。
+- `[当前建议]` 后续讨论模型性能时，应优先并列观察：batch `RTF`、realtime `Processing RTF`、`first_stable_wall_ms`、`final_lag_ms`。若只拿 realtime 的 `wall / audio` 去对比 batch，结论会系统性偏悲观且失真。

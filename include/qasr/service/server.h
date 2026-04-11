@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "qasr/core/status.h"
+#include "qasr/service/realtime.h"
 
 namespace qasr {
 
@@ -54,6 +55,8 @@ bool ShouldEvictCompletedJob(
     std::int64_t ttl_seconds) noexcept;
 Status ParseOpenAiRealtimeRequest(std::string_view body, OpenAiRealtimeRequest * request);
 Status DecodeBase64Pcm16Le(std::string_view encoded, std::vector<float> * samples);
+float RealtimeStreamChunkSeconds(const RealtimePolicyConfig & policy) noexcept;
+int RealtimeStreamMaxNewTokens(const RealtimePolicyConfig & policy) noexcept;
 
 Status ValidateServerConfig(const ServerConfig & config);
 Status ParseServerArguments(int argc, const char * const argv[], ServerConfig * config, bool * show_help);

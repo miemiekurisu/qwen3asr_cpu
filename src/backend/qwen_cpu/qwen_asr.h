@@ -7,6 +7,8 @@
 #ifndef QWEN_ASR_H
 #define QWEN_ASR_H
 
+#include "qwen_asr_perf.h"
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -142,6 +144,13 @@ typedef struct {
  * ======================================================================== */
 
 typedef struct {
+    float *f32_data;
+    size_t rows;
+    size_t cols;
+    size_t bytes;
+} qwen_prepared_f32_weight_t;
+
+typedef struct {
     /* Self-attention (NO biases in decoder) */
     uint16_t *wq_weight_bf16;  /* [n_heads*head_dim, hidden] */
     uint16_t *wk_weight_bf16;  /* [n_kv_heads*head_dim, hidden] */
@@ -163,6 +172,9 @@ typedef struct {
 
     /* Fused gate+up weight for single-token matvec [2*intermediate, hidden] */
     uint16_t *gate_up_fused_bf16;
+
+    qwen_prepared_f32_weight_t prefill_qkv_prepared;
+    qwen_prepared_f32_weight_t prefill_gate_up_prepared;
 } qwen_dec_layer_t;
 
 typedef struct {
@@ -193,13 +205,27 @@ typedef int (*qwen_cancel_cb)(void *userdata);
  * ======================================================================== */
 
 typedef struct {
+    double decoder_prefill_qkv_prepare_ms;
+    double decoder_prefill_qkv_ms;
+    double decoder_prefill_gate_up_prepare_ms;
+    double decoder_prefill_gate_up_ms;
+    size_t decoder_prefill_qkv_bytes;
+    size_t decoder_prefill_gate_up_bytes;
+    int decoder_prefill_qkv_layers;
+    int decoder_prefill_gate_up_layers;
+} qwen_runtime_perf_t;
+
+typedef struct {
     qwen_config_t config;
     qwen_encoder_t encoder;
     qwen_decoder_t decoder;
+    qwen_runtime_profile_config_t runtime_profile;
+    qwen_runtime_perf_t runtime_perf;
 
     /* Model files (kept open for mmap) */
     void *safetensors;         /* multi_safetensors_t* */
     char model_dir[512];
+    int owns_model_data;
 
     /* KV cache for decoder */
     float *kv_cache_k;         /* [layers, max_seq, kv_heads * head_dim] */
@@ -218,6 +244,7 @@ typedef struct {
     float *pref_attn_out, *pref_proj_out, *pref_ffn_out;
     float *pref_gate, *pref_gate_up;
     int pref_seq_cap;
+    qwen_float_arena_t prefill_scratch;
 
     /* Cached RoPE tables for decoder positions */
     float *rope_cache_cos, *rope_cache_sin;   /* [pos, head_dim] */
@@ -275,6 +302,9 @@ typedef struct {
     int64_t n_samples;          /* number of valid samples in buffer */
     int64_t capacity;           /* allocated capacity (in samples) */
     int eof;
+    /* Updated by stream_impl decoder thread after each chunk decode.
+     * Readers should acquire mutex before reading. */
+    int64_t decoded_cursor;     /* audio sample position up to which decode completed */
 #ifdef _WIN32
     CRITICAL_SECTION mutex;
     CONDITION_VARIABLE cond;
@@ -293,8 +323,15 @@ typedef struct {
 /* Load model from directory */
 qwen_ctx_t *qwen_load(const char *model_dir);
 
+/* Clone a context for an independent decode session while sharing read-only model data.
+ * The source context must outlive the clone. */
+qwen_ctx_t *qwen_clone_shared(const qwen_ctx_t *src);
+
 /* Free all resources */
 void qwen_free(qwen_ctx_t *ctx);
+
+/* Internal runtime preparation step used after decoder weights are loaded. */
+int qwen_decoder_prepare_runtime(qwen_ctx_t *ctx);
 
 /* Set a callback to receive each decoded token as it's generated.
  * Set cb=NULL to disable. The callback is invoked during transcription. */

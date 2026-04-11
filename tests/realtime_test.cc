@@ -161,6 +161,33 @@ QASR_TEST(AdvanceRealtimeDisplayStateFinalizesPunctuatedSegment) {
     QASR_EXPECT_EQ(snapshot.display_text, std::string("hello world."));
 }
 
+QASR_TEST(AdvanceRealtimeDisplayStateSplitsCommittedSentenceBeforeLiveTail) {
+    qasr::RealtimeDisplayState state;
+    qasr::RealtimeDisplaySnapshot snapshot;
+    qasr::RealtimeTextUpdate update;
+
+    update.stable_text = "第一句。第二句还在继续";
+    update.text = update.stable_text;
+    QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
+    QASR_EXPECT_EQ(snapshot.recent_segments.size(), std::size_t(1));
+    QASR_EXPECT_EQ(snapshot.recent_segments[0], std::string("第一句。"));
+    QASR_EXPECT_EQ(snapshot.live_stable_text, std::string("第二句还在继续"));
+    QASR_EXPECT_EQ(snapshot.display_text, std::string("第一句。\n第二句还在继续"));
+}
+
+QASR_TEST(AdvanceRealtimeDisplayStateSplitsStableChineseClauseOnComma) {
+    qasr::RealtimeDisplayState state;
+    qasr::RealtimeDisplaySnapshot snapshot;
+    qasr::RealtimeTextUpdate update;
+
+    update.stable_text = "请马上前往医院，后面立刻安排救护处理";
+    update.text = update.stable_text;
+    QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
+    QASR_EXPECT_EQ(snapshot.recent_segments.size(), std::size_t(1));
+    QASR_EXPECT_EQ(snapshot.recent_segments[0], std::string("请马上前往医院，"));
+    QASR_EXPECT_EQ(snapshot.live_stable_text, std::string("后面立刻安排救护处理"));
+}
+
 QASR_TEST(AdvanceRealtimeDisplayStateKeepsOnlyRecentSegments) {
     qasr::RealtimeDisplayState state;
     qasr::RealtimeDisplaySnapshot snapshot;

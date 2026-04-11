@@ -260,6 +260,7 @@ Stats BenchmarkPolicy(const Scenario &scenario,
 }
 
 Stats BenchmarkDecoderPrefillQkvBf16(const DecoderQkvScenario &scenario, const Options &options) {
+    const int total_out = scenario.q_dim + 2 * scenario.kv_dim;
     std::vector<float> x(static_cast<std::size_t>(scenario.seq_len * scenario.hidden));
     std::vector<std::uint16_t> wq(static_cast<std::size_t>(scenario.q_dim * scenario.hidden));
     std::vector<std::uint16_t> wk(static_cast<std::size_t>(scenario.kv_dim * scenario.hidden));
@@ -267,6 +268,8 @@ Stats BenchmarkDecoderPrefillQkvBf16(const DecoderQkvScenario &scenario, const O
     std::vector<float> q(static_cast<std::size_t>(scenario.seq_len * scenario.q_dim));
     std::vector<float> k(static_cast<std::size_t>(scenario.seq_len * scenario.kv_dim));
     std::vector<float> v(static_cast<std::size_t>(scenario.seq_len * scenario.kv_dim));
+    std::vector<float> qkv_out(static_cast<std::size_t>(scenario.seq_len * total_out));
+    std::vector<float> qkv_weights(static_cast<std::size_t>(total_out * scenario.hidden));
 
     FillPseudoRandom(&x, 3001u);
     FillPseudoRandomBfloat16(&wq, 3003u);
@@ -276,7 +279,8 @@ Stats BenchmarkDecoderPrefillQkvBf16(const DecoderQkvScenario &scenario, const O
     qwen_apply_prefill_thread_policy();
 
     return Measure([&]() {
-        qwen_linear_nobias_bf16_qkv_prefill(q.data(), k.data(), v.data(), x.data(),
+        qwen_linear_nobias_bf16_qkv_prefill(q.data(), k.data(), v.data(),
+                                            qkv_out.data(), qkv_weights.data(), x.data(),
                                             wq.data(), wk.data(), wv.data(),
                                             scenario.seq_len, scenario.hidden,
                                             scenario.q_dim, scenario.kv_dim);
@@ -312,18 +316,10 @@ Stats BenchmarkDecoderPrefillQkvPacked(const DecoderQkvScenario &scenario, const
     qwen_apply_prefill_thread_policy();
 
     return Measure([&]() {
-        qwen_linear_nobias(qkv_out.data(), x.data(), packed_weights.data(),
-                           scenario.seq_len, scenario.hidden, total_out);
-        for (int row = 0; row < scenario.seq_len; ++row) {
-            const float *src = qkv_out.data() + static_cast<std::ptrdiff_t>(row * total_out);
-            std::memcpy(q.data() + static_cast<std::ptrdiff_t>(row * scenario.q_dim),
-                        src, static_cast<std::size_t>(scenario.q_dim) * sizeof(float));
-            std::memcpy(k.data() + static_cast<std::ptrdiff_t>(row * scenario.kv_dim),
-                        src + scenario.q_dim, static_cast<std::size_t>(scenario.kv_dim) * sizeof(float));
-            std::memcpy(v.data() + static_cast<std::ptrdiff_t>(row * scenario.kv_dim),
-                        src + scenario.q_dim + scenario.kv_dim,
-                        static_cast<std::size_t>(scenario.kv_dim) * sizeof(float));
-        }
+        qwen_linear_nobias_qkv_f32_packed(q.data(), k.data(), v.data(),
+                                          qkv_out.data(), x.data(), packed_weights.data(),
+                                          scenario.seq_len, scenario.hidden,
+                                          scenario.q_dim, scenario.kv_dim);
     }, options.warmup, scenario.iterations * options.scale);
 }
 

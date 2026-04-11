@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -29,6 +30,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #else
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -338,6 +345,21 @@ Status DecodeBase64Pcm16Le(std::string_view encoded, std::vector<float> * sample
         samples->push_back(static_cast<float>(sample) / 32768.0f);
     }
     return OkStatus();
+}
+
+float RealtimeStreamChunkSeconds(const RealtimePolicyConfig & policy) noexcept {
+    float seconds = static_cast<float>(policy.min_decode_interval_ms) / 1000.0f;
+    if (seconds < 0.4f) {
+        seconds = 0.4f;
+    }
+    if (seconds > 1.0f) {
+        seconds = 1.0f;
+    }
+    return seconds;
+}
+
+int RealtimeStreamMaxNewTokens(const RealtimePolicyConfig & policy) noexcept {
+    return RealtimeStreamChunkSeconds(policy) <= 0.8f ? 24 : 32;
 }
 
 namespace {
@@ -841,6 +863,7 @@ struct ModelDecodeOptions {
     std::string prompt;
     std::string language;
     int stream_max_new_tokens = 32;
+    float stream_chunk_sec = 0.0f;
     bool use_stream_path = false;
     std::function<void(std::string_view)> token_callback;
     std::function<bool()> cancel_callback;
@@ -900,6 +923,9 @@ public:
 
         qwen_verbose = config_.verbosity;
         ctx_->stream_max_new_tokens = decode.stream_max_new_tokens;
+        if (decode.stream_chunk_sec > 0.0f) {
+            ctx_->stream_chunk_sec = decode.stream_chunk_sec;
+        }
         if (qwen_set_prompt(ctx_, decode.prompt.empty() ? nullptr : decode.prompt.c_str()) != 0) {
             result.status = Status(StatusCode::kInvalidArgument, "failed to set prompt");
             return result;
@@ -986,6 +1012,18 @@ public:
             ? Status(StatusCode::kFailedPrecondition, decode.use_stream_path ? "stream transcription cancelled" : "audio transcription cancelled")
             : OkStatus();
         return result;
+    }
+
+    qwen_ctx_t * CreateRealtimeClone() {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (ctx_ == nullptr) {
+            return nullptr;
+        }
+        return qwen_clone_shared(ctx_);
+    }
+
+    int verbosity() const noexcept {
+        return config_.verbosity;
     }
 
 private:
@@ -1199,11 +1237,13 @@ Json BuildChatCompletionResponse(
 }
 
 struct RealtimeSession {
+    std::mutex mu;
     std::string id;
     std::string model;
     std::string language;
     std::vector<float> samples;
     std::size_t total_samples = 0;
+    std::size_t decoded_samples = 0;
     std::size_t retained_sample_offset = 0;
     RealtimeTextState text_state;
     RealtimeDisplayState display_state;
@@ -1213,6 +1253,34 @@ struct RealtimeSession {
     std::string partial_text;
     double last_inference_ms = 0.0;
     bool last_decode_ran = false;
+    bool worker_done = false;
+    bool finalized = false;
+    std::string error;
+    std::unique_ptr<struct RealtimeLiveWorker> live_worker;
+};
+
+struct RealtimeSessionSnapshot {
+    std::string id;
+    std::string model;
+    std::string language;
+    std::size_t total_samples = 0;
+    std::size_t decoded_samples = 0;
+    std::size_t retained_sample_count = 0;
+    std::size_t retained_sample_offset = 0;
+    RealtimeDisplaySnapshot display_snapshot;
+    std::string text;
+    std::string stable_text;
+    std::string partial_text;
+    double last_inference_ms = 0.0;
+    bool last_decode_ran = false;
+    bool finalized = false;
+    std::string error;
+};
+
+struct RealtimeLiveWorker {
+    qwen_live_audio_t live{};
+    std::thread thread;
+    bool live_ready = false;
 };
 
 struct ServerMetrics {
@@ -1233,6 +1301,7 @@ struct HostCaptureSession {
     std::string device;
     std::vector<float> samples;
     std::size_t total_samples = 0;
+    std::size_t decoded_samples = 0;
     std::size_t retained_sample_offset = 0;
     RealtimeTextState text_state;
     RealtimeDisplayState display_state;
@@ -1243,8 +1312,11 @@ struct HostCaptureSession {
     std::string error;
     double last_inference_ms = 0.0;
     bool last_decode_ran = false;
+    bool finalized = false;
     bool active = true;
     bool stop_requested = false;
+    bool worker_done = false;
+    std::unique_ptr<RealtimeLiveWorker> live_worker;
 #if defined(_WIN32)
     HANDLE child_process = INVALID_HANDLE_VALUE;
     HANDLE read_handle = INVALID_HANDLE_VALUE;
@@ -1462,6 +1534,8 @@ Status BuildCaptureCommand(
     return Status(StatusCode::kInvalidArgument, "unsupported capture backend: " + backend);
 }
 
+void JoinRealtimeLiveWorker(RealtimeLiveWorker * worker);
+
 void StopHostCaptureSession(const std::shared_ptr<HostCaptureSession> & capture) {
     if (!capture) {
         return;
@@ -1515,8 +1589,212 @@ void StopHostCaptureSession(const std::shared_ptr<HostCaptureSession> & capture)
     }
 #endif
 
-    std::lock_guard<std::mutex> lock(capture->mu);
-    capture->active = false;
+    RealtimeLiveWorker * worker = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(capture->mu);
+        capture->active = false;
+        capture->finalized = true;
+        worker = capture->live_worker.get();
+    }
+    if (worker) {
+        JoinRealtimeLiveWorker(worker);
+    }
+}
+
+void LockLiveAudio(qwen_live_audio_t * live) {
+    if (live == nullptr) {
+        return;
+    }
+#if defined(_WIN32)
+    EnterCriticalSection(&live->mutex);
+#else
+    pthread_mutex_lock(&live->mutex);
+#endif
+}
+
+void UnlockLiveAudio(qwen_live_audio_t * live) {
+    if (live == nullptr) {
+        return;
+    }
+#if defined(_WIN32)
+    LeaveCriticalSection(&live->mutex);
+#else
+    pthread_mutex_unlock(&live->mutex);
+#endif
+}
+
+void SignalLiveAudio(qwen_live_audio_t * live) {
+    if (live == nullptr) {
+        return;
+    }
+#if defined(_WIN32)
+    WakeConditionVariable(&live->cond);
+#else
+    pthread_cond_signal(&live->cond);
+#endif
+}
+
+Status InitializeManualLiveAudio(qwen_live_audio_t * live) {
+    if (live == nullptr) {
+        return Status(StatusCode::kInvalidArgument, "live audio must not be null");
+    }
+
+    std::memset(live, 0, sizeof(*live));
+#if defined(_WIN32)
+    InitializeCriticalSection(&live->mutex);
+    InitializeConditionVariable(&live->cond);
+    live->thread = nullptr;
+#else
+    if (pthread_mutex_init(&live->mutex, nullptr) != 0) {
+        return Status(StatusCode::kInternal, "pthread_mutex_init failed");
+    }
+    if (pthread_cond_init(&live->cond, nullptr) != 0) {
+        pthread_mutex_destroy(&live->mutex);
+        return Status(StatusCode::kInternal, "pthread_cond_init failed");
+    }
+#endif
+    return OkStatus();
+}
+
+void DestroyManualLiveAudio(qwen_live_audio_t * live) {
+    if (live == nullptr) {
+        return;
+    }
+    std::free(live->samples);
+    live->samples = nullptr;
+    live->n_samples = 0;
+    live->capacity = 0;
+    live->sample_offset = 0;
+    live->eof = 0;
+#if defined(_WIN32)
+    DeleteCriticalSection(&live->mutex);
+    live->thread = nullptr;
+#else
+    pthread_cond_destroy(&live->cond);
+    pthread_mutex_destroy(&live->mutex);
+#endif
+}
+
+Status AppendManualLiveAudio(qwen_live_audio_t * live, const float * samples, std::size_t n_samples) {
+    if (live == nullptr || samples == nullptr || n_samples == 0U) {
+        return Status(StatusCode::kInvalidArgument, "live audio samples are required");
+    }
+    if (n_samples > static_cast<std::size_t>(std::numeric_limits<int64_t>::max())) {
+        return Status(StatusCode::kOutOfRange, "live audio chunk is too large");
+    }
+
+    LockLiveAudio(live);
+    const int64_t add = static_cast<int64_t>(n_samples);
+    if (live->n_samples > std::numeric_limits<int64_t>::max() - add) {
+        UnlockLiveAudio(live);
+        return Status(StatusCode::kOutOfRange, "live audio buffer would overflow");
+    }
+    const int64_t required = live->n_samples + add;
+    if (required > live->capacity) {
+        int64_t new_capacity = live->capacity > 0 ? live->capacity : 32000;
+        while (new_capacity < required) {
+            if (new_capacity > std::numeric_limits<int64_t>::max() / 2) {
+                new_capacity = required;
+                break;
+            }
+            new_capacity *= 2;
+        }
+        if (new_capacity <= 0 ||
+            static_cast<std::uint64_t>(new_capacity) >
+                static_cast<std::uint64_t>(SIZE_MAX / sizeof(float))) {
+            UnlockLiveAudio(live);
+            return Status(StatusCode::kOutOfRange, "live audio buffer is too large");
+        }
+        float * grown = static_cast<float *>(std::realloc(live->samples, static_cast<std::size_t>(new_capacity) * sizeof(float)));
+        if (grown == nullptr) {
+            UnlockLiveAudio(live);
+            return Status(StatusCode::kInternal, "failed to grow live audio buffer");
+        }
+        live->samples = grown;
+        live->capacity = new_capacity;
+    }
+
+    std::memcpy(live->samples + static_cast<std::size_t>(live->n_samples), samples, n_samples * sizeof(float));
+    live->n_samples = required;
+    SignalLiveAudio(live);
+    UnlockLiveAudio(live);
+    return OkStatus();
+}
+
+void FinishManualLiveAudio(qwen_live_audio_t * live) {
+    if (live == nullptr) {
+        return;
+    }
+    LockLiveAudio(live);
+    live->eof = 1;
+    SignalLiveAudio(live);
+    UnlockLiveAudio(live);
+}
+
+void JoinRealtimeLiveWorker(RealtimeLiveWorker * worker) {
+    if (worker == nullptr) {
+        return;
+    }
+    FinishManualLiveAudio(&worker->live);
+    if (worker->thread.joinable()) {
+        worker->thread.join();
+    }
+    if (worker->live_ready) {
+        DestroyManualLiveAudio(&worker->live);
+        worker->live_ready = false;
+    }
+}
+
+RealtimeSessionSnapshot SnapshotRealtimeSession(const RealtimeSession & session) {
+    RealtimeSessionSnapshot snapshot;
+    snapshot.id = session.id;
+    snapshot.model = session.model;
+    snapshot.language = session.language;
+    snapshot.total_samples = session.total_samples;
+    snapshot.decoded_samples = session.decoded_samples;
+    snapshot.retained_sample_count = session.samples.size();
+    snapshot.retained_sample_offset = session.retained_sample_offset;
+    snapshot.display_snapshot = session.display_snapshot;
+    snapshot.text = session.text;
+    snapshot.stable_text = session.stable_text;
+    snapshot.partial_text = session.partial_text;
+    snapshot.last_inference_ms = session.last_inference_ms;
+    snapshot.last_decode_ran = session.last_decode_ran;
+    snapshot.finalized = session.finalized;
+    snapshot.error = session.error;
+    return snapshot;
+}
+
+template <typename SessionLike>
+void ApplyStableRealtimeCommit(
+    std::size_t total_samples,
+    std::string_view stable_text,
+    double inference_ms,
+    bool finalized,
+    SessionLike * session) {
+    if (session == nullptr) {
+        return;
+    }
+
+    RealtimeTextUpdate update;
+    update.committed = session->stable_text != stable_text || finalized;
+    update.stable_text = std::string(stable_text);
+    update.partial_text.clear();
+    update.text = update.stable_text;
+    session->text_state.stable_text = update.stable_text;
+    session->text_state.last_text = update.text;
+    session->text_state.last_decode_samples = total_samples;
+    session->text_state.unstable_since_samples = total_samples;
+    ApplyRealtimeUpdate(update, inference_ms, true, finalized, session);
+}
+
+template <typename SessionLike>
+std::size_t RetainedSampleCount(const SessionLike & session) {
+    return session.samples.size();
+}
+
+std::size_t RetainedSampleCount(const RealtimeSessionSnapshot & session) {
+    return session.retained_sample_count;
 }
 
 template <typename SessionLike>
@@ -1562,10 +1840,11 @@ Json BuildRealtimeJson(
     }
     body["session_id"] = session.id;
     body["sample_count"] = session.total_samples;
-    body["retained_sample_count"] = session.samples.size();
+    body["decoded_samples"] = session.decoded_samples;
+    body["retained_sample_count"] = RetainedSampleCount(session);
     body["retained_sample_offset"] = session.retained_sample_offset;
     body["decoded"] = session.last_decode_ran;
-    body["finalized"] = finalized;
+    body["finalized"] = finalized || session.finalized;
     body["supported"] = supported;
     body["stable_text"] = session.stable_text;
     body["partial_text"] = session.partial_text;
@@ -1577,11 +1856,15 @@ Json BuildRealtimeJson(
     body["live_text"] = session.display_snapshot.live_text;
     body["display_text"] = session.display_snapshot.display_text;
     body["inference_ms"] = session.last_inference_ms;
+    if (!session.error.empty()) {
+        body["error"] = session.error;
+    }
     return body;
 }
 
+template <typename SessionLike>
 Json BuildOpenAiRealtimeSessionJson(
-    const RealtimeSession & session,
+    const SessionLike & session,
     std::string_view model_id,
     const RealtimePolicyConfig & realtime_policy) {
     Json body = Json::object({
@@ -1596,8 +1879,9 @@ Json BuildOpenAiRealtimeSessionJson(
     return body;
 }
 
+template <typename SessionLike>
 Json BuildOpenAiRealtimeEventJson(
-    const RealtimeSession & session,
+    const SessionLike & session,
     std::string_view type,
     bool finalized,
     std::string_view model_id,
@@ -1784,7 +2068,7 @@ int RunServer(const ServerConfig & config) {
     const auto server_start = std::chrono::steady_clock::now();
     ServerMetrics metrics;
     std::atomic<std::uint64_t> session_counter{1};
-    std::unordered_map<std::string, RealtimeSession> realtime_sessions;
+    std::unordered_map<std::string, std::shared_ptr<RealtimeSession>> realtime_sessions;
     std::mutex realtime_mu;
     std::unordered_map<std::string, OfflineJob> jobs;
     std::mutex jobs_mu;
@@ -1831,94 +2115,304 @@ int RunServer(const ServerConfig & config) {
         }
     });
 
-    auto CreateRealtimeSession = [&](std::string model_id, std::string language, RealtimeSession * created) -> Status {
+    auto SnapshotRealtimeSessionState = [&](const std::shared_ptr<RealtimeSession> & session,
+                                            bool consume_decode_flag,
+                                            RealtimeSessionSnapshot * snapshot) -> Status {
+        if (session == nullptr || snapshot == nullptr) {
+            return Status(StatusCode::kInvalidArgument, "session snapshot output must not be null");
+        }
+        std::lock_guard<std::mutex> lock(session->mu);
+        if (session->live_worker) {
+            LockLiveAudio(&session->live_worker->live);
+            const int64_t dc = session->live_worker->live.decoded_cursor;
+            UnlockLiveAudio(&session->live_worker->live);
+            session->decoded_samples = dc > 0 ? static_cast<std::size_t>(dc) : 0U;
+        }
+        *snapshot = SnapshotRealtimeSession(*session);
+        if (consume_decode_flag) {
+            session->last_decode_ran = false;
+        }
+        return OkStatus();
+    };
+
+    auto StartRealtimeLiveWorker = [&](const std::shared_ptr<RealtimeSession> & session) -> Status {
+        if (session == nullptr) {
+            return Status(StatusCode::kInvalidArgument, "session must not be null");
+        }
+
+        auto worker = std::make_unique<RealtimeLiveWorker>();
+        Status status = InitializeManualLiveAudio(&worker->live);
+        if (!status.ok()) {
+            return status;
+        }
+        worker->live_ready = true;
+
+        qwen_ctx_t * live_ctx = model.CreateRealtimeClone();
+        if (live_ctx == nullptr) {
+            DestroyManualLiveAudio(&worker->live);
+            return Status(StatusCode::kInternal, "failed to clone realtime model context");
+        }
+
+        const float stream_chunk_sec = RealtimeStreamChunkSeconds(realtime_policy);
+        const int stream_max_new_tokens = RealtimeStreamMaxNewTokens(realtime_policy);
+        const int verbosity = model.verbosity();
+        const std::string forced_language = session->language;
+
+        worker->thread = std::thread([
+            session,
+            worker_ptr = worker.get(),
+            live_ctx,
+            stream_chunk_sec,
+            stream_max_new_tokens,
+            verbosity,
+            forced_language,
+            &metrics]() {
+            qwen_verbose = verbosity;
+            live_ctx->segment_sec = 30.0f;
+            live_ctx->past_text_conditioning = 1;
+            live_ctx->stream_chunk_sec = stream_chunk_sec;
+            live_ctx->stream_max_new_tokens = stream_max_new_tokens;
+
+            std::function<void(std::string_view)> token_callback = [&session](std::string_view piece) {
+                if (piece.empty()) {
+                    return;
+                }
+                std::lock_guard<std::mutex> lock(session->mu);
+                const std::string new_stable = session->stable_text + std::string(piece);
+                ApplyStableRealtimeCommit(session->total_samples, new_stable, session->last_inference_ms, false, session.get());
+            };
+
+            if (qwen_set_prompt(live_ctx, nullptr) != 0) {
+                std::lock_guard<std::mutex> lock(session->mu);
+                session->error = "failed to set realtime prompt";
+                session->worker_done = true;
+                qwen_free(live_ctx);
+                return;
+            }
+            if (qwen_set_force_language(live_ctx, forced_language.empty() ? nullptr : forced_language.c_str()) != 0) {
+                std::lock_guard<std::mutex> lock(session->mu);
+                session->error = "unsupported realtime language: " + forced_language;
+                session->worker_done = true;
+                qwen_free(live_ctx);
+                return;
+            }
+
+            qwen_set_token_callback(live_ctx, ForwardTokenPiece, &token_callback);
+            char * raw = qwen_transcribe_stream_live(live_ctx, &worker_ptr->live);
+            const bool was_cancelled = qwen_was_cancelled(live_ctx) != 0;
+            qwen_set_token_callback(live_ctx, nullptr, nullptr);
+
+            {
+                std::lock_guard<std::mutex> lock(session->mu);
+                session->last_inference_ms = live_ctx->perf_total_ms;
+                if (raw != nullptr) {
+                    ApplyStableRealtimeCommit(session->total_samples, raw, live_ctx->perf_total_ms, true, session.get());
+                    session->finalized = true;
+                } else {
+                    if (session->error.empty()) {
+                        session->error = was_cancelled
+                            ? "live stream transcription cancelled"
+                            : "live stream transcription failed";
+                    }
+                    session->finalized = true;
+                }
+                session->worker_done = true;
+            }
+
+            std::free(raw);
+            qwen_free(live_ctx);
+        });
+
+        session->live_worker = std::move(worker);
+        return OkStatus();
+    };
+
+    auto StartHostCaptureLiveWorker = [&](const std::shared_ptr<HostCaptureSession> & capture) -> Status {
+        if (capture == nullptr) {
+            return Status(StatusCode::kInvalidArgument, "capture must not be null");
+        }
+
+        auto worker = std::make_unique<RealtimeLiveWorker>();
+        Status status = InitializeManualLiveAudio(&worker->live);
+        if (!status.ok()) {
+            return status;
+        }
+        worker->live_ready = true;
+
+        qwen_ctx_t * live_ctx = model.CreateRealtimeClone();
+        if (live_ctx == nullptr) {
+            DestroyManualLiveAudio(&worker->live);
+            return Status(StatusCode::kInternal, "failed to clone capture model context");
+        }
+
+        const float stream_chunk_sec = RealtimeStreamChunkSeconds(realtime_policy);
+        const int stream_max_new_tokens = RealtimeStreamMaxNewTokens(realtime_policy);
+        const int verbosity = model.verbosity();
+
+        worker->thread = std::thread([
+            capture,
+            worker_ptr = worker.get(),
+            live_ctx,
+            stream_chunk_sec,
+            stream_max_new_tokens,
+            verbosity]() {
+            qwen_verbose = verbosity;
+            live_ctx->segment_sec = 30.0f;
+            live_ctx->past_text_conditioning = 1;
+            live_ctx->stream_chunk_sec = stream_chunk_sec;
+            live_ctx->stream_max_new_tokens = stream_max_new_tokens;
+
+            if (qwen_set_prompt(live_ctx, nullptr) != 0) {
+                std::lock_guard<std::mutex> lock(capture->mu);
+                capture->error = "failed to set capture prompt";
+                capture->worker_done = true;
+                qwen_free(live_ctx);
+                return;
+            }
+
+            std::function<void(std::string_view)> token_callback = [&capture](std::string_view piece) {
+                if (piece.empty()) {
+                    return;
+                }
+                std::lock_guard<std::mutex> lock(capture->mu);
+                const std::string new_stable = capture->stable_text + std::string(piece);
+                ApplyStableRealtimeCommit(capture->total_samples, new_stable, capture->last_inference_ms, false, capture.get());
+            };
+
+            qwen_set_token_callback(live_ctx, ForwardTokenPiece, &token_callback);
+            char * raw = qwen_transcribe_stream_live(live_ctx, &worker_ptr->live);
+            const bool was_cancelled = qwen_was_cancelled(live_ctx) != 0;
+            qwen_set_token_callback(live_ctx, nullptr, nullptr);
+
+            {
+                std::lock_guard<std::mutex> lock(capture->mu);
+                capture->last_inference_ms = live_ctx->perf_total_ms;
+                if (raw != nullptr) {
+                    ApplyStableRealtimeCommit(capture->total_samples, raw, live_ctx->perf_total_ms, true, capture.get());
+                } else if (capture->error.empty()) {
+                    capture->error = was_cancelled
+                        ? "live capture transcription cancelled"
+                        : "live capture transcription failed";
+                }
+                capture->finalized = true;
+                capture->worker_done = true;
+            }
+
+            std::free(raw);
+            qwen_free(live_ctx);
+        });
+
+        capture->live_worker = std::move(worker);
+        return OkStatus();
+    };
+
+    auto FindRealtimeSession = [&](const std::string & session_id,
+                                   std::shared_ptr<RealtimeSession> * session) -> Status {
+        if (session == nullptr) {
+            return Status(StatusCode::kInvalidArgument, "session output must not be null");
+        }
+        std::lock_guard<std::mutex> lock(realtime_mu);
+        auto it = realtime_sessions.find(session_id);
+        if (it == realtime_sessions.end()) {
+            return Status(StatusCode::kNotFound, "session not found");
+        }
+        *session = it->second;
+        return OkStatus();
+    };
+
+    auto CreateRealtimeSession = [&](std::string model_id,
+                                     std::string language,
+                                     RealtimeSessionSnapshot * created) -> Status {
         if (created == nullptr) {
             return Status(StatusCode::kInvalidArgument, "created session output must not be null");
         }
 
-        RealtimeSession session;
-        session.id = std::to_string(session_counter.fetch_add(1));
-        session.model = std::move(model_id);
-        session.language = std::move(language);
+        auto session = std::make_shared<RealtimeSession>();
+        session->id = std::to_string(session_counter.fetch_add(1));
+        session->model = std::move(model_id);
+        session->language = std::move(language);
+
         {
             std::lock_guard<std::mutex> lock(realtime_mu);
             if (realtime_sessions.size() >= kMaxRealtimeSessions) {
                 return Status(StatusCode::kFailedPrecondition, "too many realtime sessions");
             }
-            realtime_sessions.emplace(session.id, session);
+            realtime_sessions.emplace(session->id, session);
         }
+
+        Status status = StartRealtimeLiveWorker(session);
+        if (!status.ok()) {
+            std::lock_guard<std::mutex> lock(realtime_mu);
+            realtime_sessions.erase(session->id);
+            return status;
+        }
+
         metrics.realtime_sessions_started.fetch_add(1);
-        *created = std::move(session);
-        return OkStatus();
+        return SnapshotRealtimeSessionState(session, false, created);
     };
 
-    auto AppendRealtimeChunk = [&](const std::string & session_id, const std::vector<float> & chunk, RealtimeSession * snapshot) -> Status {
+    auto GetRealtimeSessionSnapshot = [&](const std::string & session_id,
+                                          RealtimeSessionSnapshot * snapshot) -> Status {
+        std::shared_ptr<RealtimeSession> session;
+        Status status = FindRealtimeSession(session_id, &session);
+        if (!status.ok()) {
+            return status;
+        }
+        return SnapshotRealtimeSessionState(session, true, snapshot);
+    };
+
+    auto AppendRealtimeChunk = [&](const std::string & session_id,
+                                   const std::vector<float> & chunk,
+                                   RealtimeSessionSnapshot * snapshot) -> Status {
         if (snapshot == nullptr) {
             return Status(StatusCode::kInvalidArgument, "session snapshot output must not be null");
         }
 
-        std::vector<float> samples;
-        std::size_t total_samples = 0U;
-        std::string language;
-        {
-            std::lock_guard<std::mutex> lock(realtime_mu);
-            auto it = realtime_sessions.find(session_id);
-            if (it == realtime_sessions.end()) {
-                return Status(StatusCode::kNotFound, "session not found");
-            }
-            AppendRealtimeSamples(realtime_policy, chunk, &it->second);
-            if (!RealtimeShouldDecode(
-                    realtime_policy,
-                    it->second.total_samples,
-                    it->second.text_state.last_decode_samples,
-                    false)) {
-                it->second.last_decode_ran = false;
-                *snapshot = it->second;
-                return OkStatus();
-            }
-            samples = it->second.samples;
-            total_samples = it->second.total_samples;
-            language = it->second.language;
+        std::shared_ptr<RealtimeSession> session;
+        Status status = FindRealtimeSession(session_id, &session);
+        if (!status.ok()) {
+            return status;
         }
 
-        ModelDecodeOptions decode;
-        decode.use_stream_path = true;
-        decode.language = std::move(language);
-        const AsrRunResult result = model.TranscribeRealtime(samples, decode);
-        if (!result.status.ok()) {
-            return result.status;
+        RealtimeLiveWorker * worker = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(session->mu);
+            if (session->finalized) {
+                return Status(StatusCode::kFailedPrecondition, "session already finalized");
+            }
+            worker = session->live_worker.get();
+        }
+        if (worker == nullptr || !worker->live_ready) {
+            return Status(StatusCode::kInternal, "realtime worker is not ready");
+        }
+
+        status = AppendManualLiveAudio(&worker->live, chunk.data(), chunk.size());
+        if (!status.ok()) {
+            return status;
         }
 
         {
-            std::lock_guard<std::mutex> lock(realtime_mu);
-            auto it = realtime_sessions.find(session_id);
-            if (it == realtime_sessions.end()) {
-                return Status(StatusCode::kNotFound, "session not found");
-            }
-            RealtimeTextUpdate update;
-            const Status update_status = AdvanceRealtimeTextState(
-                realtime_policy,
-                total_samples,
-                result.text,
-                false,
-                &it->second.text_state,
-                &update);
-            if (!update_status.ok()) {
-                return update_status;
-            }
-            ApplyRealtimeUpdate(update, result.total_ms, true, false, &it->second);
-            *snapshot = it->second;
+            std::lock_guard<std::mutex> lock(session->mu);
+            AppendRealtimeSamples(realtime_policy, chunk, session.get());
         }
         metrics.realtime_decode_runs.fetch_add(1);
+        status = SnapshotRealtimeSessionState(session, true, snapshot);
+        if (!status.ok()) {
+            return status;
+        }
+        if (!snapshot->error.empty()) {
+            return Status(StatusCode::kInternal, snapshot->error);
+        }
         return OkStatus();
     };
 
-    auto FinalizeRealtimeSession = [&](const std::string & session_id, RealtimeSession * snapshot) -> Status {
+    auto FinalizeRealtimeSession = [&](const std::string & session_id,
+                                       RealtimeSessionSnapshot * snapshot) -> Status {
         if (snapshot == nullptr) {
             return Status(StatusCode::kInvalidArgument, "session snapshot output must not be null");
         }
 
-        RealtimeSession session;
+        std::shared_ptr<RealtimeSession> session;
         {
             std::lock_guard<std::mutex> lock(realtime_mu);
             auto it = realtime_sessions.find(session_id);
@@ -1929,42 +2423,26 @@ int RunServer(const ServerConfig & config) {
             realtime_sessions.erase(it);
         }
 
-        if (!session.samples.empty()) {
-            ModelDecodeOptions decode;
-            decode.use_stream_path = false;
-            decode.language = session.language;
-            const AsrRunResult result = model.TranscribeRealtime(session.samples, decode);
-            if (result.status.ok()) {
-                const std::string latest_text =
-                    (session.retained_sample_offset == 0U || session.text.empty()) ? result.text : session.text;
-                RealtimeTextUpdate update;
-                const Status update_status = AdvanceRealtimeTextState(
-                    realtime_policy,
-                    session.total_samples,
-                    latest_text,
-                    true,
-                    &session.text_state,
-                    &update);
-                if (update_status.ok()) {
-                    ApplyRealtimeUpdate(update, result.total_ms, true, true, &session);
-                }
-            } else {
-                RealtimeTextUpdate update;
-                const Status update_status = AdvanceRealtimeTextState(
-                    realtime_policy,
-                    session.total_samples,
-                    session.text.empty() ? session.text_state.last_text : session.text,
-                    true,
-                    &session.text_state,
-                    &update);
-                if (update_status.ok()) {
-                    ApplyRealtimeUpdate(update, session.last_inference_ms, false, true, &session);
-                }
-            }
+        RealtimeLiveWorker * worker = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(session->mu);
+            worker = session->live_worker.get();
         }
+        JoinRealtimeLiveWorker(worker);
 
+        {
+            std::lock_guard<std::mutex> lock(session->mu);
+            session->finalized = true;
+        }
         metrics.realtime_finalizations.fetch_add(1);
-        *snapshot = std::move(session);
+
+        Status status = SnapshotRealtimeSessionState(session, false, snapshot);
+        if (!status.ok()) {
+            return status;
+        }
+        if (!snapshot->error.empty()) {
+            return Status(StatusCode::kInternal, snapshot->error);
+        }
         return OkStatus();
     };
 
@@ -2366,7 +2844,7 @@ int RunServer(const ServerConfig & config) {
 
         const std::string model_id = realtime_request.model.empty() ? served_model_id : realtime_request.model;
         if (realtime_request.action == OpenAiRealtimeAction::kSessionCreate) {
-            RealtimeSession session;
+            RealtimeSessionSnapshot session;
             const Status status = CreateRealtimeSession(model_id, realtime_request.language, &session);
             if (!status.ok()) {
                 SetErrorResponse(response, status, StatusToHttpCode(status));
@@ -2391,7 +2869,7 @@ int RunServer(const ServerConfig & config) {
                 return;
             }
 
-            RealtimeSession session;
+            RealtimeSessionSnapshot session;
             const Status status = AppendRealtimeChunk(realtime_request.session_id, chunk, &session);
             if (!status.ok()) {
                 SetErrorResponse(response, status, StatusToHttpCode(status));
@@ -2408,7 +2886,7 @@ int RunServer(const ServerConfig & config) {
             return;
         }
 
-        RealtimeSession session;
+        RealtimeSessionSnapshot session;
         const Status status = FinalizeRealtimeSession(realtime_request.session_id, &session);
         if (!status.ok()) {
             SetErrorResponse(response, status, StatusToHttpCode(status));
@@ -2425,7 +2903,7 @@ int RunServer(const ServerConfig & config) {
     });
 
     server.Post("/api/realtime/start", [&](const HttpRequest &, HttpResponse & response) {
-        RealtimeSession session;
+        RealtimeSessionSnapshot session;
         const Status status = CreateRealtimeSession(served_model_id, "", &session);
         if (!status.ok()) {
             SetErrorResponse(response, status, StatusToHttpCode(status));
@@ -2445,6 +2923,21 @@ int RunServer(const ServerConfig & config) {
         }));
     });
 
+    server.Get("/api/realtime/status", [&](const HttpRequest & request, HttpResponse & response) {
+        if (!request.has_param("session_id")) {
+            SetErrorResponse(response, Status(StatusCode::kInvalidArgument, "session_id is required"), 400);
+            return;
+        }
+        const std::string session_id = request.get_param_value("session_id");
+        RealtimeSessionSnapshot session;
+        const Status status = GetRealtimeSessionSnapshot(session_id, &session);
+        if (!status.ok()) {
+            SetErrorResponse(response, status, StatusToHttpCode(status));
+            return;
+        }
+        SetJsonResponse(response, BuildRealtimeJson(session, false, true));
+    });
+
     server.Post("/api/realtime/chunk", [&](const HttpRequest & request, HttpResponse & response) {
         if (!request.has_param("session_id")) {
             SetErrorResponse(response, Status(StatusCode::kInvalidArgument, "session_id is required"), 400);
@@ -2457,7 +2950,7 @@ int RunServer(const ServerConfig & config) {
             return;
         }
 
-        RealtimeSession session;
+        RealtimeSessionSnapshot session;
         const Status status = AppendRealtimeChunk(session_id, chunk, &session);
         if (!status.ok()) {
             SetErrorResponse(response, status, StatusToHttpCode(status));
@@ -2472,7 +2965,7 @@ int RunServer(const ServerConfig & config) {
             return;
         }
         const std::string session_id = request.get_param_value("session_id");
-        RealtimeSession session;
+        RealtimeSessionSnapshot session;
         const Status status = FinalizeRealtimeSession(session_id, &session);
         if (!status.ok()) {
             SetErrorResponse(response, status, StatusToHttpCode(status));
@@ -2494,6 +2987,12 @@ int RunServer(const ServerConfig & config) {
         }
 
         std::lock_guard<std::mutex> lock(capture->mu);
+        if (capture->live_worker) {
+            LockLiveAudio(&capture->live_worker->live);
+            const int64_t dc = capture->live_worker->live.decoded_cursor;
+            UnlockLiveAudio(&capture->live_worker->live);
+            capture->decoded_samples = dc > 0 ? static_cast<std::size_t>(dc) : 0U;
+        }
         Json body = BuildRealtimeJson(*capture, false, true);
         body["active"] = capture->active;
         body["capture_id"] = capture->id;
@@ -2552,7 +3051,14 @@ int RunServer(const ServerConfig & config) {
         }
         metrics.host_capture_sessions_started.fetch_add(1);
 
-        capture->reader = std::thread([capture, &model, realtime_policy]() {
+        const Status live_status = StartHostCaptureLiveWorker(capture);
+        if (!live_status.ok()) {
+            StopHostCaptureSession(capture);
+            SetErrorResponse(response, live_status, StatusToHttpCode(live_status));
+            return;
+        }
+
+        capture->reader = std::thread([capture, realtime_policy, &metrics]() {
             std::vector<char> buffer(6400);
             while (true) {
 #if defined(_WIN32)
@@ -2576,49 +3082,34 @@ int RunServer(const ServerConfig & config) {
                     continue;
                 }
 
-                std::vector<float> samples;
-                std::size_t total_samples = 0;
+                RealtimeLiveWorker * worker = nullptr;
                 {
                     std::lock_guard<std::mutex> lock(capture->mu);
                     AppendRealtimeSamples(realtime_policy, chunk, capture.get());
-                    if (!RealtimeShouldDecode(
-                            realtime_policy,
-                            capture->total_samples,
-                            capture->text_state.last_decode_samples,
-                            false)) {
-                        capture->last_decode_ran = false;
-                        continue;
-                    }
-                    samples = capture->samples;
-                    total_samples = capture->total_samples;
+                    worker = capture->live_worker.get();
                 }
 
-                ModelDecodeOptions decode;
-                decode.use_stream_path = true;
-                const AsrRunResult result = model.TranscribeRealtime(samples, decode);
-                std::lock_guard<std::mutex> lock(capture->mu);
-                if (!result.status.ok()) {
-                    capture->error = result.status.message();
+                if (worker == nullptr || !worker->live_ready) {
+                    std::lock_guard<std::mutex> lock(capture->mu);
+                    capture->error = "capture live worker is not ready";
                     break;
                 }
-                RealtimeTextUpdate update;
-                Status update_status = AdvanceRealtimeTextState(
-                    realtime_policy,
-                    total_samples,
-                    result.text,
-                    false,
-                    &capture->text_state,
-                    &update);
-                if (!update_status.ok()) {
-                    capture->error = update_status.message();
+
+                const Status append_status = AppendManualLiveAudio(&worker->live, chunk.data(), chunk.size());
+                if (!append_status.ok()) {
+                    std::lock_guard<std::mutex> lock(capture->mu);
+                    capture->error = append_status.message();
                     break;
                 }
-                ApplyRealtimeUpdate(update, result.total_ms, true, false, capture.get());
+                metrics.realtime_decode_runs.fetch_add(1);
             }
 
             bool stopped_by_request = false;
             {
                 std::lock_guard<std::mutex> lock(capture->mu);
+                if (capture->live_worker) {
+                    FinishManualLiveAudio(&capture->live_worker->live);
+                }
                 capture->active = false;
                 stopped_by_request = capture->stop_requested;
             }
@@ -2652,46 +3143,14 @@ int RunServer(const ServerConfig & config) {
 
         StopHostCaptureSession(capture);
 
-        {
-            std::lock_guard<std::mutex> lock(capture->mu);
-            if (!capture->samples.empty()) {
-                ModelDecodeOptions decode;
-                decode.use_stream_path = false;
-                const AsrRunResult result = model.TranscribeRealtime(capture->samples, decode);
-                if (result.status.ok()) {
-                    const std::string latest_text =
-                        (capture->retained_sample_offset == 0U || capture->text.empty()) ? result.text : capture->text;
-                    RealtimeTextUpdate update;
-                    const Status update_status = AdvanceRealtimeTextState(
-                        realtime_policy,
-                        capture->total_samples,
-                        latest_text,
-                        true,
-                        &capture->text_state,
-                        &update);
-                    if (update_status.ok()) {
-                        ApplyRealtimeUpdate(update, result.total_ms, true, true, capture.get());
-                    }
-                } else if (capture->error.empty()) {
-                    capture->error = result.status.message();
-                }
-            } else {
-                RealtimeTextUpdate update;
-                const Status update_status = AdvanceRealtimeTextState(
-                    realtime_policy,
-                    capture->total_samples,
-                    capture->text.empty() ? capture->text_state.last_text : capture->text,
-                    true,
-                    &capture->text_state,
-                    &update);
-                if (update_status.ok()) {
-                    ApplyRealtimeUpdate(update, capture->last_inference_ms, false, true, capture.get());
-                }
-            }
-        }
-
         metrics.realtime_finalizations.fetch_add(1);
         std::lock_guard<std::mutex> lock(capture->mu);
+        if (capture->live_worker) {
+            LockLiveAudio(&capture->live_worker->live);
+            const int64_t dc = capture->live_worker->live.decoded_cursor;
+            UnlockLiveAudio(&capture->live_worker->live);
+            capture->decoded_samples = dc > 0 ? static_cast<std::size_t>(dc) : 0U;
+        }
         Json body = BuildRealtimeJson(*capture, true, true);
         body["capture_id"] = capture->id;
         body["backend"] = capture->backend;

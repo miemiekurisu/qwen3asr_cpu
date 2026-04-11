@@ -182,6 +182,13 @@ CLI 长音频输出：
 | `DecodeStep` | 单 token 步进 |
 | `BuildPromptEmbeddings` | prompt + audio embedding 组装 |
 
+约束：
+
+- decoder prefill QKV 允有“加载期 prepared F32”快路，但必须受 `RuntimeProfile` + 内存预算约束。
+- 默认预算仅固化可落入预算者；当前 `512MB` 档只放行 0.6B 形状 QKV，全量 1.7B 仍回退 BF16 热路。
+- decoder prefill 的 QKV 输出 scratch 与 WO / GateUp / Down 的 BF16 展开 scratch，皆不得再用静态全局缓冲；必须改走 session 私有 arena / 复用池。
+- GateUp 允有同型 prepared F32 快路，但默认预算仍关；仅在显式提高预算时启用，不以大内存副本换默认收益。
+
 ### `qasr/inference/streaming_policy`
 
 | 类/函数 | 义 |

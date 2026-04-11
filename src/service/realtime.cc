@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <initializer_list>
 #include <limits>
 
 namespace qasr {
@@ -11,6 +12,8 @@ constexpr std::size_t kNoPendingUnstable = std::numeric_limits<std::size_t>::max
 constexpr std::size_t kForcedTailGuardCodepoints = 4;
 constexpr std::size_t kForcedTailMinCodepoints = 8;
 constexpr std::size_t kRecentSegmentLimit = 2;
+constexpr std::size_t kSoftClauseMinCodepoints = 8;
+constexpr std::size_t kSoftClauseTailCodepoints = 6;
 constexpr std::size_t kSoftSegmentCodepoints = 32;
 constexpr std::size_t kHardSegmentCodepoints = 64;
 
@@ -44,6 +47,23 @@ bool StartsWith(std::string_view text, std::string_view prefix) {
 
 bool EndsWith(std::string_view text, std::string_view suffix) {
     return text.size() >= suffix.size() && text.substr(text.size() - suffix.size()) == suffix;
+}
+
+bool MatchesAnyTokenAt(
+    std::string_view text,
+    std::size_t offset,
+    std::initializer_list<std::string_view> tokens,
+    std::size_t * matched_size) {
+    for (std::string_view token : tokens) {
+        if (offset + token.size() <= text.size() &&
+            text.substr(offset, token.size()) == token) {
+            if (matched_size != nullptr) {
+                *matched_size = token.size();
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 std::string TrimAsciiWordTail(std::string_view text) {
@@ -143,6 +163,39 @@ bool EndsWithTerminalPunctuation(std::string_view text) {
         EndsWith(trimmed, "\n");
 }
 
+bool MatchesTerminalPunctuationAt(
+    std::string_view text,
+    std::size_t offset,
+    std::size_t * matched_size) {
+    return MatchesAnyTokenAt(
+        text,
+        offset,
+        {".", "!", "?", "。", "！", "？", "\n"},
+        matched_size);
+}
+
+bool MatchesSoftClausePunctuationAt(
+    std::string_view text,
+    std::size_t offset,
+    std::size_t * matched_size) {
+    return MatchesAnyTokenAt(
+        text,
+        offset,
+        {",", ";", ":", "，", "、", "；", "："},
+        matched_size);
+}
+
+std::size_t ConsumeTrailingAsciiWhitespace(std::string_view text, std::size_t offset) {
+    while (offset < text.size()) {
+        const unsigned char byte = static_cast<unsigned char>(text[offset]);
+        if (!std::isspace(byte)) {
+            break;
+        }
+        ++offset;
+    }
+    return offset;
+}
+
 bool ShouldFinalizeStableSegment(std::string_view text, bool force_finalize) {
     const std::string_view trimmed = TrimAsciiWhitespace(text);
     if (trimmed.empty()) {
@@ -156,6 +209,60 @@ bool ShouldFinalizeStableSegment(std::string_view text, bool force_finalize) {
         return true;
     }
     return codepoints >= kSoftSegmentCodepoints && EndsWithAsciiWhitespace(text);
+}
+
+void PushRecentSegment(std::string segment, RealtimeDisplayState * state);
+
+std::size_t FindStableSegmentBoundary(std::string_view text, bool force_finalize) {
+    if (text.empty()) {
+        return 0U;
+    }
+    if (force_finalize) {
+        return text.size();
+    }
+
+    for (std::size_t offset = 0; offset < text.size(); ++offset) {
+        if (IsUtf8Continuation(static_cast<unsigned char>(text[offset]))) {
+            continue;
+        }
+
+        std::size_t matched_size = 0;
+        if (MatchesTerminalPunctuationAt(text, offset, &matched_size)) {
+            return ConsumeTrailingAsciiWhitespace(text, offset + matched_size);
+        }
+
+        if (MatchesSoftClausePunctuationAt(text, offset, &matched_size)) {
+            const std::size_t boundary = ConsumeTrailingAsciiWhitespace(text, offset + matched_size);
+            const std::size_t prefix_codepoints = CountUtf8Codepoints(text.substr(0, boundary));
+            const std::size_t tail_codepoints =
+                CountUtf8Codepoints(TrimAsciiWhitespace(text.substr(boundary)));
+            if (prefix_codepoints >= kSoftClauseMinCodepoints &&
+                tail_codepoints >= kSoftClauseTailCodepoints) {
+                return boundary;
+            }
+        }
+    }
+
+    if (ShouldFinalizeStableSegment(text, false)) {
+        return text.size();
+    }
+    return 0U;
+}
+
+void DrainStableSegments(bool force_finalize, RealtimeDisplayState * state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    while (!state->live_stable_text.empty()) {
+        const std::size_t boundary = FindStableSegmentBoundary(state->live_stable_text, force_finalize);
+        if (boundary == 0U) {
+            break;
+        }
+        PushRecentSegment(state->live_stable_text.substr(0, boundary), state);
+        state->live_stable_text.erase(0, boundary);
+        force_finalize = false;
+    }
 }
 
 void PushRecentSegment(std::string segment, RealtimeDisplayState * state) {
@@ -379,10 +486,7 @@ Status AdvanceRealtimeDisplayState(
         state->live_partial_text.clear();
     }
 
-    if (ShouldFinalizeStableSegment(state->live_stable_text, force_finalize)) {
-        PushRecentSegment(state->live_stable_text, state);
-        state->live_stable_text.clear();
-    }
+    DrainStableSegments(force_finalize, state);
 
     snapshot->recent_segments = state->recent_segments;
     snapshot->live_stable_text = state->live_stable_text;

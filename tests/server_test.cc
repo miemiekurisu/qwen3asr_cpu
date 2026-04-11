@@ -181,3 +181,24 @@ QASR_TEST(RunServerRejectsMissingModelDir) {
     config.port = 8080;
     QASR_EXPECT_EQ(qasr::RunServer(config), 1);
 }
+
+QASR_TEST(RealtimeStreamChunkSecondsClampsToReasonableRange) {
+    qasr::RealtimePolicyConfig policy;
+    policy.min_decode_interval_ms = 200;
+    QASR_EXPECT_EQ(qasr::RealtimeStreamChunkSeconds(policy), 0.4f);
+
+    policy.min_decode_interval_ms = 800;
+    QASR_EXPECT_EQ(qasr::RealtimeStreamChunkSeconds(policy), 0.8f);
+
+    policy.min_decode_interval_ms = 1600;
+    QASR_EXPECT_EQ(qasr::RealtimeStreamChunkSeconds(policy), 1.0f);
+}
+
+QASR_TEST(RealtimeStreamMaxNewTokensTracksChunkCadence) {
+    qasr::RealtimePolicyConfig policy;
+    policy.min_decode_interval_ms = 600;
+    QASR_EXPECT_EQ(qasr::RealtimeStreamMaxNewTokens(policy), 24);
+
+    policy.min_decode_interval_ms = 950;
+    QASR_EXPECT_EQ(qasr::RealtimeStreamMaxNewTokens(policy), 32);
+}
