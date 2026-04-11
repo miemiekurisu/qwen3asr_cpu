@@ -136,7 +136,7 @@
 - 主程序可独立启动
 - 后续可逐模块替换 vendor 后端
 
-### 10. 本机已实跑 `qasr_cli`
+### 11. 本机已实跑 `qasr_cli`
 
 于 2026-04-10，macOS / arm64 / Accelerate，模型：
 
@@ -155,7 +155,7 @@
 
 此时“主程序可启且可跑 ASR”已成。
 
-### 11. 官方实时与时间戳，本就分路
+### 12. 官方实时与时间戳，本就分路
 
 外部事实：
 
@@ -168,7 +168,7 @@
 - 主实时路先求稳定字幕
 - 词级时间戳宜异步后补
 
-### 12. “无停顿”之核心，不是 VAD，而是稳定前缀
+### 13. “无停顿”之核心，不是 VAD，而是稳定前缀
 
 AWS 文档与 Whisper-Streaming 皆指向同一结论：
 
@@ -178,7 +178,7 @@ AWS 文档与 Whisper-Streaming 皆指向同一结论：
 
 此比“等停顿再整句冒出”更合字幕 UX。
 
-### 13. `qwen-asr-learn` 已隐含正确方向
+### 14. `qwen-asr-learn` 已隐含正确方向
 
 其 `--stream` 默认：
 
@@ -191,14 +191,14 @@ AWS 文档与 Whisper-Streaming 皆指向同一结论：
 
 这说明参考实现并未依赖停顿；其主法本就是“滑窗 + rollback + frontier commit”。
 
-### 14. vLLM 官方 realtime 默认分段偏保守
+### 15. vLLM 官方 realtime 默认分段偏保守
 
 vLLM `qwen3_asr_realtime` buffer 默认 `5s` 才吐一段。
 
 此足以保正确，不足以保字幕观感。
 若求“看似准实时”，须在我们自研 runtime 内把 cadence 压到亚秒级 tick，而非直接照搬 `5s`。
 
-### 15. 双路法值记，但不宜阻首版
+### 16. 双路法值记，但不宜阻首版
 
 2025 年论文已示：
 
@@ -208,7 +208,7 @@ vLLM `qwen3_asr_realtime` buffer 默认 `5s` 才吐一段。
 然其多赖额外训练或额外头。
 本项目首版当先把“无停顿滑窗 + 稳定前缀”做稳，再议双路增强。
 
-### 16. 实时接口第一版已改成三态文本
+### 17. 实时接口第一版已改成三态文本
 
 现 `/api/realtime/*` 与 `/api/capture/*` 已不再只回一段 `partial_text`，而回：
 
@@ -221,360 +221,168 @@ vLLM `qwen3_asr_realtime` buffer 默认 `5s` 才吐一段。
 
 ## 2026-04-11
 
-### 17. Windows/OpenBLAS 先落低风险 encoder QKV 融合
-
-- encoder 自注意 Q/K/V 原为三次独立 F32 线性层
-- 现仅在较长序列时，临时拼成一次 GEMM，再拆回三路输出
-- 不改模型权重所有权，不引入持久重复缓存
-- 若 scratch 申请失败或序列太短，则自动回退旧路径
-
-### 18. Windows 一键构建脚本不得写死本机路径
-
-- 构建脚本须先按仓内相对目录约定检索 OpenBLAS
-- 若当前 shell 未带 MSVC 环境，则用 `vswhere` + `VsDevCmd` 自动补齐
-- configure/build/test 均走 CMake preset，避免脚本复制构建参数
-
-### 19. Windows / SkylakeX 上，QKV 只该做“预打包融合”，不该做“每次临时拼接”
-
-2026-04-11 于 Windows + OpenBLAS + SkylakeX + 16 logical CPUs，实测 `qasr_cpu_bench`：
-
-- 8 线程下，`fused_packed` 相对 `separate`：
-   `seq4 d1024 = 1.43x`，`seq13 d1024 = 1.07x`，`seq52 d1024 = 1.08x`，`seq104 d1024 = 0.93x`，`seq13 d896 = 1.47x`
-- 12 线程下，`fused_packed` 相对 `separate`：
-   `seq4 d1024 = 1.67x`，`seq13 d1024 = 1.15x`，`seq52 d1024 = 1.14x`，`seq104 d1024 = 1.20x`，`seq13 d896 = 1.34x`
-- `fused_copy` 即“每次调用把 Q/K/V 拷成临时连续块再打一发 GEMM”在全部测点都比 `separate` 更慢
-
-故：
-
-- runtime 应保留“加载期预打包 + 运行期单 GEMM”
-- 不应把“每次临时拼接”留在热路径里
-- 线程数 8 与 12 皆可用，但最优值会随 shape 变，不可假设 12 恒优
-
-
-### 17. decode cadence 不宜随包即跑
-
-原先每来一包即整段重解，浪费甚大。
-今改为固定最小样本门槛：
-
-- 默认 `800ms`
-
-故浏览器亦改 `800ms` flush 一次，与服务 cadence 对齐。
-
-### 18. stop 时应再跑一次终态 refine
-
-若 stop 只回最后一轮 partial，往往欠尾字。
-今 `stop` 改再跑一次非流式 full-audio decode，并强制 flush 尾巴，终稿更稳。
-
-### 19. “参考”与“依赖”须硬分
-
-用户已明令：
-
-- `qwen-asr-learn/`
-- `whisper.cpp/`
-
-只能参考，不得成编译或 include 依赖。
-
-故今已改：
-
-- 现用 C 核源码已内化入 `src/backend/qwen_cpu/`
-- `httplib.h` 与 `json.hpp` 复制入 `vendor/third_party/`
-- CMake 只指向 `vendor/`，不再指向参考目录
-
-后续仍须继续：
-
-- 从“vendor 快照”再走向“自研替换”
-
-### 20. 共享局部变量入 handler，极易生并发暗伤
-
-`RunServer` 中若以一枚外层 `Status status` 供多 handler 复用，则多请求并发时可互踩。
-今已尽改为各 handler 各自局部 `Status`，此类变量不得再上提到共享作用域。
-
-### 21. 命名也会形成依赖错觉
-
-### 22. 大 multipart 上传，不仅吃带宽，也吃双份内存
-
-这轮排查 `208MB WAV -> 前端 Failed to fetch` 后确认：
-
-- HTTP server 先把整个 body 读入 `request.body`
-- multipart 解析再把文件 part 复制到 `MultipartFormData.content`
-- 离线路径随后还会再落一份 tmp 文件
-
-故“大文件整包上传”的真实成本不是 `1x 文件大小`，而是：
-
-- 网络：整包一次打满
-- 服务端内存：至少 `2x body`
-- 磁盘：再加 `1x tmp`
-
-若只把上限从 `64MiB` 提到 `500MiB`，只是把风险放大，不是正解。
-
-### 23. 对离线 WAV，正解是浏览器端先变成 `16k mono PCM16`
-
-当前离线 UI 已改为：
-
-- 浏览器解析 WAV 头
-- 按块读帧
-- 先下混 mono
-- 若非 `16k` 则在浏览器侧重采样
-- 结果按小块推送到现有 `/api/realtime/*`
-
-这样得到三重收益：
-
-- 单请求很小，不再撞 multipart 上限
-- 服务端不再为离线大文件写 tmp
-- 对 stereo `16k` WAV，网络流量约减半
-
-此法仍有边界：
-
-- 目前浏览器端只支持 `PCM 16-bit WAV`
-- 其它 WAV 编码仍需回退整包上传或后续补 upload session
-
-即使构建已只指向 `vendor/`，若接口仍名 `legacy_bridge`，会误导后续开发继续按参考工程思路走。
-
-今已改：
-
-- `legacy_bridge` -> `model_bridge`
-- `LegacyAsr*` -> `AsrRun*`
-- `QASR_LEGACY_BRIDGE_ENABLED` -> `QASR_CPU_BACKEND_ENABLED`
-- `qasr_legacy_c` -> `qasr_cpu_c`
-
-经验：边界名须反映本项目所有权，不得反映来源。
-
-### 21.1 CPU 后端可内化，但许可须随行
-
-`vendor/qasr_cpu/` 已改入 `src/backend/qwen_cpu/`。这样构建路径更像主项目后端，不再给人“临时 vendor 依赖”错觉。
-
-必须保：
-
-- `src/backend/qwen_cpu/LICENSE.upstream`
-- `NOTICE.md`
-- `docs/07-license-compliance.md`
-
-### 22. 实时长流必须限内存
-
-实时 ASR 不可假设用户会停，也不可令 `samples` 无限增长。
-
-今已改：
-
-- `RealtimePolicyConfig::max_decode_window_ms = 32000`
-- session 只保近 `32s` PCM
-- `sample_count` 记累计样本
-- `retained_sample_count` 记当前保留样本
-- stop 时若已裁旧 PCM，不以窗口结果覆盖既有全文
-
-经验：计时与解码窗口须分离；否则一裁样本，cadence 与稳定前缀都会漂。
-
-### 23. PCM chunk 必须明示二进制类型
-
-用 `curl --data-binary` 若不设 `Content-Type`，httplib 可能按表单体处理，触发 `413`。
-
-今后 `/api/realtime/chunk` 冒烟一律加：
-
-- `Content-Type: application/octet-stream`
-
-UI 已如此设置。
-
-### 24. Docker 验收依赖 daemon
-
-本轮执行 `tools/docker_linux_openblas.sh linux/arm64` 时，Docker API socket 不存在：
-
-- `/Users/kurisu/.docker/run/docker.sock`
-
-故 Linux/OpenBLAS 容器验收未能启动。
-此非代码失败；后续跑 Docker 前须先确认 Docker Desktop / daemon 已起。
-
-本机现状：
-
-- Docker CLI 存在：`/usr/local/bin/docker`
-- Docker client：`29.1.3`
-- 本机架构：`darwin/arm64`
-- context：`desktop-linux`
-- buildx 插件存在
-- daemon socket 缺：`/Users/kurisu/.docker/run/docker.sock`
-
-按脚本设计，`tools/docker_linux_openblas.sh linux/amd64` 可触发 amd64 Linux 容器；但须 daemon 起后才能确认 QEMU/binfmt 或 Docker Desktop emulation 实际可用。
-
-用户启动 Docker 后已验：
-
-- `docker buildx ls` 显示 `linux/amd64`
-- `docker run --rm --platform linux/amd64 ubuntu:24.04 uname -m` 输出 `x86_64`
-
-故 amd64 Linux 虚拟可行。
-后续 OpenBLAS 构建若失败，多半是 apt 源网络，不是架构虚拟失败。
-
-### 25. HTTP 服务须先限队列
-
-ASR 请求耗时远大于普通 HTTP。若 server 允许无限排队，CPU 慢时会堆内存并拖垮延迟。
-
-今已设：
-
-- httplib task queue 上限 `64`
-- read / write timeout `30s`
-- keepalive timeout `5s`
-- realtime 活跃会话上限 `64`
-
-后续还须给 async job 做 TTL 清理与硬上限。
-
-### 26. 中文测试音频可入库，但须受控
-
-`testfile/` 存中文 ASR 测试样音，用户已准许入库作为覆盖补充。
-
-规则：
-
-- 可提交 `testfile/*.mp3`
-- 不提交临时转码 WAV/PCM
-- 不提交模型文件
-- 新增大体积样音前须先说明用途
-
-### 27. 长音频 CLI 不能只等终稿
-
-用户用中文长音频测试时，默认 CLI 只在末尾吐全文，观感差，也不利于观察进度。
-
-参考 whisper.cpp 后确认：
-
-- 内部生成 segment 后立刻回调
-- CLI 只打印新增 segment
-- 最终文件输出再遍历全部 segment
-
-本项目当前 CPU 后端尚无 segment callback，先用 token callback 在 C++ 桥接层做段聚合：
-
-- `--emit-segments`
-- `--segment-max-codepoints`
-- 标点触发 flush
-- 无标点达阈值亦 flush
-
-后续更优解：在 `src/backend/qwen_cpu` 增原生 segment callback，带近似时间窗。
-
-### 28. 流式重复非多线程竞态
-
-同一 30 秒中文样本矩阵复验：
-
-- 非流式 `threads=1`：无重复
-- 非流式 `threads=4`：无重复
-- 流式 `threads=1`：重复
-- 流式 `threads=4`：重复
-
-结论：
-
-- 不是模型文件问题
-- 不是 BLAS/OpenMP 多线程竞态
-- 是流式 append-only 提交策略问题
-
-根因：
-
-- 模型后续 chunk 会修正已提交前缀
-- 旧逻辑从首个差异点继续外发
-- 外部没有 delete/update 通道，故修正文会表现为重复文本
-
-修法：
-
-- 已提交 frontier 只前进，不回退
-- 已提交前缀内的模型修正不外发
-- 外发前用 `qwen_stream_skip_recent_duplicate_prefix` 扫近邻已提交 token，跳过 rollback/reanchor 回放旧 span
-
-验收：
-
-- `ctest --test-dir build/macos-accelerate-cli --output-on-failure` 通过
-- 中文 30 秒流式 `threads=1/4` 均无重复
-
-### 29. Docker apt 源须可禁用与限时
-
-amd64 Docker/OpenBLAS 验收卡在 apt：
-
-- Aliyun 源：`noble/universe amd64 Packages` 连接失败
-- Ubuntu 官方源：`noble InRelease` / `noble-backports InRelease` 返回 `503`
-
-已改脚本：
-
-- `QASR_APT_MIRROR=` 可禁用镜像替换
-- `QASR_APT_RETRIES` 控重试次数，默认 `3`
-- `QASR_APT_TIMEOUT` 控 HTTP/HTTPS timeout，默认 `20`
-
-本轮 Docker 未进入 CMake 构建，不能作为代码失败判据。
-
-### 30. 长音频不可用超大 stream max_new_tokens
-
-`%E9%A1%BE%E5%90%9B%E5%AD%90%EF%BC%8801%EF%BC%89.mp3` 时长 `1726.457s`，约 `864` 个 2 秒流式 chunk。
-
-用户命令设：
-
-- `--stream`
-- `--emit-tokens`
-- `--stream-max-new-tokens 512`
-
-这会使每个 chunk 最多解 `512` token，长时间无输出，看似卡死。此非 ffmpeg 死锁。
-
-处置：
-
-- CLI / bridge 限 `stream_max_new_tokens <= 128`
-- C 后端也硬限 `QWEN_STREAM_MAX_NEW_TOKENS_LIMIT=128`
-- 长文件离线测试应优先用非流式 `--emit-segments`
-
-### 31. 全模块补齐：C++ 抽象层实现
-
-审计发现设计规格 9 层架构中约 82% 的 C++ 组件缺失（仅有 core/status、audio_types、timestamp、service/realtime、runtime 五个底层模块）。本次一次性补齐所有缺失模块：
-
-**新增头文件 10 个**（`include/qasr/`）：
-
-| 层           | 文件                                  | 主要类型/函数                                  |
-|:-------------|:--------------------------------------|:-----------------------------------------------|
-| core         | `core/state_machine.h`                | SessionState, RequestState, RealtimeTextLane, StreamChunkState 枚举 + 转换验证 |
-| storage      | `storage/safetensors_loader.h`        | MappedFile (RAII mmap), SafeTensorIndex, ShardRegistry, TensorView |
-| model        | `model/tokenizer.h`                   | Tokenizer (BPE), LoadVocabJson, LoadMergesTxt  |
-| audio        | `audio/frontend.h`                    | ReadWav, ParseWavBuffer, Resample, ComputeMelSpectrogram, CompactSilence, StreamingAudioRing |
-| inference    | `inference/encoder.h`                 | EncoderWeights, EncoderWindowPlan, EncodeChunk, EncodeAudio |
-| inference    | `inference/decoder.h`                 | DecoderWeights, KvCache, Prefill, DecodeStep, BuildPromptEmbeddings |
-| inference    | `inference/streaming_policy.h`        | StreamPolicyConfig, StreamChunkPlanner, EncoderCache, CommitFrontier, DetectDegenerateTail |
-| runtime      | `runtime/session_manager.h`           | SessionManager (线程安全, mutex 保护)          |
-| runtime      | `runtime/task_queue.h`                | TaskQueue (有界队列 + 背压 + 取消)             |
-| runtime      | `runtime/realtime_session.h`          | RealtimeSession (per-session 流式状态)         |
-
-**新增实现文件 10 个**（`src/`）：state_machine.cc, safetensors_loader.cc, tokenizer.cc, frontend.cc, encoder.cc, decoder.cc, streaming_policy.cc, session_manager.cc, task_queue.cc, realtime_session.cc
-
-**新增测试文件 10 个**（`tests/`）：覆盖正常/极端/错误场景，共新增 ~120 个测试用例，全部 217 个测试通过。
-
-教训：
-
-- encoder/decoder `.cc` 实现为 stub（返回零值或 EOS），待接入 C 后端真正的权重加载和推理
-- tokenizer 的 BPE 编码实现为简化版（逐字符匹配），待接真正的 merge 优先级算法
-- 所有模块遵循开发手册：Pre/Post/Thread-safe 契约注释、RAII 资源管理、Status 错误传播
-
-## 2026-04-11
-
-### Enhancement 方案落地（QKV 融合 + 多线程 BF16→F32 转换）
-
-基于 enhancement.md 的分析，实施了两项 CPU prefill 优化：
-
-1. **Prefill QKV 投影融合**
-   - 原来每层 prefill 分三次调用 `qwen_linear_nobias_bf16`（wq/wk/wv），即三次 BF16→F32 转换 + 三次 cblas_sgemm
-   - 新增 `qwen_linear_nobias_bf16_qkv_prefill()`：一次转换到连续 F32 缓冲区（[4096, 2048]），一次 cblas_sgemm，再拆分输出
-   - decode 路径（seq=1）不受影响，仍走 `qwen_linear_nobias_bf16_qkv` 的 BF16 NEON matvec
-
-2. **多线程 BF16→F32 转换**
-   - 发现 `bf16_to_f32_buf` 原为单线程 —— 对 gate_up_fused（25M 值）单次~1.5ms，28 层累计 ~140ms，占 prefill 的 ~55%
-   - 新增 `bf16_to_f32_buf_threaded()`（复用现有 pthread pool 的 parallel_for）
-   - QKV 融合路径用自定义 `qkv_cvt_worker` 单次 parallel_for 完成三段权重转换（避免三次 thread dispatch 开销）
-   - `bf16_get_f32_view` 也改用多线程路径（影响 wo/gate_up/down 投影）
-
-#### 基准数据（long_test.wav, 864 chunks, M3 Pro）
-
-| 指标 | 原始 | 优化后 | 变化 |
-|:-----|:-----|:-------|:-----|
-| Prefill avg | 263.6 ms | 208.6 ms | **−20.9%** |
-| Decode avg | 22.2 ms/tok | 22.4 ms/tok | ~0%（噪声） |
-| 总推理时间 | ~917 ms/chunk | ~861 ms/chunk | **−6.1%** |
-
-#### 关键经验
-
-- **enhancement.md 方向正确但实现优先级不同**：文档首推 QKV fusion，实测单独收益仅 ~3.5%，真正大头是多线程 BF16→F32 转换（~17%）。一个结构性优化（减 BLAS 调用）不如一个执行级优化（消除单线程瓶颈）
-- **Apple Accelerate BLAS 自管线程**：BLAS sgemm 用 GCD 自行并行，不用我们的 pthread pool。转换和 BLAS 是顺序关系，不会线程竞争
-- **转换阈值**：小于 65536 个值时走单线程，避免 thread dispatch 开销（~40μs）超过计算本身
-- **内存 layout 注意**：fused QKV 转换的 worker 须正确映射"逻辑偏移 → 三段不连续 BF16 源"，原始实现有指针负偏移 UB，已修正为 local_pos 计算
-- **识别准确率不变**：short_test.wav 和 long_test.wav 转录结果与优化前一致
-
-#### 未实施项目及原因
-
-| 方案 | 结论 | 理由 |
-|:-----|:-----|:-----|
-| 持久化 F32 权重缓存 | 延后 | +5.5GB 内存，且多线程转换已将转换开销压至 ~30ms（原 ~140ms） |
-| Shape-aware dispatch | 延后 | 实测 delta_prefill 最小为 32，BLAS+AMX 在此规模仍优于 per-token matvec |
-| vDSP 向量算子替换 | 延后 | RMSNorm/RoPE 等非瓶颈，优先级低 |
+本日经验改按主题归并，不再续接全局编号；旧的重复编号、重复日期段与重复结论已合并如下。
+
+### Windows / OpenBLAS 优化
+
+- Windows/Intel 当前正确主线已明确：encoder QKV 走“加载期预打包 + 运行期单 GEMM + 拆分 q/k/v”。
+- 先前的低风险过渡方案是“运行期临时把 Q/K/V 拷到连续缓冲区再打一发 GEMM”；后续实测已证伪，此法不应再回到热路径。
+- `tools/build_windows_openblas.cmd` / `.ps1` 已作为 Windows 一键构建入口：
+   - 不写死本机路径
+   - 先检 `-OpenBlasDir`
+   - 再检 `OPENBLAS_DIR`
+   - 再检现有 `build/<preset>/CMakeCache.txt`
+   - 最后按仓内相对目录约定检索 OpenBLAS
+   - 若当前 shell 未带 MSVC 环境，则用 `vswhere` + `VsDevCmd` 自动补齐
+
+本轮 Intel benchmark 环境：
+
+- OpenBLAS `OPENBLAS_VERBOSE=2` 报告核心类型：`SkylakeX`
+- Windows 主机：`16 logical CPUs`
+- 基准程序：`qasr_cpu_bench`
+- 对比对象：`separate` / `fused_copy` / `fused_packed`
+
+Windows + OpenBLAS + SkylakeX + 16 logical CPUs，`qasr_cpu_bench` 实测：
+
+- 8 线程：
+   - `seq4 d1024`：`fused_packed = 1.43x separate`
+   - `seq13 d1024`：`1.07x`
+   - `seq52 d1024`：`1.08x`
+   - `seq104 d1024`：`0.93x`
+   - `seq13 d896`：`1.47x`
+- 12 线程：
+   - `seq4 d1024`：`1.67x`
+   - `seq13 d1024`：`1.15x`
+   - `seq52 d1024`：`1.14x`
+   - `seq104 d1024`：`1.20x`
+   - `seq13 d896`：`1.34x`
+- `fused_copy` 即“每次调用临时拼接后再单 GEMM”，在全部测点都慢于 `separate`。
+
+当前结论：
+
+- Intel/Windows 保留 `fused_packed`
+- 禁止把 `fused_copy` 回灌到热路径
+- 线程数 8 与 12 皆可用，但最优值随 shape 变，不可假设 12 恒优
+
+进一步的 benchmark 结论必须明确写清：
+
+- 若看**相对 speedup**，12 线程常优于 8 线程，因为 `separate` 在 12 线程下退化更明显。
+- 若看**`fused_packed` 的绝对延迟**，8 线程在多数测点反而更低：
+   - `seq4 d1024`：`0.444ms @8` vs `0.447ms @12`
+   - `seq52 d1024`：`1.080ms @8` vs `1.504ms @12`
+   - `seq104 d1024`：`1.897ms @8` vs `1.927ms @12`
+   - `seq13 d896`：`0.415ms @8` vs `0.484ms @12`
+- 故线程评估不可只看“加速比”，必须同时看**最终绝对时延**。
+- 当前样本上，8 线程更像稳态低延迟候选；12 线程更像特定 shape 的吞吐候选。
+- `seq104 d1024 @8` 上 `fused_packed` 仍略慢于 `separate`，说明 fused QKV 不是对所有大 shape 都绝对占优，后续仍需 shape-aware dispatch 来做最后分流。
+
+Apple 旧实验仍保留一条参考：
+
+- 在 M3 Pro + `long_test.wav` + `864 chunks` 上，prefill avg `263.6ms -> 208.6ms`，总推理 `~917ms/chunk -> ~861ms/chunk`，而 decode avg `22.2 -> 22.4 ms/tok` 基本不变。
+- 这说明 Apple/prefill 的主要收益来自“多线程 BF16->F32 转换”而不只是“减少 BLAS 次数”；结构优化与执行级优化必须拆开看。
+- 此结论只作 Apple/prefill 参考，不可直接套为 Intel/Windows 的主线判断。
+
+实验性探索账本：
+
+- `[已验证]` encoder QKV 加载期预打包：成立，现为 Windows/Intel 保留方案。
+- `[已证伪]` encoder QKV 运行期临时拼接：不成立，全部测点慢于 `separate`。
+- `[已验证]` 8 / 12 线程对比：线程最优值依赖 shape，且“相对 speedup”与“绝对时延”可能给出相反结论。
+- `[已确认现状]` decoder prefill QKV 原本就已 fused，不应重复投入同一路优化。
+- `[已确认现状]` decoder gate/up 原本就已 fused，不应重复投入同一路优化。
+- `[已确认现状]` 当前 BF16 cache 只是 F32 view/cache，不等于真正后端友好的 packed weight cache。
+- `[已确认缺口]` x86 AVX2/AVX-512 仍是编译期宏分支，不是运行时 CPUID dispatch。
+- `[已确认缺口]` 当前只做 `seq==1` 与 `seq>1` 分流，尚无 `small / medium / large` shape-aware dispatch。
+- `[已延后]` decoder 侧持久 packed weight cache：方向成立，但需先权衡内存占用后再做。
+- `[已延后]` OpenBLAS BF16 API 实验：可跟踪，但在 packed weight 与 shape dispatch 之前优先级不高。
+
+### 流式服务与资源边界
+
+- decode cadence 不宜随包即跑，现已统一到最小 `800ms` 门槛；浏览器亦按同 cadence flush。
+- stop 不可只回最后一轮 partial；现已在 stop 时再跑一次非流式 full-audio decode，并强制 flush 尾巴。
+- `RunServer` 的 handler 不得复用外层共享 `Status`；并发请求下极易互踩，必须每个 handler 自持局部变量。
+- 实时长流必须限内存：
+   - `max_decode_window_ms = 32000`
+   - session 只保近 `32s` PCM
+   - `sample_count` 记累计样本
+   - `retained_sample_count` 记当前保留样本
+   - stop 时若旧 PCM 已裁，不得用窗口结果覆盖既有全文
+- HTTP 服务须先限队列：
+   - httplib task queue 上限 `64`
+   - read / write timeout `30s`
+   - keepalive timeout `5s`
+   - realtime 活跃会话上限 `64`
+
+### 上传与前端路径
+
+- 大 multipart 上传不是“带宽问题”而已，而是至少 `2x body` 服务端内存 + `1x tmp` 磁盘成本。
+- `208MB WAV -> Failed to fetch` 说明：仅把上传上限从 `64MiB` 提到更大，不是正解。
+- 当前离线 WAV 正解是浏览器端先转成 `16k mono PCM16` 再按小块推送到 `/api/realtime/*`：
+   - 浏览器解析 WAV 头
+   - 按块读帧
+   - 先下混 mono
+   - 若非 `16k` 则浏览器端重采样
+   - 结果按小块推送
+- 这样可同时降低网络峰值、服务端内存峰值与 tmp 文件写入。
+- 当前边界：浏览器端仅支持 `PCM 16-bit WAV`；其它编码仍需回退整包上传或后续补 upload session。
+- `/api/realtime/chunk` 的 PCM chunk 必须显式 `Content-Type: application/octet-stream`，否则可能被按表单体处理并触发 `413`。
+
+### 边界、命名与许可
+
+- `qwen-asr-learn/` 与 `whisper.cpp/` 只能参考，不能形成编译、include 或 link 依赖。
+- 当前 CPU 核源码已内化到 `src/backend/qwen_cpu/`，构建路径不再指向参考目录。
+- 命名也会形成依赖错觉，边界名须反映本项目所有权，不得反映来源：
+   - `legacy_bridge` -> `model_bridge`
+   - `LegacyAsr*` -> `AsrRun*`
+   - `QASR_LEGACY_BRIDGE_ENABLED` -> `QASR_CPU_BACKEND_ENABLED`
+   - `qasr_legacy_c` -> `qasr_cpu_c`
+- CPU 后端可内化，但许可须随行：
+   - `src/backend/qwen_cpu/LICENSE.upstream`
+   - `NOTICE.md`
+   - `docs/07-license-compliance.md`
+
+### 长音频与流式稳定性
+
+- 中文长音频 CLI 不能只等终稿；当前先用 token callback 在 C++ 桥接层聚合出段：
+   - `--emit-segments`
+   - `--segment-max-codepoints`
+   - 标点触发 flush
+   - 无标点达阈值亦 flush
+- 长音频流式不可使用超大 `stream_max_new_tokens`；现已将 CLI / bridge / C 后端统一硬限到 `<= 128`。
+- 流式重复并非多线程竞态：同一中文 30 秒样本在非流式 `threads=1/4` 均无重复，而流式 `threads=1/4` 均重复，根因是 append-only 提交策略而非 BLAS 竞态。
+- 当前修法：
+   - 已提交 frontier 只前进，不回退
+   - 已提交前缀内的模型修正不再外发
+   - 外发前扫近邻已提交 token，跳过 rollback/reanchor 的旧 span
+
+### Docker 与环境
+
+- Docker 验收依赖 daemon；`docker` CLI 存在不代表 daemon 已起。
+- 本轮 `linux/arm64` 容器验收失败时，根因是 daemon socket 缺失，而非代码失败。
+- 用户后续已证实：`linux/amd64` 虚拟可行；若 OpenBLAS Docker 构建失败，多半是 apt 源网络，而非架构虚拟失败。
+- apt 源策略必须可禁用与限时：
+   - `QASR_APT_MIRROR=` 可禁镜像替换
+   - `QASR_APT_RETRIES` 默认 `3`
+   - `QASR_APT_TIMEOUT` 默认 `20`
+
+### C++ 抽象层补齐
+
+- 一次性补齐了 10 个头文件、10 个实现文件、10 个测试文件，约新增 120 个测试用例。
+- 该层当前可作为设计规格的外壳与契约层，但有两点必须明示：
+   - encoder/decoder `.cc` 仍是 stub，待继续接入 C 后端真实权重加载与推理
+   - tokenizer BPE 仍是简化版，待接入真正的 merge 优先级逻辑
+
+### 受控测试样音
+
+- `testfile/` 中的中文样音可入库作覆盖补充，但须受控：
+   - 可提交 `testfile/*.mp3`
+   - 不提交临时转码 WAV/PCM
+   - 不提交模型文件
+   - 新增大体积样音前须先说明用途
+
+### 重复错误（已标记）
+
+- `[重复文档]` 同一日期采用 append-only 记录，曾导致重复编号、重复日期段与重复结论；今后同日经验改按主题归并，不再续接旧编号流。
+- `[重复实现]` “每次调用临时拼接 Q/K/V 再单 GEMM”曾被当作可行优化反复尝试；Windows/Intel 基准已证伪，后续视为禁回归路线。
+- `[重复环境]` Windows 重建时若 `qasr_server.exe` 仍在运行，会反复触发 `LNK1168`；重编前须先停占用进程。
+- `[重复兼容]` Win32 `max` 宏会破坏 `std::max`；Windows 代码路径必须坚持 `NOMINMAX` 或 `(std::max)` 规避。
+- `[重复误判]` 大文件上传失败不应再靠“单纯提高 multipart 上限”处理；后续一律优先流式上传或浏览器端转码。
