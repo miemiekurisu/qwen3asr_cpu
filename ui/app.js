@@ -2,18 +2,15 @@ const healthBadge = document.getElementById("healthBadge");
 const runtimeHint = document.getElementById("runtimeHint");
 const uploadForm = document.getElementById("uploadForm");
 const audioFile = document.getElementById("audioFile");
+const offlineSubmit = document.getElementById("offlineSubmit");
+const offlineStatus = document.getElementById("offlineStatus");
 const offlineResult = document.getElementById("offlineResult");
 const startRealtime = document.getElementById("startRealtime");
 const stopRealtime = document.getElementById("stopRealtime");
 const clearRealtime = document.getElementById("clearRealtime");
 const realtimeResult = document.getElementById("realtimeResult");
 const realtimeStatus = document.getElementById("realtimeStatus");
-const hostBackend = document.getElementById("hostBackend");
-const hostDevice = document.getElementById("hostDevice");
-const startHostCapture = document.getElementById("startHostCapture");
-const stopHostCapture = document.getElementById("stopHostCapture");
-const hostCaptureStatus = document.getElementById("hostCaptureStatus");
-const hostCaptureResult = document.getElementById("hostCaptureResult");
+
 
 let realtimeState = {
   audioContext: null,
@@ -25,13 +22,10 @@ let realtimeState = {
   sending: false,
   pending: [],
   sampleRate: 0,
+  startedAt: 0,
 };
 
-let hostCaptureState = {
-  active: false,
-  supported: true,
-  pollTimer: null,
-};
+
 
 function escapeHtml(text) {
   return text
@@ -64,8 +58,7 @@ async function checkHealth() {
     if (data.status === "ok") {
       healthBadge.textContent = "已就绪";
       healthBadge.classList.add("ok");
-      runtimeHint.textContent = "离线上传、浏览器麦克风与宿主采音接口可测";
-      await refreshHostCaptureStatus();
+      runtimeHint.textContent = "离线上传与浏览器麦克风实时转写可用";
       return;
     }
   } catch (error) {
@@ -81,124 +74,71 @@ uploadForm.addEventListener("submit", async (event) => {
     return;
   }
 
-  offlineResult.textContent = "转写中...";
-  const form = new FormData();
-  form.append("audio", audioFile.files[0]);
+  offlineResult.textContent = "";
+  offlineStatus.textContent = "提交中...";
+  offlineSubmit.disabled = true;
+  const startTime = performance.now();
 
   try {
-    const response = await fetch("/api/transcriptions", {
+    const form = new FormData();
+    form.append("audio", audioFile.files[0]);
+    const submitRes = await fetch("/api/transcriptions/async", {
       method: "POST",
       body: form,
     });
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.error.message);
+    const submitData = await submitRes.json();
+    if (!submitRes.ok) {
+      throw new Error(submitData.error?.message || "提交失败");
     }
-    offlineResult.textContent = `${data.text}\n\n推理 ${data.inference_ms.toFixed(0)} ms`;
+    const jobId = submitData.id;
+    offlineStatus.textContent = "转写中...";
+
+    let lastTextLen = 0;
+    while (true) {
+      await new Promise((r) => setTimeout(r, 300));
+      const pollRes = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
+      const job = await pollRes.json();
+      if (!pollRes.ok) {
+        throw new Error(job.error?.message || "查询失败");
+      }
+
+      if (job.state === "running" || job.state === "queued") {
+        const text = job.text || "";
+        if (text.length > lastTextLen) {
+          lastTextLen = text.length;
+          offlineResult.innerHTML =
+            `<span class="stable">${escapeHtml(text)}</span>`;
+        }
+        const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
+        const chars = [...text].length;
+        offlineStatus.textContent = chars > 0
+          ? `转写中... 已识别 ${chars} 字 / ${elapsed}s`
+          : `转写中... ${elapsed}s`;
+        continue;
+      }
+
+      if (job.state === "failed") {
+        throw new Error(job.error || "转写失败");
+      }
+
+      offlineResult.innerHTML =
+        `<span class="final">${escapeHtml(job.text)}</span>`;
+      const audioDur = (job.audio_ms / 1000).toFixed(1);
+      const infMs = job.inference_ms.toFixed(0);
+      const rtf = (job.inference_ms / job.audio_ms).toFixed(2);
+      offlineStatus.textContent =
+        `音频 ${audioDur}s / 推理 ${infMs}ms / RTF ${rtf} / ${job.tokens} tokens`;
+      break;
+    }
   } catch (error) {
     offlineResult.textContent = `失败：${error.message}`;
+    offlineStatus.textContent = "";
+  } finally {
+    offlineSubmit.disabled = false;
   }
 });
 
-function setHostCaptureButtons(active, supported) {
-  startHostCapture.disabled = !supported || active;
-  stopHostCapture.disabled = !supported || !active;
-}
 
-function stopHostCapturePoll() {
-  if (hostCaptureState.pollTimer !== null) {
-    window.clearInterval(hostCaptureState.pollTimer);
-    hostCaptureState.pollTimer = null;
-  }
-}
-
-function ensureHostCapturePoll() {
-  if (hostCaptureState.pollTimer !== null) {
-    return;
-  }
-  hostCaptureState.pollTimer = window.setInterval(() => {
-    refreshHostCaptureStatus().catch((error) => {
-      hostCaptureStatus.textContent = `查询失败：${error.message}`;
-    });
-  }, 2000);
-}
-
-async function refreshHostCaptureStatus() {
-  const response = await fetch("/api/capture/status");
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.error.message);
-  }
-
-  const supported = data.supported !== false;
-  const active = Boolean(data.active);
-  hostCaptureState.active = active;
-  hostCaptureState.supported = supported;
-  setHostCaptureButtons(active, supported);
-
-  if (!supported) {
-    stopHostCapturePoll();
-    hostCaptureStatus.textContent = "当前服务无可用采音后端；请安装 ffmpeg。";
-    hostCaptureResult.textContent = "尚无结果";
-    return;
-  }
-
-  if (!active) {
-    stopHostCapturePoll();
-    hostCaptureStatus.textContent = "宿主采音未开始";
-    if (data.error) {
-      hostCaptureResult.textContent = data.error;
-    }
-    return;
-  }
-
-  ensureHostCapturePoll();
-  hostCaptureStatus.textContent = `${data.backend || "auto"} 已启动，累计 ${data.sample_count || 0} 样本`;
-  renderTranscript(hostCaptureResult, data, "采集中...");
-  if (data.error) {
-    hostCaptureStatus.textContent = `采音异常：${data.error}`;
-  }
-}
-
-async function startLinuxHostCapture() {
-  hostCaptureStatus.textContent = "宿主采音启动中...";
-  const response = await fetch("/api/capture/start", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({
-      backend: hostBackend.value,
-      device: hostDevice.value.trim(),
-    }),
-  });
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.error.message);
-  }
-  renderTranscript(hostCaptureResult, null, "采集中...");
-  hostCaptureStatus.textContent = `${data.backend} 已启动`;
-  ensureHostCapturePoll();
-  await refreshHostCaptureStatus();
-}
-
-async function stopLinuxHostCapture() {
-  stopHostCapturePoll();
-  const response = await fetch("/api/capture/stop", {
-    method: "POST",
-    body: "",
-  });
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.error.message);
-  }
-  hostCaptureState.active = false;
-  setHostCaptureButtons(false, true);
-  hostCaptureStatus.textContent = `${data.backend || "capture"} 已停止`;
-  if (data.error && !(data.text || data.stable_text || data.partial_text)) {
-    hostCaptureResult.textContent = data.error;
-    return;
-  }
-  renderTranscript(hostCaptureResult, data, "尚无结果");
-}
 
 function downsampleTo16k(input, inputRate) {
   if (inputRate === 16000) {
@@ -255,8 +195,12 @@ async function flushRealtimeChunk(force) {
       throw new Error(data.error.message);
     }
     renderTranscript(realtimeResult, data, "尚无结果");
+    const audioDur = (data.sample_count / 16000).toFixed(1);
+    const wallElapsed = ((performance.now() - realtimeState.startedAt) / 1000).toFixed(1);
+    const lag = (wallElapsed - audioDur).toFixed(1);
+    const infMs = data.inference_ms !== undefined ? data.inference_ms.toFixed(0) : "-";
     const decodeLabel = data.decoded ? "已解码" : "待下轮";
-    realtimeStatus.textContent = `会话 ${realtimeState.sessionId}，累计 ${data.sample_count} 样本，${decodeLabel}，稳 ${data.stable_text.length} / 尾 ${data.partial_text.length}`;
+    realtimeStatus.textContent = `音频 ${audioDur}s / 耗时 ${wallElapsed}s / 滞后 ${lag}s / 推理 ${infMs}ms / ${decodeLabel}`;
   } catch (error) {
     realtimeStatus.textContent = `失败：${error.message}`;
   } finally {
@@ -286,6 +230,7 @@ async function startRealtimeCapture() {
     sending: false,
     pending: [],
     sampleRate: audioContext.sampleRate,
+    startedAt: performance.now(),
   };
 
   processor.onaudioprocess = (event) => {
@@ -338,6 +283,7 @@ async function stopRealtimeCapture() {
     sending: false,
     pending: [],
     sampleRate: 0,
+    startedAt: 0,
   };
   startRealtime.disabled = false;
   stopRealtime.disabled = true;
@@ -364,22 +310,6 @@ clearRealtime.addEventListener("click", () => {
   realtimeResult.textContent = "尚无结果";
   realtimeStatus.textContent = "未开始";
   clearRealtime.style.display = "none";
-});
-
-startHostCapture.addEventListener("click", async () => {
-  try {
-    await startLinuxHostCapture();
-  } catch (error) {
-    hostCaptureStatus.textContent = `启动失败：${error.message}`;
-  }
-});
-
-stopHostCapture.addEventListener("click", async () => {
-  try {
-    await stopLinuxHostCapture();
-  } catch (error) {
-    hostCaptureStatus.textContent = `停止失败：${error.message}`;
-  }
 });
 
 checkHealth();

@@ -29,8 +29,9 @@
             <span>WAV 文件</span>
             <input id="audioFile" type="file" accept=".wav,audio/wav">
           </label>
-          <button class="action" type="submit">开始转写</button>
+          <button id="offlineSubmit" class="action" type="submit">开始转写</button>
         </form>
+        <p id="offlineStatus" class="hint"></p>
         <pre id="offlineResult" class="output">尚无结果</pre>
       </article>
 
@@ -47,34 +48,6 @@
           </div>
           <p id="realtimeStatus" class="hint">未开始</p>
           <pre id="realtimeResult" class="output">尚无结果</pre>
-        </div>
-      </article>
-
-      <article class="panel host">
-        <header class="panel-head">
-          <p class="panel-kicker">Host Audio</p>
-          <h2>宿主设备采音</h2>
-        </header>
-        <div class="stack">
-          <label class="field">
-            <span>后端</span>
-            <select id="hostBackend">
-              <option value="auto">auto</option>
-              <option value="ffmpeg">ffmpeg</option>
-              <option value="arecord">arecord</option>
-              <option value="parec">parec</option>
-            </select>
-          </label>
-          <label class="field">
-            <span>设备名</span>
-            <input id="hostDevice" type="text" placeholder="留空即默认设备">
-          </label>
-          <div class="button-row">
-            <button id="startHostCapture" class="action" type="button">启动</button>
-            <button id="stopHostCapture" class="ghost" type="button" disabled>停止</button>
-          </div>
-          <p id="hostCaptureStatus" class="hint">宿主采音未开始</p>
-          <pre id="hostCaptureResult" class="output">尚无结果</pre>
         </div>
       </article>
     </section>

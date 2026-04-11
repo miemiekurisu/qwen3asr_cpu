@@ -672,6 +672,7 @@ public:
             return Status(StatusCode::kInternal, "qwen_load failed");
         }
         ctx_->past_text_conditioning = 1;
+        ctx_->segment_sec = 30.0f;
         return OkStatus();
     }
 
@@ -828,6 +829,7 @@ struct OfflineJob {
     double inference_ms = 0.0;
     double audio_ms = 0.0;
     std::int32_t tokens = 0;
+    std::int32_t token_count = 0;
     std::int64_t created_at = 0;
     std::int64_t updated_at = 0;
 };
@@ -842,6 +844,7 @@ Json BuildJobJson(const OfflineJob & job) {
     body["inference_ms"] = job.inference_ms;
     body["audio_ms"] = job.audio_ms;
     body["tokens"] = job.tokens;
+    body["token_count"] = job.token_count;
     body["created_at"] = job.created_at;
     body["updated_at"] = job.updated_at;
     return body;
@@ -1596,7 +1599,7 @@ int RunServer(const ServerConfig & config) {
         if (options.stream) {
             SetErrorResponse(
                 response,
-                Status(StatusCode::kFailedPrecondition, "use /v1/chat/completions with stream=true or /api/realtime/* for streaming"),
+                Status(StatusCode::kFailedPrecondition, "use /api/transcriptions/async + GET /api/jobs/:id for progressive results"),
                 412);
             return;
         }
@@ -1669,6 +1672,16 @@ int RunServer(const ServerConfig & config) {
             ModelDecodeOptions decode;
             decode.prompt = options.prompt;
             decode.language = options.language;
+            decode.token_callback = [&jobs, &jobs_mu, &job_id](std::string_view piece) {
+                std::lock_guard<std::mutex> lock(jobs_mu);
+                auto it = jobs.find(job_id);
+                if (it != jobs.end()) {
+                    it->second.text += std::string(piece);
+                    // With boundary cleanup, callback fires per-segment with full text.
+                    // Estimate token count: ~1.5 bytes/token for CJK, ~4 for Latin.
+                    it->second.token_count += std::max(static_cast<std::int32_t>(piece.size() / 3), std::int32_t{1});
+                }
+            };
             const AsrRunResult result = model.TranscribeFile(prepared.wav_path, decode);
             CleanupPreparedAudio(&prepared);
 

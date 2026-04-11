@@ -89,7 +89,7 @@ h2 {
 
 .grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: 2fr 1fr;
   gap: 18px;
   margin-top: 22px;
 }
