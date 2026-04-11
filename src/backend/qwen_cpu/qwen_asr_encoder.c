@@ -21,6 +21,14 @@
 #include <string.h>
 #include <math.h>
 
+static int encoder_should_cancel(qwen_ctx_t *ctx) {
+    if (ctx && ctx->cancel_cb && ctx->cancel_cb(ctx->cancel_cb_userdata)) {
+        ctx->last_run_cancelled = 1;
+        return 1;
+    }
+    return 0;
+}
+
 /* ========================================================================
  * Weight Loading
  * ======================================================================== */
@@ -245,6 +253,17 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
 
     /* Process each chunk through Conv2D + reshape + project + sinusoidal PE */
     for (int c = 0; c < n_chunks; c++) {
+        if (encoder_should_cancel(ctx)) {
+            free(chunk_mel_buf);
+            free(c1_buf);
+            free(c2_buf);
+            free(c3_buf);
+            free(reshaped_buf);
+            free(pe_buf);
+            free(x);
+            return NULL;
+        }
+
         int start = c * chunk_size;
         int end = start + chunk_size;
         if (end > mel_frames) end = mel_frames;
@@ -331,6 +350,14 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     float scale = 1.0f / sqrtf((float)head_dim);
 
     for (int layer = 0; layer < cfg->enc_layers; layer++) {
+        if (encoder_should_cancel(ctx)) {
+            free(x); free(x_norm); free(q); free(k); free(v);
+            free(attn_out); free(proj_out);
+            free(ffn_mid); free(ffn_out);
+            free(window_starts);
+            return NULL;
+        }
+
         qwen_enc_layer_t *l = &enc->layers[layer];
 
         /* ---- Self-attention ---- */
@@ -365,6 +392,14 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
                      total_tokens, ffn_dim, d_model);
         qwen_add_inplace(x, ffn_out, total_tokens * d_model);
 
+    }
+
+    if (encoder_should_cancel(ctx)) {
+        free(x); free(x_norm); free(q); free(k); free(v);
+        free(attn_out); free(proj_out);
+        free(ffn_mid); free(ffn_out);
+        free(window_starts);
+        return NULL;
     }
 
     /* Final LayerNorm */

@@ -29,7 +29,10 @@
             <span>WAV 文件</span>
             <input id="audioFile" type="file" accept=".wav,audio/wav">
           </label>
-          <button id="offlineSubmit" class="action" type="submit">开始转写</button>
+          <div class="button-row">
+            <button id="offlineSubmit" class="action" type="submit">开始转写</button>
+            <button id="offlineStop" class="ghost" type="button" disabled>停止</button>
+          </div>
         </form>
         <p id="offlineStatus" class="hint"></p>
         <pre id="offlineResult" class="output">尚无结果</pre>

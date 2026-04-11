@@ -47,6 +47,29 @@ void qwen_set_token_callback(qwen_ctx_t *ctx, qwen_token_cb cb, void *userdata) 
     ctx->token_cb_userdata = userdata;
 }
 
+void qwen_set_cancel_callback(qwen_ctx_t *ctx, qwen_cancel_cb cb, void *userdata) {
+    ctx->cancel_cb = cb;
+    ctx->cancel_cb_userdata = userdata;
+}
+
+int qwen_was_cancelled(const qwen_ctx_t *ctx) {
+    return ctx && ctx->last_run_cancelled;
+}
+
+static int qwen_should_cancel(qwen_ctx_t *ctx) {
+    if (ctx && ctx->cancel_cb && ctx->cancel_cb(ctx->cancel_cb_userdata)) {
+        ctx->last_run_cancelled = 1;
+        return 1;
+    }
+    return 0;
+}
+
+static char *qwen_alloc_empty_text(void) {
+    char *text = (char *)malloc(1);
+    if (text) text[0] = '\0';
+    return text;
+}
+
 static const char *QWEN_SUPPORTED_LANGUAGES[] = {
     "Chinese", "English", "Cantonese", "Arabic", "German", "French",
     "Spanish", "Portuguese", "Indonesian", "Italian", "Korean", "Russian",
@@ -624,6 +647,8 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
     double seg_t0 = get_time_ms();
     int n_text_tokens = 0;
 
+    if (qwen_should_cancel(ctx)) return qwen_alloc_empty_text();
+
     /* ---- Mel spectrogram ---- */
     double t0 = get_time_ms();
     int mel_frames = 0;
@@ -639,7 +664,7 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
     int enc_seq_len = 0;
     float *enc_output = qwen_encoder_forward(ctx, mel, mel_frames, &enc_seq_len);
     free(mel);
-    if (!enc_output) return NULL;
+    if (!enc_output) return ctx->last_run_cancelled ? qwen_alloc_empty_text() : NULL;
     double enc_ms = get_time_ms() - t0;
 
     if (qwen_verbose >= 2)
@@ -662,6 +687,12 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
         free(input_embeds);
         free(tmp_embed);
         return NULL;
+    }
+    if (qwen_should_cancel(ctx)) {
+        free(enc_output);
+        free(input_embeds);
+        free(tmp_embed);
+        return qwen_alloc_empty_text();
     }
 
     /* Embed prefix head: <|im_start|>system\n */
@@ -755,6 +786,7 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
     text[0] = '\0';
 
     while (n_generated < max_tokens) {
+        if (qwen_should_cancel(ctx)) break;
         n_generated++;
 
         /* Check EOS */
@@ -867,11 +899,14 @@ static void segment_emit_cb(const char *piece, void *userdata) {
 }
 
 char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples) {
+    ctx->last_run_cancelled = 0;
     ctx->perf_total_ms = 0;
     ctx->perf_text_tokens = 0;
     ctx->perf_audio_ms = 1000.0 * (double)n_samples / (double)QWEN_SAMPLE_RATE;
     ctx->perf_encode_ms = 0;
     ctx->perf_decode_ms = 0;
+
+    if (qwen_should_cancel(ctx)) return qwen_alloc_empty_text();
 
     const float *audio_samples = samples;
     int audio_n_samples = n_samples;
@@ -920,6 +955,7 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
         char *text = transcribe_segment(ctx, audio_samples, audio_n_samples, tokenizer, NULL, 0, NULL);
         qwen_tokenizer_free(tokenizer);
         free(compacted_samples);
+        if (!text && ctx->last_run_cancelled) return qwen_alloc_empty_text();
         return text;
     }
 
@@ -954,6 +990,8 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
     void *saved_cb_userdata = ctx->token_cb_userdata;
 
     for (int s = 0; s < n_splits; s++) {
+        if (qwen_should_cancel(ctx)) break;
+
         int core_start = splits[s];
         int core_end = splits[s + 1];
         int seg_start = core_start;
@@ -1009,7 +1047,8 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
         char *seg_text = transcribe_segment(ctx, seg_ptr, seg_samples, tokenizer,
                                             past_tokens, n_past_tokens,
                                             &seg_text_tokens);
-        if (do_boundary_cleanup &&
+        if (!ctx->last_run_cancelled &&
+            do_boundary_cleanup &&
             use_past_conditioning && n_past_tokens > 0 &&
             should_retry_unconditioned_segment(result, seg_text,
                                                core_end - core_start,
@@ -1041,8 +1080,15 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
 
         free(past_tokens);
         free(seg_buf);
-        if (!seg_text) continue;
-        if (seg_text[0] == '\0') { free(seg_text); continue; }
+        if (!seg_text) {
+            if (ctx->last_run_cancelled) break;
+            continue;
+        }
+        if (seg_text[0] == '\0') {
+            free(seg_text);
+            if (ctx->last_run_cancelled) break;
+            continue;
+        }
 
         int cut_pos = 0;
         if (do_boundary_cleanup) {
@@ -1071,6 +1117,7 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
         result[result_len] = '\0';
         if (do_boundary_cleanup && saved_cb) saved_cb(seg_text + cut_pos, saved_cb_userdata);
         free(seg_text);
+        if (ctx->last_run_cancelled) break;
     }
 
     ctx->token_cb = saved_cb;
@@ -1312,6 +1359,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         local_n_samples = audio_n_samples;
     }
 
+    ctx->last_run_cancelled = 0;
     ctx->perf_total_ms = 0;
     ctx->perf_text_tokens = 0;
     ctx->perf_audio_ms = live ? 0.0 : 1000.0 * (double)n_samples / (double)QWEN_SAMPLE_RATE;

@@ -3,6 +3,7 @@ const runtimeHint = document.getElementById("runtimeHint");
 const uploadForm = document.getElementById("uploadForm");
 const audioFile = document.getElementById("audioFile");
 const offlineSubmit = document.getElementById("offlineSubmit");
+const offlineStop = document.getElementById("offlineStop");
 const offlineStatus = document.getElementById("offlineStatus");
 const offlineResult = document.getElementById("offlineResult");
 const startRealtime = document.getElementById("startRealtime");
@@ -23,6 +24,11 @@ let realtimeState = {
   pending: [],
   sampleRate: 0,
   startedAt: 0,
+};
+
+let offlineState = {
+  jobId: "",
+  stopRequested: false,
 };
 
 
@@ -51,6 +57,32 @@ function renderTranscript(element, data, fallback) {
     `<span class=\"partial\">${escapeHtml(partial || text)}</span>`;
 }
 
+function hasOfflineJob() {
+  return offlineState.jobId !== "";
+}
+
+function hasRealtimeSession() {
+  return realtimeState.sessionId !== "";
+}
+
+function updateControlAvailability() {
+  const offlineActive = hasOfflineJob();
+  const realtimeActive = hasRealtimeSession();
+  audioFile.disabled = offlineActive || realtimeActive;
+  offlineSubmit.disabled = offlineActive || realtimeActive;
+  offlineStop.disabled = !offlineActive || offlineState.stopRequested || realtimeActive;
+  startRealtime.disabled = offlineActive || realtimeActive;
+  stopRealtime.disabled = !realtimeActive;
+}
+
+function resetOfflineState() {
+  offlineState = {
+    jobId: "",
+    stopRequested: false,
+  };
+  updateControlAvailability();
+}
+
 async function checkHealth() {
   try {
     const response = await fetch("/api/health");
@@ -69,6 +101,10 @@ async function checkHealth() {
 
 uploadForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (hasRealtimeSession()) {
+    offlineStatus.textContent = "实时转写进行中，请先停止。";
+    return;
+  }
   if (!audioFile.files[0]) {
     offlineResult.textContent = "请先选择 WAV 文件。";
     return;
@@ -76,7 +112,6 @@ uploadForm.addEventListener("submit", async (event) => {
 
   offlineResult.textContent = "";
   offlineStatus.textContent = "提交中...";
-  offlineSubmit.disabled = true;
   const startTime = performance.now();
 
   try {
@@ -91,6 +126,9 @@ uploadForm.addEventListener("submit", async (event) => {
       throw new Error(submitData.error?.message || "提交失败");
     }
     const jobId = submitData.id;
+    offlineState.jobId = jobId;
+    offlineState.stopRequested = false;
+    updateControlAvailability();
     offlineStatus.textContent = "转写中...";
 
     let lastTextLen = 0;
@@ -102,7 +140,7 @@ uploadForm.addEventListener("submit", async (event) => {
         throw new Error(job.error?.message || "查询失败");
       }
 
-      if (job.state === "running" || job.state === "queued") {
+      if (job.state === "running" || job.state === "queued" || job.state === "cancelling") {
         const text = job.text || "";
         if (text.length > lastTextLen) {
           lastTextLen = text.length;
@@ -111,10 +149,22 @@ uploadForm.addEventListener("submit", async (event) => {
         }
         const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
         const chars = [...text].length;
+        const prefix = job.state === "cancelling" ? "停止中..." : "转写中...";
         offlineStatus.textContent = chars > 0
-          ? `转写中... 已识别 ${chars} 字 / ${elapsed}s`
-          : `转写中... ${elapsed}s`;
+          ? `${prefix} 已识别 ${chars} 字 / ${elapsed}s`
+          : `${prefix} ${elapsed}s`;
         continue;
+      }
+
+      if (job.state === "cancelled") {
+        if (job.text) {
+          offlineResult.innerHTML =
+            `<span class="stable">${escapeHtml(job.text)}</span>`;
+        } else {
+          offlineResult.textContent = "已停止";
+        }
+        offlineStatus.textContent = "已停止";
+        break;
       }
 
       if (job.state === "failed") {
@@ -134,7 +184,32 @@ uploadForm.addEventListener("submit", async (event) => {
     offlineResult.textContent = `失败：${error.message}`;
     offlineStatus.textContent = "";
   } finally {
-    offlineSubmit.disabled = false;
+    resetOfflineState();
+  }
+});
+
+offlineStop.addEventListener("click", async () => {
+  if (!hasOfflineJob()) {
+    return;
+  }
+
+  offlineState.stopRequested = true;
+  updateControlAvailability();
+  offlineStatus.textContent = "停止中...";
+
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(offlineState.jobId)}/cancel`, {
+      method: "POST",
+      body: "",
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error?.message || "停止失败");
+    }
+  } catch (error) {
+    offlineState.stopRequested = false;
+    updateControlAvailability();
+    offlineStatus.textContent = `停止失败：${error.message}`;
   }
 });
 
@@ -209,50 +284,72 @@ async function flushRealtimeChunk(force) {
 }
 
 async function startRealtimeCapture() {
-  const sessionResponse = await fetch("/api/realtime/start", {method: "POST", body: ""});
-  const sessionData = await sessionResponse.json();
-  if (!sessionResponse.ok) {
-    throw new Error(sessionData.error.message);
+  if (hasOfflineJob()) {
+    throw new Error("离线转写进行中，请先停止");
   }
 
   const mediaStream = await navigator.mediaDevices.getUserMedia({audio: true});
-  const audioContext = new AudioContext();
-  const source = audioContext.createMediaStreamSource(mediaStream);
-  const processor = audioContext.createScriptProcessor(4096, 1, 1);
+  const sessionResponse = await fetch("/api/realtime/start", {method: "POST", body: ""});
+  const sessionData = await sessionResponse.json();
+  if (!sessionResponse.ok) {
+    mediaStream.getTracks().forEach((track) => track.stop());
+    throw new Error(sessionData.error.message);
+  }
 
-  realtimeState = {
-    audioContext,
-    source,
-    processor,
-    mediaStream,
-    sessionId: sessionData.session_id,
-    sendTimer: window.setInterval(() => flushRealtimeChunk(false), 800),
-    sending: false,
-    pending: [],
-    sampleRate: audioContext.sampleRate,
-    startedAt: performance.now(),
-  };
+  let audioContext = null;
+  try {
+    audioContext = new AudioContext();
+    const source = audioContext.createMediaStreamSource(mediaStream);
+    const processor = audioContext.createScriptProcessor(4096, 1, 1);
 
-  processor.onaudioprocess = (event) => {
-    const channel = event.inputBuffer.getChannelData(0);
-    const downsampled = downsampleTo16k(channel, realtimeState.sampleRate);
-    const pcm = floatToPcm16(downsampled);
-    realtimeState.pending.push(...pcm);
-  };
+    realtimeState = {
+      audioContext,
+      source,
+      processor,
+      mediaStream,
+      sessionId: sessionData.session_id,
+      sendTimer: window.setInterval(() => flushRealtimeChunk(false), 800),
+      sending: false,
+      pending: [],
+      sampleRate: audioContext.sampleRate,
+      startedAt: performance.now(),
+    };
 
-  source.connect(processor);
-  processor.connect(audioContext.destination);
-  startRealtime.disabled = true;
-  stopRealtime.disabled = false;
-  clearRealtime.style.display = "none";
-  renderTranscript(realtimeResult, null, "实时转写中...");
-  realtimeStatus.textContent = `会话 ${realtimeState.sessionId} 已启动`;
+    processor.onaudioprocess = (event) => {
+      const channel = event.inputBuffer.getChannelData(0);
+      const downsampled = downsampleTo16k(channel, realtimeState.sampleRate);
+      const pcm = floatToPcm16(downsampled);
+      realtimeState.pending.push(...pcm);
+    };
+
+    source.connect(processor);
+    processor.connect(audioContext.destination);
+    updateControlAvailability();
+    clearRealtime.style.display = "none";
+    renderTranscript(realtimeResult, null, "实时转写中...");
+    realtimeStatus.textContent = `会话 ${realtimeState.sessionId} 已启动`;
+  } catch (error) {
+    mediaStream.getTracks().forEach((track) => track.stop());
+    if (audioContext) {
+      await audioContext.close();
+    }
+    try {
+      await fetch(`/api/realtime/stop?session_id=${encodeURIComponent(sessionData.session_id)}`, {
+        method: "POST",
+        body: "",
+      });
+    } catch (_cleanupError) {
+      // Best effort only; the original startup error is more important to surface.
+    }
+    throw error;
+  }
 }
 
 async function stopRealtimeCapture() {
   if (!realtimeState.sessionId) {
     return;
   }
+  const sessionId = realtimeState.sessionId;
   window.clearInterval(realtimeState.sendTimer);
   await flushRealtimeChunk(true);
 
@@ -261,33 +358,34 @@ async function stopRealtimeCapture() {
   realtimeState.mediaStream.getTracks().forEach((track) => track.stop());
   await realtimeState.audioContext.close();
 
-  const response = await fetch(`/api/realtime/stop?session_id=${encodeURIComponent(realtimeState.sessionId)}`, {
-    method: "POST",
-    body: "",
-  });
-  const data = await response.json();
-  if (response.ok && data.text) {
-    renderTranscript(realtimeResult, data, "尚无结果");
-    realtimeStatus.textContent = `会话 ${realtimeState.sessionId} 已停止，终稿已出`;
-  } else {
-    realtimeStatus.textContent = data.error ? data.error.message : "停止失败";
+  try {
+    const response = await fetch(`/api/realtime/stop?session_id=${encodeURIComponent(sessionId)}`, {
+      method: "POST",
+      body: "",
+    });
+    const data = await response.json();
+    if (response.ok && data.text) {
+      renderTranscript(realtimeResult, data, "尚无结果");
+      realtimeStatus.textContent = `会话 ${sessionId} 已停止，终稿已出`;
+    } else {
+      realtimeStatus.textContent = data.error ? data.error.message : "停止失败";
+    }
+  } finally {
+    realtimeState = {
+      audioContext: null,
+      source: null,
+      processor: null,
+      mediaStream: null,
+      sessionId: "",
+      sendTimer: null,
+      sending: false,
+      pending: [],
+      sampleRate: 0,
+      startedAt: 0,
+    };
+    updateControlAvailability();
+    clearRealtime.style.display = "";
   }
-
-  realtimeState = {
-    audioContext: null,
-    source: null,
-    processor: null,
-    mediaStream: null,
-    sessionId: "",
-    sendTimer: null,
-    sending: false,
-    pending: [],
-    sampleRate: 0,
-    startedAt: 0,
-  };
-  startRealtime.disabled = false;
-  stopRealtime.disabled = true;
-  clearRealtime.style.display = "";
 }
 
 startRealtime.addEventListener("click", async () => {
@@ -312,4 +410,5 @@ clearRealtime.addEventListener("click", () => {
   clearRealtime.style.display = "none";
 });
 
+updateControlAvailability();
 checkHealth();

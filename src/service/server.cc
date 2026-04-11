@@ -644,6 +644,7 @@ struct ModelDecodeOptions {
     int stream_max_new_tokens = 32;
     bool use_stream_path = false;
     std::function<void(std::string_view)> token_callback;
+    std::function<bool()> cancel_callback;
 };
 
 void ForwardTokenPiece(const char * piece, void * userdata) {
@@ -652,6 +653,14 @@ void ForwardTokenPiece(const char * piece, void * userdata) {
     }
     auto * callback = static_cast<std::function<void(std::string_view)> *>(userdata);
     (*callback)(piece);
+}
+
+int ForwardCancelRequest(void * userdata) {
+    if (userdata == nullptr) {
+        return 0;
+    }
+    auto * callback = static_cast<std::function<bool()> *>(userdata);
+    return (*callback)() ? 1 : 0;
 }
 
 class SharedAsrModel {
@@ -701,13 +710,19 @@ public:
             return result;
         }
 
-        std::function<void(std::string_view)> callback = decode.token_callback;
-        qwen_set_token_callback(ctx_, callback ? ForwardTokenPiece : nullptr, callback ? &callback : nullptr);
+        std::function<void(std::string_view)> token_callback = decode.token_callback;
+        std::function<bool()> cancel_callback = decode.cancel_callback;
+        qwen_set_token_callback(ctx_, token_callback ? ForwardTokenPiece : nullptr, token_callback ? &token_callback : nullptr);
+        qwen_set_cancel_callback(ctx_, cancel_callback ? ForwardCancelRequest : nullptr, cancel_callback ? &cancel_callback : nullptr);
 
         char * raw = qwen_transcribe(ctx_, audio_path.string().c_str());
+        const bool was_cancelled = qwen_was_cancelled(ctx_) != 0;
+        qwen_set_cancel_callback(ctx_, nullptr, nullptr);
         qwen_set_token_callback(ctx_, nullptr, nullptr);
         if (raw == nullptr) {
-            result.status = Status(StatusCode::kInternal, "transcription failed");
+            result.status = was_cancelled
+                ? Status(StatusCode::kFailedPrecondition, "transcription cancelled")
+                : Status(StatusCode::kInternal, "transcription failed");
             return result;
         }
 
@@ -718,7 +733,9 @@ public:
         result.text_tokens = ctx_->perf_text_tokens;
         result.encode_ms = ctx_->perf_encode_ms;
         result.decode_ms = ctx_->perf_decode_ms;
-        result.status = OkStatus();
+        result.status = was_cancelled
+            ? Status(StatusCode::kFailedPrecondition, "transcription cancelled")
+            : OkStatus();
         return result;
     }
 
@@ -741,15 +758,21 @@ public:
             return result;
         }
 
-        std::function<void(std::string_view)> callback = decode.token_callback;
-        qwen_set_token_callback(ctx_, callback ? ForwardTokenPiece : nullptr, callback ? &callback : nullptr);
+        std::function<void(std::string_view)> token_callback = decode.token_callback;
+        std::function<bool()> cancel_callback = decode.cancel_callback;
+        qwen_set_token_callback(ctx_, token_callback ? ForwardTokenPiece : nullptr, token_callback ? &token_callback : nullptr);
+        qwen_set_cancel_callback(ctx_, cancel_callback ? ForwardCancelRequest : nullptr, cancel_callback ? &cancel_callback : nullptr);
 
         char * raw = decode.use_stream_path
             ? qwen_transcribe_stream(ctx_, samples.data(), static_cast<int>(samples.size()))
             : qwen_transcribe_audio(ctx_, samples.data(), static_cast<int>(samples.size()));
+        const bool was_cancelled = qwen_was_cancelled(ctx_) != 0;
+        qwen_set_cancel_callback(ctx_, nullptr, nullptr);
         qwen_set_token_callback(ctx_, nullptr, nullptr);
         if (raw == nullptr) {
-            result.status = Status(StatusCode::kInternal, decode.use_stream_path ? "stream transcription failed" : "audio transcription failed");
+            result.status = was_cancelled
+                ? Status(StatusCode::kFailedPrecondition, decode.use_stream_path ? "stream transcription cancelled" : "audio transcription cancelled")
+                : Status(StatusCode::kInternal, decode.use_stream_path ? "stream transcription failed" : "audio transcription failed");
             return result;
         }
 
@@ -760,7 +783,9 @@ public:
         result.text_tokens = ctx_->perf_text_tokens;
         result.encode_ms = ctx_->perf_encode_ms;
         result.decode_ms = ctx_->perf_decode_ms;
-        result.status = OkStatus();
+        result.status = was_cancelled
+            ? Status(StatusCode::kFailedPrecondition, decode.use_stream_path ? "stream transcription cancelled" : "audio transcription cancelled")
+            : OkStatus();
         return result;
     }
 
@@ -830,6 +855,8 @@ struct OfflineJob {
     double audio_ms = 0.0;
     std::int32_t tokens = 0;
     std::int32_t token_count = 0;
+    bool cancel_requested = false;
+    std::shared_ptr<std::atomic<bool>> cancel_flag;
     std::int64_t created_at = 0;
     std::int64_t updated_at = 0;
 };
@@ -845,6 +872,7 @@ Json BuildJobJson(const OfflineJob & job) {
     body["audio_ms"] = job.audio_ms;
     body["tokens"] = job.tokens;
     body["token_count"] = job.token_count;
+    body["cancel_requested"] = job.cancel_requested;
     body["created_at"] = job.created_at;
     body["updated_at"] = job.updated_at;
     return body;
@@ -1485,12 +1513,60 @@ int RunServer(const ServerConfig & config) {
     const auto server_start = std::chrono::steady_clock::now();
     ServerMetrics metrics;
     std::atomic<std::uint64_t> session_counter{1};
+    enum class ActiveWorkloadKind {
+        kNone,
+        kOffline,
+        kRealtime,
+        kHostCapture,
+    };
+    struct ActiveWorkload {
+        ActiveWorkloadKind kind = ActiveWorkloadKind::kNone;
+        std::string id;
+    };
     std::unordered_map<std::string, RealtimeSession> realtime_sessions;
     std::mutex realtime_mu;
     std::unordered_map<std::string, OfflineJob> jobs;
     std::mutex jobs_mu;
     std::shared_ptr<HostCaptureSession> host_capture;
     std::mutex host_capture_mu;
+    ActiveWorkload active_workload;
+    std::mutex active_workload_mu;
+
+    auto DescribeActiveWorkload = [](ActiveWorkloadKind kind) -> std::string_view {
+        switch (kind) {
+            case ActiveWorkloadKind::kOffline:
+                return "offline transcription";
+            case ActiveWorkloadKind::kRealtime:
+                return "realtime transcription";
+            case ActiveWorkloadKind::kHostCapture:
+                return "host capture";
+            case ActiveWorkloadKind::kNone:
+            default:
+                return "workload";
+        }
+    };
+    auto TryAcquireActiveWorkload = [&](ActiveWorkloadKind kind, const std::string & id, HttpResponse & response) -> bool {
+        std::lock_guard<std::mutex> lock(active_workload_mu);
+        if (active_workload.kind != ActiveWorkloadKind::kNone) {
+            SetErrorResponse(
+                response,
+                Status(
+                    StatusCode::kFailedPrecondition,
+                    std::string(DescribeActiveWorkload(active_workload.kind)) + " is already active"),
+                409);
+            return false;
+        }
+        active_workload.kind = kind;
+        active_workload.id = id;
+        return true;
+    };
+    auto ReleaseActiveWorkload = [&](ActiveWorkloadKind kind, const std::string & id) {
+        std::lock_guard<std::mutex> lock(active_workload_mu);
+        if (active_workload.kind == kind && active_workload.id == id) {
+            active_workload.kind = ActiveWorkloadKind::kNone;
+            active_workload.id.clear();
+        }
+    };
 
     HttpServer server;
     {
@@ -1611,11 +1687,18 @@ int RunServer(const ServerConfig & config) {
             return;
         }
 
+        const std::string request_id = "offline-" + std::to_string(session_counter.fetch_add(1));
+        if (!TryAcquireActiveWorkload(ActiveWorkloadKind::kOffline, request_id, response)) {
+            CleanupPreparedAudio(&prepared);
+            return;
+        }
+
         ModelDecodeOptions decode;
         decode.prompt = options.prompt;
         decode.language = options.language;
         const AsrRunResult result = model.TranscribeFile(prepared.wav_path, decode);
         CleanupPreparedAudio(&prepared);
+        ReleaseActiveWorkload(ActiveWorkloadKind::kOffline, request_id);
         if (!result.status.ok()) {
             SetErrorResponse(response, result.status, StatusToHttpCode(result.status));
             return;
@@ -1653,25 +1736,46 @@ int RunServer(const ServerConfig & config) {
 
         OfflineJob job;
         job.id = std::to_string(session_counter.fetch_add(1));
+        job.cancel_flag = std::make_shared<std::atomic<bool>>(false);
         job.created_at = CurrentUnixSeconds();
         job.updated_at = job.created_at;
+        if (!TryAcquireActiveWorkload(ActiveWorkloadKind::kOffline, job.id, response)) {
+            CleanupPreparedAudio(&prepared);
+            return;
+        }
         {
             std::lock_guard<std::mutex> lock(jobs_mu);
             jobs.emplace(job.id, job);
         }
 
         const std::string job_id = job.id;
-        std::thread([prepared, options, job_id, &jobs, &jobs_mu, &model]() mutable {
+        const std::shared_ptr<std::atomic<bool>> cancel_flag = job.cancel_flag;
+        std::thread([&, prepared, options, job_id, cancel_flag]() mutable {
+            bool cancel_before_start = false;
             {
                 std::lock_guard<std::mutex> lock(jobs_mu);
                 OfflineJob & current = jobs[job_id];
-                current.state = "running";
                 current.updated_at = CurrentUnixSeconds();
+                if (current.cancel_requested || (cancel_flag && cancel_flag->load())) {
+                    current.state = "cancelled";
+                    cancel_before_start = true;
+                } else {
+                    current.state = "running";
+                }
+            }
+
+            if (cancel_before_start) {
+                CleanupPreparedAudio(&prepared);
+                ReleaseActiveWorkload(ActiveWorkloadKind::kOffline, job_id);
+                return;
             }
 
             ModelDecodeOptions decode;
             decode.prompt = options.prompt;
             decode.language = options.language;
+            decode.cancel_callback = [cancel_flag]() {
+                return cancel_flag && cancel_flag->load();
+            };
             decode.token_callback = [&jobs, &jobs_mu, &job_id](std::string_view piece) {
                 std::lock_guard<std::mutex> lock(jobs_mu);
                 auto it = jobs.find(job_id);
@@ -1685,20 +1789,29 @@ int RunServer(const ServerConfig & config) {
             const AsrRunResult result = model.TranscribeFile(prepared.wav_path, decode);
             CleanupPreparedAudio(&prepared);
 
-            std::lock_guard<std::mutex> lock(jobs_mu);
-            OfflineJob & current = jobs[job_id];
-            current.updated_at = CurrentUnixSeconds();
-            current.language = DetectLanguageLabel(options.language);
-            if (!result.status.ok()) {
-                current.state = "failed";
-                current.error = result.status.message();
-                return;
+            {
+                std::lock_guard<std::mutex> lock(jobs_mu);
+                OfflineJob & current = jobs[job_id];
+                current.updated_at = CurrentUnixSeconds();
+                current.language = DetectLanguageLabel(options.language);
+                current.inference_ms = result.total_ms;
+                current.audio_ms = result.audio_ms;
+                current.tokens = result.text_tokens;
+                if (cancel_flag && cancel_flag->load()) {
+                    current.state = "cancelled";
+                    current.error.clear();
+                    if (!result.text.empty()) {
+                        current.text = result.text;
+                    }
+                } else if (!result.status.ok()) {
+                    current.state = "failed";
+                    current.error = result.status.message();
+                } else {
+                    current.state = "completed";
+                    current.text = result.text;
+                }
             }
-            current.state = "completed";
-            current.text = result.text;
-            current.inference_ms = result.total_ms;
-            current.audio_ms = result.audio_ms;
-            current.tokens = result.text_tokens;
+            ReleaseActiveWorkload(ActiveWorkloadKind::kOffline, job_id);
         }).detach();
 
         response.status = 202;
@@ -1718,6 +1831,38 @@ int RunServer(const ServerConfig & config) {
             return;
         }
         SetJsonResponse(response, BuildJobJson(it->second));
+    });
+
+    server.Post("/api/jobs/:id/cancel", [&](const HttpRequest & request, HttpResponse & response) {
+        const auto path_it = request.path_params.find("id");
+        if (path_it == request.path_params.end()) {
+            SetErrorResponse(response, Status(StatusCode::kInvalidArgument, "job id is required"), 400);
+            return;
+        }
+
+        OfflineJob snapshot;
+        {
+            std::lock_guard<std::mutex> lock(jobs_mu);
+            const auto it = jobs.find(path_it->second);
+            if (it == jobs.end()) {
+                SetErrorResponse(response, Status(StatusCode::kNotFound, "job not found"), 404);
+                return;
+            }
+
+            OfflineJob & job = it->second;
+            if (job.state != "completed" && job.state != "failed" && job.state != "cancelled") {
+                job.cancel_requested = true;
+                job.updated_at = CurrentUnixSeconds();
+                if (job.cancel_flag) {
+                    job.cancel_flag->store(true);
+                }
+                if (job.state == "queued" || job.state == "running") {
+                    job.state = "cancelling";
+                }
+            }
+            snapshot = job;
+        }
+        SetJsonResponse(response, BuildJobJson(snapshot));
     });
 
     server.Post("/v1/audio/transcriptions", [&](const HttpRequest & request, HttpResponse & response) {
@@ -1749,11 +1894,18 @@ int RunServer(const ServerConfig & config) {
             return;
         }
 
+        const std::string request_id = "openai-audio-" + std::to_string(session_counter.fetch_add(1));
+        if (!TryAcquireActiveWorkload(ActiveWorkloadKind::kOffline, request_id, response)) {
+            CleanupPreparedAudio(&prepared);
+            return;
+        }
+
         ModelDecodeOptions decode;
         decode.prompt = options.prompt;
         decode.language = options.language;
         const AsrRunResult result = model.TranscribeFile(prepared.wav_path, decode);
         CleanupPreparedAudio(&prepared);
+        ReleaseActiveWorkload(ActiveWorkloadKind::kOffline, request_id);
         if (!result.status.ok()) {
             SetErrorResponse(response, result.status, StatusToHttpCode(result.status));
             return;
@@ -1791,12 +1943,17 @@ int RunServer(const ServerConfig & config) {
 
         const std::string model_id = options.model.empty() ? served_model_id : options.model;
         const std::string request_id = "chatcmpl-" + std::to_string(session_counter.fetch_add(1));
+        if (!TryAcquireActiveWorkload(ActiveWorkloadKind::kOffline, request_id, response)) {
+            CleanupPreparedAudio(&prepared);
+            return;
+        }
 
         ModelDecodeOptions decode;
         decode.prompt = options.prompt;
         decode.language = options.language;
         const AsrRunResult result = model.TranscribeFile(prepared.wav_path, decode);
         CleanupPreparedAudio(&prepared);
+        ReleaseActiveWorkload(ActiveWorkloadKind::kOffline, request_id);
         if (!result.status.ok()) {
             SetErrorResponse(response, result.status, StatusToHttpCode(result.status));
             return;
@@ -1820,10 +1977,14 @@ int RunServer(const ServerConfig & config) {
     server.Post("/api/realtime/start", [&](const HttpRequest &, HttpResponse & response) {
         RealtimeSession session;
         session.id = std::to_string(session_counter.fetch_add(1));
+        if (!TryAcquireActiveWorkload(ActiveWorkloadKind::kRealtime, session.id, response)) {
+            return;
+        }
         metrics.realtime_sessions_started.fetch_add(1);
         {
             std::lock_guard<std::mutex> lock(realtime_mu);
             if (realtime_sessions.size() >= kMaxRealtimeSessions) {
+                ReleaseActiveWorkload(ActiveWorkloadKind::kRealtime, session.id);
                 SetErrorResponse(response, Status(StatusCode::kFailedPrecondition, "too many realtime sessions"), 429);
                 return;
             }
@@ -1966,6 +2127,7 @@ int RunServer(const ServerConfig & config) {
         }
 
         metrics.realtime_finalizations.fetch_add(1);
+        ReleaseActiveWorkload(ActiveWorkloadKind::kRealtime, session.id);
         Json body = BuildRealtimeJson(session, true, true);
         SetJsonResponse(response, body);
     });
@@ -2028,6 +2190,9 @@ int RunServer(const ServerConfig & config) {
         capture->id = std::to_string(session_counter.fetch_add(1));
         capture->device = device;
         capture->backend = selected_backend;
+        if (!TryAcquireActiveWorkload(ActiveWorkloadKind::kHostCapture, capture->id, response)) {
+            return;
+        }
 
 #if defined(_WIN32)
         const Status spawn_status = SpawnCaptureProcess(argv, &capture->child_process, &capture->read_handle);
@@ -2035,12 +2200,13 @@ int RunServer(const ServerConfig & config) {
         const Status spawn_status = SpawnCaptureProcess(argv, &capture->child_pid, &capture->read_fd);
 #endif
         if (!spawn_status.ok()) {
+            ReleaseActiveWorkload(ActiveWorkloadKind::kHostCapture, capture->id);
             SetErrorResponse(response, spawn_status, StatusToHttpCode(spawn_status));
             return;
         }
         metrics.host_capture_sessions_started.fetch_add(1);
 
-        capture->reader = std::thread([capture, &model, realtime_policy]() {
+        capture->reader = std::thread([capture, &ReleaseActiveWorkload, &model, realtime_policy]() {
             std::vector<char> buffer(6400);
             while (true) {
 #if defined(_WIN32)
@@ -2104,11 +2270,20 @@ int RunServer(const ServerConfig & config) {
                 ApplyRealtimeUpdate(update, result.total_ms, true, capture.get());
             }
 
-            std::lock_guard<std::mutex> lock(capture->mu);
-            capture->active = false;
+            bool stopped_by_request = false;
+            {
+                std::lock_guard<std::mutex> lock(capture->mu);
+                capture->active = false;
+                stopped_by_request = capture->stop_requested;
+            }
+            if (!stopped_by_request) {
+                ReleaseActiveWorkload(ActiveWorkloadKind::kHostCapture, capture->id);
+            }
         });
 
         {
+
+        ReleaseActiveWorkload(ActiveWorkloadKind::kHostCapture, capture->id);
             std::lock_guard<std::mutex> lock(host_capture_mu);
             host_capture = capture;
         }

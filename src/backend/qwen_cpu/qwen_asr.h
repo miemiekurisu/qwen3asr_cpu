@@ -182,6 +182,10 @@ typedef struct {
  * 'piece' is the decoded token string (UTF-8). */
 typedef void (*qwen_token_cb)(const char *piece, void *userdata);
 
+/* Called to decide whether the current transcription should stop early.
+ * Return non-zero to cancel the active run. */
+typedef int (*qwen_cancel_cb)(void *userdata);
+
 /* ========================================================================
  * Main Context
  * ======================================================================== */
@@ -222,6 +226,11 @@ typedef struct {
     /* Token streaming callback (optional) */
     qwen_token_cb token_cb;
     void *token_cb_userdata;
+
+    /* Cooperative cancellation callback (optional) */
+    qwen_cancel_cb cancel_cb;
+    void *cancel_cb_userdata;
+    int last_run_cancelled;
 
     /* Segmentation settings */
     float segment_sec;             /* 0 = no splitting, default full-audio decode */
@@ -288,6 +297,13 @@ void qwen_free(qwen_ctx_t *ctx);
 /* Set a callback to receive each decoded token as it's generated.
  * Set cb=NULL to disable. The callback is invoked during transcription. */
 void qwen_set_token_callback(qwen_ctx_t *ctx, qwen_token_cb cb, void *userdata);
+
+/* Set a callback used to cooperatively cancel an active transcription.
+ * Set cb=NULL to disable. */
+void qwen_set_cancel_callback(qwen_ctx_t *ctx, qwen_cancel_cb cb, void *userdata);
+
+/* Returns non-zero if the most recent transcription exited due to cancellation. */
+int qwen_was_cancelled(const qwen_ctx_t *ctx);
 
 /* Set optional system prompt text (UTF-8). Pass NULL or "" to clear.
  * Returns 0 on success, -1 on allocation/encoding errors. */
