@@ -34,6 +34,30 @@ void qwen_linear(float *y, const float *x, const float *W, const float *b,
 void qwen_linear_nobias(float *y, const float *x, const float *W,
                          int seq_len, int in_dim, int out_dim);
 
+/* Encoder/prefill QKV fusion for float32 weights with per-call packing.
+ * Precondition: qkv_out_scratch[seq_len, q_dim + 2 * kv_dim],
+ * W_qkv_scratch[q_dim + 2 * kv_dim, in_dim],
+ * b_qkv_scratch[q_dim + 2 * kv_dim]. */
+void qwen_linear_qkv_f32(float *q, float *k, float *v,
+                         float *qkv_out_scratch,
+                         float *W_qkv_scratch,
+                         float *b_qkv_scratch,
+                         const float *x,
+                         const float *Wq, const float *Wk, const float *Wv,
+                         const float *bq, const float *bk, const float *bv,
+                         int seq_len, int in_dim, int q_dim, int kv_dim);
+
+            /* Encoder/prefill QKV fusion for pre-packed contiguous float32 weights.
+             * Precondition: qkv_out_scratch[seq_len, q_dim + 2 * kv_dim],
+             * W_qkv_packed[q_dim + 2 * kv_dim, in_dim],
+             * b_qkv_packed[q_dim + 2 * kv_dim]. */
+            void qwen_linear_qkv_f32_packed(float *q, float *k, float *v,
+                                float *qkv_out_scratch,
+                                const float *x,
+                                const float *W_qkv_packed,
+                                const float *b_qkv_packed,
+                                int seq_len, int in_dim, int q_dim, int kv_dim);
+
 /* bf16 weight variants */
 void qwen_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
                       const float *b, int seq_len, int in_dim, int out_dim);

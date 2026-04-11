@@ -394,6 +394,80 @@ void qwen_linear_nobias(float *y, const float *x, const float *W,
     qwen_linear(y, x, W, NULL, seq_len, in_dim, out_dim);
 }
 
+void qwen_linear_qkv_f32(float *q, float *k, float *v,
+                         float *qkv_out_scratch,
+                         float *W_qkv_scratch,
+                         float *b_qkv_scratch,
+                         const float *x,
+                         const float *Wq, const float *Wk, const float *Wv,
+                         const float *bq, const float *bk, const float *bv,
+                         int seq_len, int in_dim, int q_dim, int kv_dim) {
+    if (!q || !k || !v || !qkv_out_scratch || !W_qkv_scratch || !b_qkv_scratch ||
+        !x || !Wq || !Wk || !Wv ||
+        seq_len <= 0 || in_dim <= 0 || q_dim <= 0 || kv_dim <= 0) {
+        return;
+    }
+
+    size_t wq_n = (size_t)q_dim * (size_t)in_dim;
+    size_t wk_n = (size_t)kv_dim * (size_t)in_dim;
+    int total_out = q_dim + 2 * kv_dim;
+
+    memcpy(W_qkv_scratch, Wq, wq_n * sizeof(float));
+    memcpy(W_qkv_scratch + wq_n, Wk, wk_n * sizeof(float));
+    memcpy(W_qkv_scratch + wq_n + wk_n, Wv, wk_n * sizeof(float));
+
+    if (bq) {
+        memcpy(b_qkv_scratch, bq, (size_t)q_dim * sizeof(float));
+    } else {
+        memset(b_qkv_scratch, 0, (size_t)q_dim * sizeof(float));
+    }
+    if (bk) {
+        memcpy(b_qkv_scratch + q_dim, bk, (size_t)kv_dim * sizeof(float));
+    } else {
+        memset(b_qkv_scratch + q_dim, 0, (size_t)kv_dim * sizeof(float));
+    }
+    if (bv) {
+        memcpy(b_qkv_scratch + q_dim + kv_dim, bv, (size_t)kv_dim * sizeof(float));
+    } else {
+        memset(b_qkv_scratch + q_dim + kv_dim, 0, (size_t)kv_dim * sizeof(float));
+    }
+
+    qwen_linear(qkv_out_scratch, x, W_qkv_scratch, b_qkv_scratch,
+                seq_len, in_dim, total_out);
+
+    for (int s = 0; s < seq_len; s++) {
+        const float *row = qkv_out_scratch + (size_t)s * total_out;
+        memcpy(q + (size_t)s * q_dim, row, (size_t)q_dim * sizeof(float));
+        memcpy(k + (size_t)s * kv_dim, row + q_dim, (size_t)kv_dim * sizeof(float));
+        memcpy(v + (size_t)s * kv_dim, row + q_dim + kv_dim, (size_t)kv_dim * sizeof(float));
+    }
+}
+
+void qwen_linear_qkv_f32_packed(float *q, float *k, float *v,
+                                float *qkv_out_scratch,
+                                const float *x,
+                                const float *W_qkv_packed,
+                                const float *b_qkv_packed,
+                                int seq_len, int in_dim, int q_dim, int kv_dim) {
+    if (!q || !k || !v || !qkv_out_scratch || !x || !W_qkv_packed ||
+        !b_qkv_packed || seq_len <= 0 || in_dim <= 0 || q_dim <= 0 || kv_dim <= 0) {
+        return;
+    }
+
+    {
+        int total_out = q_dim + 2 * kv_dim;
+        qwen_linear(qkv_out_scratch, x, W_qkv_packed, b_qkv_packed,
+                    seq_len, in_dim, total_out);
+
+        for (int s = 0; s < seq_len; s++) {
+            const float *row = qkv_out_scratch + (size_t)s * total_out;
+            memcpy(q + (size_t)s * q_dim, row, (size_t)q_dim * sizeof(float));
+            memcpy(k + (size_t)s * kv_dim, row + q_dim, (size_t)kv_dim * sizeof(float));
+            memcpy(v + (size_t)s * kv_dim, row + q_dim + kv_dim, (size_t)kv_dim * sizeof(float));
+        }
+    }
+}
+
 /* Convert bf16 buffer to f32 buffer */
 static void bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
     /*

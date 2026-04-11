@@ -307,9 +307,26 @@ void qwen_free(qwen_ctx_t *ctx) {
     /* Encoder layers (weights are pre-converted f32, all allocated) */
     for (int i = 0; i < ctx->config.enc_layers; i++) {
         qwen_enc_layer_t *l = &ctx->encoder.layers[i];
-        FREE0(l->wq_weight); FREE0(l->wq_bias);
-        FREE0(l->wk_weight); FREE0(l->wk_bias);
-        FREE0(l->wv_weight); FREE0(l->wv_bias);
+        if (l->qkv_weight_packed) {
+            FREE0(l->qkv_weight_packed);
+            l->wq_weight = NULL;
+            l->wk_weight = NULL;
+            l->wv_weight = NULL;
+        } else {
+            FREE0(l->wq_weight);
+            FREE0(l->wk_weight);
+            FREE0(l->wv_weight);
+        }
+        if (l->qkv_bias_packed) {
+            FREE0(l->qkv_bias_packed);
+            l->wq_bias = NULL;
+            l->wk_bias = NULL;
+            l->wv_bias = NULL;
+        } else {
+            FREE0(l->wq_bias);
+            FREE0(l->wk_bias);
+            FREE0(l->wv_bias);
+        }
         FREE0(l->wo_weight); FREE0(l->wo_bias);
         FREE0(l->attn_norm_weight); FREE0(l->attn_norm_bias);
         FREE0(l->fc1_weight); FREE0(l->fc1_bias);

@@ -91,6 +91,8 @@ typedef struct {
     float *wk_bias;            /* [d_model] */
     float *wv_weight;          /* [d_model, d_model] */
     float *wv_bias;            /* [d_model] */
+    float *qkv_weight_packed;  /* [3*d_model, d_model], owned packed QKV block */
+    float *qkv_bias_packed;    /* [3*d_model], owned packed QKV bias block */
     float *wo_weight;          /* [d_model, d_model] */
     float *wo_bias;            /* [d_model] */
 

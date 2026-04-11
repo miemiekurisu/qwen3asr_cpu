@@ -21,6 +21,8 @@
 #include <string.h>
 #include <math.h>
 
+#define QWEN_ENC_QKV_FUSION_MIN_SEQ 8
+
 static int encoder_should_cancel(qwen_ctx_t *ctx) {
     if (ctx && ctx->cancel_cb && ctx->cancel_cb(ctx->cancel_cb_userdata)) {
         ctx->last_run_cancelled = 1;
@@ -70,6 +72,50 @@ static float *load_bf16_as_f32(multi_safetensors_t *ms, const char *name) {
         d[i] = ((uint32_t)bf16[i]) << 16;
 
     return f32;
+}
+
+static int pack_encoder_qkv(qwen_enc_layer_t *layer, int d_model) {
+    size_t weight_stride = (size_t)d_model * (size_t)d_model;
+    size_t bias_stride = (size_t)d_model;
+    float *packed_weights = NULL;
+    float *packed_biases = NULL;
+
+    if (!layer || !layer->wq_weight || !layer->wk_weight || !layer->wv_weight ||
+        !layer->wq_bias || !layer->wk_bias || !layer->wv_bias || d_model <= 0) {
+        return -1;
+    }
+
+    packed_weights = (float *)malloc(weight_stride * 3 * sizeof(float));
+    packed_biases = (float *)malloc(bias_stride * 3 * sizeof(float));
+    if (!packed_weights || !packed_biases) {
+        free(packed_weights);
+        free(packed_biases);
+        return -1;
+    }
+
+    memcpy(packed_weights, layer->wq_weight, weight_stride * sizeof(float));
+    memcpy(packed_weights + weight_stride, layer->wk_weight, weight_stride * sizeof(float));
+    memcpy(packed_weights + weight_stride * 2, layer->wv_weight, weight_stride * sizeof(float));
+    memcpy(packed_biases, layer->wq_bias, bias_stride * sizeof(float));
+    memcpy(packed_biases + bias_stride, layer->wk_bias, bias_stride * sizeof(float));
+    memcpy(packed_biases + bias_stride * 2, layer->wv_bias, bias_stride * sizeof(float));
+
+    free(layer->wq_weight);
+    free(layer->wk_weight);
+    free(layer->wv_weight);
+    free(layer->wq_bias);
+    free(layer->wk_bias);
+    free(layer->wv_bias);
+
+    layer->qkv_weight_packed = packed_weights;
+    layer->qkv_bias_packed = packed_biases;
+    layer->wq_weight = packed_weights;
+    layer->wk_weight = packed_weights + weight_stride;
+    layer->wv_weight = packed_weights + weight_stride * 2;
+    layer->wq_bias = packed_biases;
+    layer->wk_bias = packed_biases + bias_stride;
+    layer->wv_bias = packed_biases + bias_stride * 2;
+    return 0;
 }
 
 int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
@@ -146,6 +192,10 @@ int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
             !l->wv_weight || !l->wo_weight) {
             fprintf(stderr, "encoder: failed to load layer %d weights\n", i);
             return -1;
+        }
+
+        if (pack_encoder_qkv(l, cfg->enc_d_model) != 0 && qwen_verbose >= 1) {
+            fprintf(stderr, "encoder: layer %d using unfused qkv storage\n", i);
         }
 
     }
@@ -342,10 +392,23 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     float *q = (float *)malloc(total_tokens * d_model * sizeof(float));
     float *k = (float *)malloc(total_tokens * d_model * sizeof(float));
     float *v = (float *)malloc(total_tokens * d_model * sizeof(float));
+    float *qkv_out = NULL;
     float *attn_out = (float *)malloc(total_tokens * d_model * sizeof(float));
     float *proj_out = (float *)malloc(total_tokens * d_model * sizeof(float));
     float *ffn_mid = (float *)malloc(total_tokens * ffn_dim * sizeof(float));
     float *ffn_out = (float *)malloc(total_tokens * d_model * sizeof(float));
+    int fused_qkv_dim = d_model * 3;
+    int can_fuse_qkv = 0;
+
+    if (total_tokens >= QWEN_ENC_QKV_FUSION_MIN_SEQ) {
+        qkv_out = (float *)malloc((size_t)total_tokens * fused_qkv_dim * sizeof(float));
+        if (qkv_out) {
+            can_fuse_qkv = 1;
+        } else {
+            free(qkv_out);
+            qkv_out = NULL;
+        }
+    }
 
     float scale = 1.0f / sqrtf((float)head_dim);
 
@@ -364,12 +427,21 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
         qwen_layer_norm(x_norm, x, l->attn_norm_weight, l->attn_norm_bias,
                         total_tokens, d_model, 1e-5f);
 
-        qwen_linear(q, x_norm, l->wq_weight, l->wq_bias,
-                     total_tokens, d_model, d_model);
-        qwen_linear(k, x_norm, l->wk_weight, l->wk_bias,
-                     total_tokens, d_model, d_model);
-        qwen_linear(v, x_norm, l->wv_weight, l->wv_bias,
-                     total_tokens, d_model, d_model);
+        if (can_fuse_qkv && l->qkv_weight_packed && l->qkv_bias_packed) {
+            qwen_linear_qkv_f32_packed(q, k, v,
+                                       qkv_out,
+                                       x_norm,
+                                       l->qkv_weight_packed,
+                                       l->qkv_bias_packed,
+                                       total_tokens, d_model, d_model, d_model);
+        } else {
+            qwen_linear(q, x_norm, l->wq_weight, l->wq_bias,
+                         total_tokens, d_model, d_model);
+            qwen_linear(k, x_norm, l->wk_weight, l->wk_bias,
+                         total_tokens, d_model, d_model);
+            qwen_linear(v, x_norm, l->wv_weight, l->wv_bias,
+                         total_tokens, d_model, d_model);
+        }
 
         qwen_bidirectional_attention(attn_out, q, k, v,
                                       total_tokens, n_heads, head_dim, scale,
@@ -419,6 +491,7 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
 
     /* Clean up */
     free(x); free(x_norm); free(q); free(k); free(v);
+    free(qkv_out);
     free(attn_out); free(proj_out);
     free(ffn_mid); free(ffn_out);
     free(window_starts);

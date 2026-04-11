@@ -120,6 +120,23 @@ if(QASR_ENABLE_CPU_BACKEND)
     endif()
     qasr_configure_blas(qasr_cpu_c)
     target_link_libraries(qasr_core PUBLIC qasr_cpu_c)
+
+    add_executable(qasr_cpu_bench
+        app/qasr_cpu_bench.cc
+    )
+    target_link_libraries(qasr_cpu_bench PRIVATE qasr_cpu_c)
+    target_include_directories(qasr_cpu_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/qwen_cpu)
+
+    if(MSVC)
+        target_compile_options(qasr_cpu_bench PRIVATE /W4 /permissive- /utf-8)
+    else()
+        target_compile_options(qasr_cpu_bench PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+
+    if(QASR_ENABLE_ASAN AND NOT MSVC)
+        target_compile_options(qasr_cpu_bench PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(qasr_cpu_bench PRIVATE -fsanitize=address,undefined)
+    endif()
 endif()
 
 add_executable(qasr_cli
@@ -165,7 +182,7 @@ endif()
 if(QASR_ENABLE_TESTS)
     enable_testing()
 
-    add_executable(qasr_unit_tests
+    set(QASR_UNIT_TEST_SOURCES
         src/cli/options.cc
         src/service/server.cc
         tests/test_main.cc
@@ -195,6 +212,12 @@ if(QASR_ENABLE_TESTS)
         tests/json_test.cc
         tests/http_server_test.cc
     )
+
+    if(QASR_ENABLE_CPU_BACKEND)
+        list(APPEND QASR_UNIT_TEST_SOURCES tests/qwen_cpu_kernels_test.cc)
+    endif()
+
+    add_executable(qasr_unit_tests ${QASR_UNIT_TEST_SOURCES})
 
     target_link_libraries(qasr_unit_tests PRIVATE qasr_core)
     target_include_directories(qasr_unit_tests PRIVATE

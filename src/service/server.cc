@@ -1783,7 +1783,7 @@ int RunServer(const ServerConfig & config) {
                     it->second.text += std::string(piece);
                     // With boundary cleanup, callback fires per-segment with full text.
                     // Estimate token count: ~1.5 bytes/token for CJK, ~4 for Latin.
-                    it->second.token_count += std::max(static_cast<std::int32_t>(piece.size() / 3), std::int32_t{1});
+                    it->second.token_count += (std::max)(static_cast<std::int32_t>(piece.size() / 3), std::int32_t{1});
                 }
             };
             const AsrRunResult result = model.TranscribeFile(prepared.wav_path, decode);

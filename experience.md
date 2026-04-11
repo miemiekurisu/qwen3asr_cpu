@@ -219,6 +219,38 @@ vLLM `qwen3_asr_realtime` buffer 默认 `5s` 才吐一段。
 
 此使前端后续可做“稳定前缀不重绘”。
 
+## 2026-04-11
+
+### 17. Windows/OpenBLAS 先落低风险 encoder QKV 融合
+
+- encoder 自注意 Q/K/V 原为三次独立 F32 线性层
+- 现仅在较长序列时，临时拼成一次 GEMM，再拆回三路输出
+- 不改模型权重所有权，不引入持久重复缓存
+- 若 scratch 申请失败或序列太短，则自动回退旧路径
+
+### 18. Windows 一键构建脚本不得写死本机路径
+
+- 构建脚本须先按仓内相对目录约定检索 OpenBLAS
+- 若当前 shell 未带 MSVC 环境，则用 `vswhere` + `VsDevCmd` 自动补齐
+- configure/build/test 均走 CMake preset，避免脚本复制构建参数
+
+### 19. Windows / SkylakeX 上，QKV 只该做“预打包融合”，不该做“每次临时拼接”
+
+2026-04-11 于 Windows + OpenBLAS + SkylakeX + 16 logical CPUs，实测 `qasr_cpu_bench`：
+
+- 8 线程下，`fused_packed` 相对 `separate`：
+   `seq4 d1024 = 1.43x`，`seq13 d1024 = 1.07x`，`seq52 d1024 = 1.08x`，`seq104 d1024 = 0.93x`，`seq13 d896 = 1.47x`
+- 12 线程下，`fused_packed` 相对 `separate`：
+   `seq4 d1024 = 1.67x`，`seq13 d1024 = 1.15x`，`seq52 d1024 = 1.14x`，`seq104 d1024 = 1.20x`，`seq13 d896 = 1.34x`
+- `fused_copy` 即“每次调用把 Q/K/V 拷成临时连续块再打一发 GEMM”在全部测点都比 `separate` 更慢
+
+故：
+
+- runtime 应保留“加载期预打包 + 运行期单 GEMM”
+- 不应把“每次临时拼接”留在热路径里
+- 线程数 8 与 12 皆可用，但最优值会随 shape 变，不可假设 12 恒优
+
+
 ### 17. decode cadence 不宜随包即跑
 
 原先每来一包即整段重解，浪费甚大。
