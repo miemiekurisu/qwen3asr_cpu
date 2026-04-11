@@ -118,6 +118,7 @@ RealtimeTextUpdate BuildRealtimeTextUpdate(
         update.partial_text = std::string(latest_text.substr(state.stable_text.size()));
         update.text = state.stable_text + update.partial_text;
     } else {
+        update.stable_text.clear();
         update.partial_text = std::string(latest_text);
         update.text = std::string(latest_text);
     }

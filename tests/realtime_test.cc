@@ -98,6 +98,21 @@ QASR_TEST(AdvanceRealtimeTextStateForceFreezesAgedTail) {
     QASR_EXPECT(update.text.size() >= update.stable_text.size());
 }
 
+QASR_TEST(AdvanceRealtimeTextStateDivergentClearsStable) {
+    const qasr::RealtimePolicyConfig config;
+    qasr::RealtimeTextState state;
+    qasr::RealtimeTextUpdate update;
+
+    QASR_EXPECT(qasr::AdvanceRealtimeTextState(config, 16000U, "hello wor", false, &state, &update).ok());
+    QASR_EXPECT(qasr::AdvanceRealtimeTextState(config, 32000U, "hello world ", false, &state, &update).ok());
+    QASR_EXPECT_EQ(update.stable_text, std::string("hello "));
+
+    QASR_EXPECT(qasr::AdvanceRealtimeTextState(config, 48000U, "hola mundo", false, &state, &update).ok());
+    QASR_EXPECT_EQ(update.stable_text, std::string());
+    QASR_EXPECT_EQ(update.partial_text, std::string("hola mundo"));
+    QASR_EXPECT_EQ(update.text, std::string("hola mundo"));
+}
+
 QASR_TEST(AdvanceRealtimeTextStateRejectsNullOutputs) {
     const qasr::RealtimePolicyConfig config;
     qasr::RealtimeTextState state;
