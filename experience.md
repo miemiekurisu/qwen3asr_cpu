@@ -468,3 +468,44 @@ amd64 Docker/OpenBLAS 验收卡在 apt：
 - encoder/decoder `.cc` 实现为 stub（返回零值或 EOS），待接入 C 后端真正的权重加载和推理
 - tokenizer 的 BPE 编码实现为简化版（逐字符匹配），待接真正的 merge 优先级算法
 - 所有模块遵循开发手册：Pre/Post/Thread-safe 契约注释、RAII 资源管理、Status 错误传播
+
+## 2026-04-11
+
+### Enhancement 方案落地（QKV 融合 + 多线程 BF16→F32 转换）
+
+基于 enhancement.md 的分析，实施了两项 CPU prefill 优化：
+
+1. **Prefill QKV 投影融合**
+   - 原来每层 prefill 分三次调用 `qwen_linear_nobias_bf16`（wq/wk/wv），即三次 BF16→F32 转换 + 三次 cblas_sgemm
+   - 新增 `qwen_linear_nobias_bf16_qkv_prefill()`：一次转换到连续 F32 缓冲区（[4096, 2048]），一次 cblas_sgemm，再拆分输出
+   - decode 路径（seq=1）不受影响，仍走 `qwen_linear_nobias_bf16_qkv` 的 BF16 NEON matvec
+
+2. **多线程 BF16→F32 转换**
+   - 发现 `bf16_to_f32_buf` 原为单线程 —— 对 gate_up_fused（25M 值）单次~1.5ms，28 层累计 ~140ms，占 prefill 的 ~55%
+   - 新增 `bf16_to_f32_buf_threaded()`（复用现有 pthread pool 的 parallel_for）
+   - QKV 融合路径用自定义 `qkv_cvt_worker` 单次 parallel_for 完成三段权重转换（避免三次 thread dispatch 开销）
+   - `bf16_get_f32_view` 也改用多线程路径（影响 wo/gate_up/down 投影）
+
+#### 基准数据（long_test.wav, 864 chunks, M3 Pro）
+
+| 指标 | 原始 | 优化后 | 变化 |
+|:-----|:-----|:-------|:-----|
+| Prefill avg | 263.6 ms | 208.6 ms | **−20.9%** |
+| Decode avg | 22.2 ms/tok | 22.4 ms/tok | ~0%（噪声） |
+| 总推理时间 | ~917 ms/chunk | ~861 ms/chunk | **−6.1%** |
+
+#### 关键经验
+
+- **enhancement.md 方向正确但实现优先级不同**：文档首推 QKV fusion，实测单独收益仅 ~3.5%，真正大头是多线程 BF16→F32 转换（~17%）。一个结构性优化（减 BLAS 调用）不如一个执行级优化（消除单线程瓶颈）
+- **Apple Accelerate BLAS 自管线程**：BLAS sgemm 用 GCD 自行并行，不用我们的 pthread pool。转换和 BLAS 是顺序关系，不会线程竞争
+- **转换阈值**：小于 65536 个值时走单线程，避免 thread dispatch 开销（~40μs）超过计算本身
+- **内存 layout 注意**：fused QKV 转换的 worker 须正确映射"逻辑偏移 → 三段不连续 BF16 源"，原始实现有指针负偏移 UB，已修正为 local_pos 计算
+- **识别准确率不变**：short_test.wav 和 long_test.wav 转录结果与优化前一致
+
+#### 未实施项目及原因
+
+| 方案 | 结论 | 理由 |
+|:-----|:-----|:-----|
+| 持久化 F32 权重缓存 | 延后 | +5.5GB 内存，且多线程转换已将转换开销压至 ~30ms（原 ~140ms） |
+| Shape-aware dispatch | 延后 | 实测 delta_prefill 最小为 32，BLAS+AMX 在此规模仍优于 per-token matvec |
+| vDSP 向量算子替换 | 延后 | RMSNorm/RoPE 等非瓶颈，优先级低 |
