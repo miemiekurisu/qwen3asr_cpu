@@ -21,6 +21,13 @@ qwen_enc_qkv_impl_t qwen_select_encoder_qkv_impl(qwen_enc_qkv_policy_t policy,
 const char *qwen_encoder_qkv_policy_name(qwen_enc_qkv_policy_t policy);
 const char *qwen_encoder_qkv_impl_name(qwen_enc_qkv_impl_t impl);
 
+int qwen_get_prefill_threads(void);
+int qwen_get_decode_threads(void);
+void qwen_set_thread_policy_override(int prefill_threads, int decode_threads);
+void qwen_clear_thread_policy_override(void);
+void qwen_apply_prefill_thread_policy(void);
+void qwen_apply_decode_thread_policy(void);
+
 int qwen_x86_cpu_supports_avx2_fma(void);
 
 #endif /* QWEN_ASR_PERF_H */

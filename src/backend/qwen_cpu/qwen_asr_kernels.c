@@ -162,6 +162,8 @@ void qwen_set_threads(int n) {
 
     tp_init_once();
 
+    if (tp.n_threads == n) return;
+
     /* Shutdown existing workers */
     if (tp.n_threads > 1) {
         EnterCriticalSection(&tp.mutex);
@@ -186,6 +188,11 @@ void qwen_set_threads(int n) {
 
     if (qwen_verbose >= 2)
         fprintf(stderr, "Thread pool: %d threads\n", n);
+}
+
+int qwen_get_threads(void) {
+    tp_init_once();
+    return tp.n_threads;
 }
 
 int qwen_get_num_cpus(void) {
@@ -276,6 +283,8 @@ void qwen_set_threads(int n) {
     if (n < 1) n = 1;
     if (n > QWEN_MAX_THREADS) n = QWEN_MAX_THREADS;
 
+    if (tp.n_threads == n) return;
+
     /* Shutdown existing workers */
     if (tp.n_threads > 1) {
         pthread_mutex_lock(&tp.mutex);
@@ -298,6 +307,10 @@ void qwen_set_threads(int n) {
 
     if (qwen_verbose >= 2)
         fprintf(stderr, "Thread pool: %d threads\n", n);
+}
+
+int qwen_get_threads(void) {
+    return tp.n_threads;
 }
 
 int qwen_get_num_cpus(void) {

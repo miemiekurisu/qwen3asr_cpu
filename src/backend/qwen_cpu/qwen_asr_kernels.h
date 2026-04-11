@@ -197,6 +197,9 @@ int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
  * Creates a persistent thread pool. Call before inference. */
 void qwen_set_threads(int n);
 
+/* Get current thread pool size */
+int qwen_get_threads(void);
+
 /* Get number of available CPU cores */
 int qwen_get_num_cpus(void);
 

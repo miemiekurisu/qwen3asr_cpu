@@ -441,17 +441,20 @@ QASR_TEST(QwenLinearQkvF32PackedZeroSequenceLeavesOutputsUntouched) {
     QASR_EXPECT(std::fabs(v[0] - 7.0f) < 1e-6f);
 }
 
-QASR_TEST(QwenEncoderQkvPolicyBestKeepsCurrentProductionPath) {
+QASR_TEST(QwenEncoderQkvPolicyBestUsesPackedFromSeq4) {
+    qwen_set_thread_policy_override(8, 8);
     const qwen_enc_qkv_impl_t below_threshold = qwen_select_encoder_qkv_impl(
-        QWEN_ENC_QKV_POLICY_BEST, 4, 1024, 1);
+        QWEN_ENC_QKV_POLICY_BEST, 3, 1024, 1);
     const qwen_enc_qkv_impl_t normal_prefill = qwen_select_encoder_qkv_impl(
-        QWEN_ENC_QKV_POLICY_BEST, 13, 1024, 1);
+        QWEN_ENC_QKV_POLICY_BEST, 4, 1024, 1);
 
     QASR_EXPECT_EQ(below_threshold, QWEN_ENC_QKV_IMPL_SEPARATE);
     QASR_EXPECT_EQ(normal_prefill, QWEN_ENC_QKV_IMPL_PACKED);
+    qwen_clear_thread_policy_override();
 }
 
 QASR_TEST(QwenEncoderQkvPolicyShapeAutoFallsBackOnLargeWideShapes) {
+    qwen_set_thread_policy_override(8, 8);
     const qwen_enc_qkv_impl_t large_wide = qwen_select_encoder_qkv_impl(
         QWEN_ENC_QKV_POLICY_SHAPE_AUTO, 104, 1024, 1);
     const qwen_enc_qkv_impl_t medium = qwen_select_encoder_qkv_impl(
@@ -462,6 +465,19 @@ QASR_TEST(QwenEncoderQkvPolicyShapeAutoFallsBackOnLargeWideShapes) {
     QASR_EXPECT_EQ(large_wide, QWEN_ENC_QKV_IMPL_SEPARATE);
     QASR_EXPECT_EQ(medium, QWEN_ENC_QKV_IMPL_PACKED);
     QASR_EXPECT_EQ(no_packed, QWEN_ENC_QKV_IMPL_SEPARATE);
+    qwen_clear_thread_policy_override();
+}
+
+QASR_TEST(QwenEncoderQkvPolicyShapeAutoKeepsPackedOnHighPrefillThreads) {
+    qwen_set_thread_policy_override(12, 8);
+    const qwen_enc_qkv_impl_t large_wide = qwen_select_encoder_qkv_impl(
+        QWEN_ENC_QKV_POLICY_SHAPE_AUTO, 104, 1024, 1);
+    const qwen_enc_qkv_impl_t medium = qwen_select_encoder_qkv_impl(
+        QWEN_ENC_QKV_POLICY_SHAPE_AUTO, 52, 1024, 1);
+
+    QASR_EXPECT_EQ(large_wide, QWEN_ENC_QKV_IMPL_PACKED);
+    QASR_EXPECT_EQ(medium, QWEN_ENC_QKV_IMPL_PACKED);
+    qwen_clear_thread_policy_override();
 }
 
 QASR_TEST(QwenLinearBf16MatchesReferenceForSingleToken) {

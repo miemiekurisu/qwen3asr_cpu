@@ -269,7 +269,7 @@ Windows + OpenBLAS + SkylakeX + 16 logical CPUs，`qasr_cpu_bench` 实测：
 - 已新增独立策略模块 `qwen_asr_perf.{h,c}`，把实验策略与 runtime CPU 特征检测从 encoder / kernels 主体里拆开，便于整体回退。
 - encoder QKV 现支持四种策略名：`best` / `force_separate` / `force_packed` / `shape_auto`。
 - 当前**生产默认**仍是 `best`：
-   - `seq < 8` 走 `separate`
+   - `seq < 4` 走 `separate`
    - 其余已验证 shape 继续走 `packed`
 - `shape_auto` 目前仅保留为**显式实验策略**，通过 `QWEN_ENC_QKV_POLICY=shape_auto` 启用；未改成默认，原因是它在大 shape 上有收益，但在部分中小 shape 上还不够稳定。
 - x86 decode 热核已从“编译期宏碰运气”改成“独立 AVX2 源文件 + runtime CPUID 选择”：
@@ -302,6 +302,16 @@ Windows + OpenBLAS + SkylakeX + 16 logical CPUs，`qasr_cpu_bench` 实测：
 - 因此当前判断应保持保守：
    - **decoder runtime AVX2 dispatch：成立，已纳入默认路径**
    - **encoder `shape_auto`：方向成立，但只保留为实验开关，不直接替换生产默认**
+- 进一步把本轮新增方向的结论写死如下：
+   - **encoder packed QKV 默认门槛下调到 `seq>=4`：成立，已纳入默认路径**
+   - 理由：在本轮 `qasr_cpu_bench` 中，`seq4 d1024` 的 `fused_packed` 在 `8` / `12` 线程都稳定快于 `separate`
+   - 实测点：`seq4 d1024 @8` 为 `0.447ms vs 0.517ms`，`@12` 为 `0.383ms vs 0.569ms`
+   - **prefill/decode split thread policy：不成立为生产默认**
+   - 理由：在 `--threads 12` 下，`decode_threads=1` 与 `decode_threads=4` 都明显慢于 `decode_threads=12`；当前机器上 decoder 单 token 仍然受益于较高线程数
+   - 实测点：`dec_decode_qkv_h2048` 为 `0.541ms @12`，`0.861ms @4`，`2.744ms @1`；`dec_decode_gate_up_h2048_i6144` 为 `1.943ms @12`，`2.696ms @4`，`8.503ms @1`
+   - **decoder persistent packed F32 cache：不成立为生产默认**
+   - 理由：decoder prefill QKV / gate-up 的 packed F32 microbench 虽有约 `1.4x` 到 `1.9x` 提升，但单层额外 cache 已达 `16MB` / `32MB` / `24MB` / `96MB` 量级，累计到多层后内存代价不可接受
+   - 实测点：`dec_prefill_qkv_seq64_h2048` 为 `6.072ms -> 3.564ms`，但单层 cache `32MB`；`dec_gate_up_seq64_h2048_i6144` 为 `18.530ms -> 10.201ms`，但单层 cache `96MB`
 - 硬性约束“不可降低准确率”本轮通过新增 BF16 参考测试守住：
    - `qwen_linear_bf16(seq=1)` 与 reference 对齐
    - `qwen_argmax_matvec_bf16` 与 reference 对齐
@@ -319,12 +329,14 @@ Apple 旧实验仍保留一条参考：
 - `[已验证]` 8 / 12 线程对比：线程最优值依赖 shape，且“相对 speedup”与“绝对时延”可能给出相反结论。
 - `[已验证]` x86 decode 热核 runtime AVX2 dispatch：成立；Windows/OpenBLAS bench 已实测落到 `runtime_kernel_backend=avx2`。
 - `[试验中]` encoder `shape_auto`：已做成显式策略开关，`seq104 d1024` 有收益，但尚未达到可替换默认策略的证据标准。
+- `[已验证]` encoder packed QKV 默认门槛下调到 `seq>=4`：成立；`seq4 d1024` 在 8 / 12 线程都稳定优于 `separate`，已并入默认路径。
 - `[已确认现状]` decoder prefill QKV 原本就已 fused，不应重复投入同一路优化。
 - `[已确认现状]` decoder gate/up 原本就已 fused，不应重复投入同一路优化。
 - `[已确认现状]` 当前 BF16 cache 只是 F32 view/cache，不等于真正后端友好的 packed weight cache。
 - `[部分补齐]` x86 runtime dispatch：AVX2+FMA 热核已 runtime 化，但 `qwen_asr_kernels.c` 中仍有不少 AVX 分支停留在编译期宏，后续若继续做 full ISA dispatch，需要继续拆源文件。
 - `[已确认缺口]` 当前只做 `seq==1` 与 `seq>1` 分流，尚无 `small / medium / large` shape-aware dispatch。
-- `[已延后]` decoder 侧持久 packed weight cache：方向成立，但需先权衡内存占用后再做。
+- `[已证伪为默认方案]` prefill/decode split thread policy：本机 12 线程下 decoder 降线程明显变慢，不作为生产默认。
+- `[已证伪为默认方案]` decoder 侧持久 packed weight cache：microbench 有收益，但额外 cache 内存不可接受，不进入默认路径。
 - `[已延后]` OpenBLAS BF16 API 实验：可跟踪，但在 packed weight 与 shape dispatch 之前优先级不高。
 
 重复提醒：VS Code 的 CMake Tools 在当前环境下仍可能因未注入完整 MSVC 标准库环境而报 `stddef.h` / `cstdint` / `functional` 缺失；Windows 真正验证请优先走 `tools/build_windows_openblas.cmd` / `.ps1`。

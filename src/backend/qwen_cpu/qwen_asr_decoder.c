@@ -272,6 +272,8 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
     int q_dim = n_heads * head_dim;
     int kv_dim = n_kv_heads * head_dim;
 
+    qwen_apply_prefill_thread_policy();
+
     /* Ensure KV cache */
     if (!ctx->kv_cache_k) {
         if (kv_cache_init(ctx, seq_len + 1024) != 0) return;
@@ -399,6 +401,8 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
     float theta = cfg->dec_rope_theta;
     int q_dim = n_heads * head_dim;
     int kv_dim = n_kv_heads * head_dim;
+
+    qwen_apply_decode_thread_policy();
 
     ensure_dec_buffers(ctx);
     float *x = ctx->dec_x;

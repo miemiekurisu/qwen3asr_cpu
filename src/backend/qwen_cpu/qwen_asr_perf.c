@@ -4,27 +4,46 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(USE_OPENBLAS)
+#include <cblas.h>
+#endif
+
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
 #endif
 
-#define QWEN_ENC_QKV_PACK_MIN_SEQ_DEFAULT 8
-#define QWEN_ENC_QKV_SHAPE_AUTO_FALLBACK_SEQ_DEFAULT 96
-#define QWEN_ENC_QKV_SHAPE_AUTO_FALLBACK_DMODEL_DEFAULT 1024
+#define QWEN_ENC_QKV_PACK_MIN_SEQ_DEFAULT 4
+#define QWEN_ENC_QKV_SHAPE_AUTO_LARGE_SEQ_DEFAULT 96
+#define QWEN_ENC_QKV_SHAPE_AUTO_LARGE_DMODEL_DEFAULT 1024
+#define QWEN_ENC_QKV_SHAPE_AUTO_MAX_SEPARATE_THREADS_DEFAULT 8
+
+void qwen_set_threads(int n);
+int qwen_get_num_cpus(void);
+int qwen_get_threads(void);
 
 typedef struct {
     qwen_enc_qkv_policy_t policy;
     int pack_min_seq;
-    int shape_auto_fallback_seq;
-    int shape_auto_fallback_d_model;
+    int shape_auto_large_seq;
+    int shape_auto_large_d_model;
+    int shape_auto_max_separate_threads;
+    int prefill_threads;
+    int decode_threads;
+    int override_prefill_threads;
+    int override_decode_threads;
     int initialized;
 } qwen_enc_qkv_policy_config_t;
 
 static qwen_enc_qkv_policy_config_t g_qkv_policy_config = {
     QWEN_ENC_QKV_POLICY_BEST,
     QWEN_ENC_QKV_PACK_MIN_SEQ_DEFAULT,
-    QWEN_ENC_QKV_SHAPE_AUTO_FALLBACK_SEQ_DEFAULT,
-    QWEN_ENC_QKV_SHAPE_AUTO_FALLBACK_DMODEL_DEFAULT,
+    QWEN_ENC_QKV_SHAPE_AUTO_LARGE_SEQ_DEFAULT,
+    QWEN_ENC_QKV_SHAPE_AUTO_LARGE_DMODEL_DEFAULT,
+    QWEN_ENC_QKV_SHAPE_AUTO_MAX_SEPARATE_THREADS_DEFAULT,
+    0,
+    0,
+    0,
+    0,
     0,
 };
 
@@ -82,13 +101,94 @@ static void ensure_qkv_policy_config(void) {
     g_qkv_policy_config.policy = parse_policy_env(getenv("QWEN_ENC_QKV_POLICY"));
     g_qkv_policy_config.pack_min_seq = parse_positive_env(
         "QWEN_ENC_QKV_PACK_MIN_SEQ", QWEN_ENC_QKV_PACK_MIN_SEQ_DEFAULT);
-    g_qkv_policy_config.shape_auto_fallback_seq = parse_positive_env(
-        "QWEN_ENC_QKV_SHAPE_AUTO_FALLBACK_SEQ",
-        QWEN_ENC_QKV_SHAPE_AUTO_FALLBACK_SEQ_DEFAULT);
-    g_qkv_policy_config.shape_auto_fallback_d_model = parse_positive_env(
-        "QWEN_ENC_QKV_SHAPE_AUTO_FALLBACK_DMODEL",
-        QWEN_ENC_QKV_SHAPE_AUTO_FALLBACK_DMODEL_DEFAULT);
+    g_qkv_policy_config.shape_auto_large_seq = parse_positive_env(
+        "QWEN_ENC_QKV_SHAPE_AUTO_LARGE_SEQ",
+        QWEN_ENC_QKV_SHAPE_AUTO_LARGE_SEQ_DEFAULT);
+    g_qkv_policy_config.shape_auto_large_d_model = parse_positive_env(
+        "QWEN_ENC_QKV_SHAPE_AUTO_LARGE_DMODEL",
+        QWEN_ENC_QKV_SHAPE_AUTO_LARGE_DMODEL_DEFAULT);
+    g_qkv_policy_config.shape_auto_max_separate_threads = parse_positive_env(
+        "QWEN_ENC_QKV_SHAPE_AUTO_MAX_SEPARATE_THREADS",
+        QWEN_ENC_QKV_SHAPE_AUTO_MAX_SEPARATE_THREADS_DEFAULT);
+    g_qkv_policy_config.prefill_threads = parse_positive_env(
+        "QWEN_PREFILL_THREADS", 0);
+    g_qkv_policy_config.decode_threads = parse_positive_env(
+        "QWEN_DECODE_THREADS", 0);
     g_qkv_policy_config.initialized = 1;
+}
+
+static int clamp_threads(int threads) {
+    int max_threads = qwen_get_num_cpus();
+    if (threads <= 0) {
+        return 0;
+    }
+    if (threads > max_threads) {
+        return max_threads;
+    }
+    return threads;
+}
+
+int qwen_get_prefill_threads(void) {
+    ensure_qkv_policy_config();
+
+    if (g_qkv_policy_config.override_prefill_threads > 0) {
+        return clamp_threads(g_qkv_policy_config.override_prefill_threads);
+    }
+    if (g_qkv_policy_config.prefill_threads > 0) {
+        return clamp_threads(g_qkv_policy_config.prefill_threads);
+    }
+#if defined(USE_OPENBLAS)
+    {
+        int openblas_threads = openblas_get_num_threads();
+        if (openblas_threads > 0) {
+            return clamp_threads(openblas_threads);
+        }
+    }
+#endif
+    return clamp_threads(qwen_get_threads());
+}
+
+int qwen_get_decode_threads(void) {
+    ensure_qkv_policy_config();
+
+    if (g_qkv_policy_config.override_decode_threads > 0) {
+        return clamp_threads(g_qkv_policy_config.override_decode_threads);
+    }
+    if (g_qkv_policy_config.decode_threads > 0) {
+        return clamp_threads(g_qkv_policy_config.decode_threads);
+    }
+    return clamp_threads(qwen_get_threads());
+}
+
+void qwen_set_thread_policy_override(int prefill_threads, int decode_threads) {
+    ensure_qkv_policy_config();
+    g_qkv_policy_config.override_prefill_threads = clamp_threads(prefill_threads);
+    g_qkv_policy_config.override_decode_threads = clamp_threads(decode_threads);
+}
+
+void qwen_clear_thread_policy_override(void) {
+    ensure_qkv_policy_config();
+    g_qkv_policy_config.override_prefill_threads = 0;
+    g_qkv_policy_config.override_decode_threads = 0;
+}
+
+void qwen_apply_prefill_thread_policy(void) {
+    int prefill_threads = qwen_get_prefill_threads();
+    if (prefill_threads > 0) {
+        qwen_set_threads(prefill_threads);
+    }
+#if defined(USE_OPENBLAS)
+    if (prefill_threads > 0 && openblas_get_num_threads() != prefill_threads) {
+        openblas_set_num_threads(prefill_threads);
+    }
+#endif
+}
+
+void qwen_apply_decode_thread_policy(void) {
+    int decode_threads = qwen_get_decode_threads();
+    if (decode_threads > 0) {
+        qwen_set_threads(decode_threads);
+    }
 }
 
 qwen_enc_qkv_policy_t qwen_get_encoder_qkv_policy(void) {
@@ -100,7 +200,10 @@ qwen_enc_qkv_impl_t qwen_select_encoder_qkv_impl(qwen_enc_qkv_policy_t policy,
                                                  int seq_len,
                                                  int d_model,
                                                  int has_packed_weights) {
+    int prefill_threads = 0;
+
     ensure_qkv_policy_config();
+    prefill_threads = qwen_get_prefill_threads();
 
     if (!has_packed_weights || seq_len < g_qkv_policy_config.pack_min_seq) {
         return QWEN_ENC_QKV_IMPL_SEPARATE;
@@ -112,8 +215,10 @@ qwen_enc_qkv_impl_t qwen_select_encoder_qkv_impl(qwen_enc_qkv_policy_t policy,
     case QWEN_ENC_QKV_POLICY_FORCE_PACKED:
         return QWEN_ENC_QKV_IMPL_PACKED;
     case QWEN_ENC_QKV_POLICY_SHAPE_AUTO:
-        if (seq_len >= g_qkv_policy_config.shape_auto_fallback_seq &&
-            d_model >= g_qkv_policy_config.shape_auto_fallback_d_model) {
+        if (seq_len >= g_qkv_policy_config.shape_auto_large_seq &&
+            d_model >= g_qkv_policy_config.shape_auto_large_d_model &&
+            prefill_threads > 0 &&
+            prefill_threads <= g_qkv_policy_config.shape_auto_max_separate_threads) {
             return QWEN_ENC_QKV_IMPL_SEPARATE;
         }
         return QWEN_ENC_QKV_IMPL_PACKED;

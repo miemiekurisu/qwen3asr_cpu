@@ -238,6 +238,8 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     int chunk_size = cfg->enc_chunk_size;          /* 100 */
     int n_window_infer = cfg->enc_n_window_infer;  /* 800 */
 
+    qwen_apply_prefill_thread_policy();
+
 
     /* ---- Per-chunk Conv2D stem ---- */
     /* mel: [128, mel_frames] (already in Conv2D-friendly layout)
