@@ -1598,6 +1598,8 @@ void StopHostCaptureSession(const std::shared_ptr<HostCaptureSession> & capture)
     }
     if (worker) {
         JoinRealtimeLiveWorker(worker);
+        std::lock_guard<std::mutex> lock(capture->mu);
+        capture->live_worker.reset();
     }
 }
 
@@ -2432,6 +2434,7 @@ int RunServer(const ServerConfig & config) {
 
         {
             std::lock_guard<std::mutex> lock(session->mu);
+            session->live_worker.reset();
             session->finalized = true;
         }
         metrics.realtime_finalizations.fetch_add(1);

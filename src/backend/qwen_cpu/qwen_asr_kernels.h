@@ -223,6 +223,13 @@ int qwen_get_threads(void);
 /* Get number of available CPU cores */
 int qwen_get_num_cpus(void);
 
+/* Background thread mode for encoder/decoder overlap.
+ * When enabled on a thread, parallel_for runs inline and
+ * qwen_set_threads becomes a no-op, so the bg encoder uses only
+ * OpenBLAS while the main decoder thread keeps the custom pool. */
+void qwen_set_bg_thread_mode(int enable);
+int  qwen_is_bg_thread(void);
+
 /* Returns the selected runtime backend for the decoder hot kernels. */
 const char *qwen_get_runtime_kernel_backend_name(void);
 

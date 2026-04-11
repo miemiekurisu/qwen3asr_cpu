@@ -101,6 +101,20 @@ const char *qwen_get_runtime_kernel_backend_name(void) {
 
 typedef void (*parallel_fn_t)(int tid, int n_threads, void *arg);
 
+/* Background thread mode: when set for a thread, parallel_for runs inline
+ * and qwen_set_threads becomes a no-op.  This allows the background encoder
+ * thread to coexist safely with the main thread's pool — the bg thread
+ * uses only OpenBLAS (its own internal pool) while the main decoder uses
+ * only the custom parallel_for pool, avoiding contention on either. */
+#ifdef _WIN32
+static __declspec(thread) int tl_bg_thread = 0;
+#else
+static __thread int tl_bg_thread = 0;
+#endif
+
+void qwen_set_bg_thread_mode(int enable) { tl_bg_thread = enable; }
+int  qwen_is_bg_thread(void)             { return tl_bg_thread; }
+
 #ifdef _WIN32
 
 static struct {
@@ -157,6 +171,7 @@ static DWORD WINAPI worker_loop(LPVOID arg) {
 }
 
 void qwen_set_threads(int n) {
+    if (tl_bg_thread) return;  /* bg thread must not touch the global pool */
     if (n < 1) n = 1;
     if (n > QWEN_MAX_THREADS) n = QWEN_MAX_THREADS;
 
@@ -204,7 +219,7 @@ int qwen_get_num_cpus(void) {
 
 /* Dispatch work to all threads; main thread is tid=0 */
 static void parallel_for(parallel_fn_t fn, void *arg) {
-    if (tp.n_threads <= 1) {
+    if (tl_bg_thread || tp.n_threads <= 1) {
         fn(0, 1, arg);
         return;
     }
@@ -280,6 +295,7 @@ static void *worker_loop(void *arg) {
 }
 
 void qwen_set_threads(int n) {
+    if (tl_bg_thread) return;  /* bg thread must not touch the global pool */
     if (n < 1) n = 1;
     if (n > QWEN_MAX_THREADS) n = QWEN_MAX_THREADS;
 
@@ -327,7 +343,7 @@ int qwen_get_num_cpus(void) {
 
 /* Dispatch work to all threads; main thread is tid=0 */
 static void parallel_for(parallel_fn_t fn, void *arg) {
-    if (tp.n_threads <= 1) {
+    if (tl_bg_thread || tp.n_threads <= 1) {
         fn(0, 1, arg);
         return;
     }

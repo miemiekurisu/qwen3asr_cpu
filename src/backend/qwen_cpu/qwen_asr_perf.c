@@ -466,6 +466,10 @@ void qwen_clear_thread_policy_override(void) {
 }
 
 void qwen_apply_prefill_thread_policy(void) {
+    /* Background encoder thread manages its own threading via TLS;
+     * skip global pool / OpenBLAS modifications to avoid races. */
+    if (qwen_is_bg_thread()) return;
+
     int prefill_threads = qwen_get_prefill_threads();
     if (prefill_threads > 0) {
         qwen_set_threads(prefill_threads);

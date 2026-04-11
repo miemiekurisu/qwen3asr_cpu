@@ -1450,6 +1450,7 @@ typedef struct {
     /* Control flags */
     int has_work;                /* 1 = new work submitted */
     int has_result;              /* 1 = result available for collection */
+    int is_busy;                 /* 1 = worker is encoding */
     int stop;                    /* 1 = thread should exit */
 
 #ifdef _WIN32
@@ -1470,6 +1471,14 @@ static void *stream_bg_encoder_fn(void *arg) {
 #endif
     stream_bg_encoder_t *bg = (stream_bg_encoder_t *)arg;
 
+    /* Enable TLS bg-thread mode: parallel_for runs inline (single-threaded)
+     * and qwen_set_threads/qwen_apply_prefill_thread_policy become no-ops.
+     * This lets the bg encoder use only OpenBLAS (its own internal pool)
+     * while the main decoder thread keeps exclusive use of the custom pool.
+     * During the decode phase (seq=1), the decoder uses only parallel_for
+     * and never calls cblas_sgemm, so both can run concurrently. */
+    qwen_set_bg_thread_mode(1);
+
     while (1) {
         BG_LOCK(bg);
         while (!bg->has_work && !bg->stop)
@@ -1486,6 +1495,7 @@ static void *stream_bg_encoder_fn(void *arg) {
         int64_t start_sample = bg->work_start_sample;
         bg->work_samples = NULL;
         bg->has_work = 0;
+        bg->is_busy = 1;
         BG_UNLOCK(bg);
 
         /* Encode outside the lock */
@@ -1495,6 +1505,7 @@ static void *stream_bg_encoder_fn(void *arg) {
                                      &enc_output, &seq_len);
 
         BG_LOCK(bg);
+        bg->is_busy = 0;
         if (err == 0 && enc_output && seq_len > 0) {
             free(bg->result_enc); /* discard any stale result */
             bg->result_enc = enc_output;
@@ -1625,6 +1636,48 @@ static void stream_bg_encoder_invalidate(stream_bg_encoder_t *bg) {
     free(bg->result_enc);
     bg->result_enc = NULL;
     bg->has_result = 0;
+    BG_UNLOCK(bg);
+}
+
+/* Blocking collect: wait for any in-flight encoding to finish, then
+ * check if the result matches the expected window.  This ensures the
+ * background encoder is idle before the caller proceeds with its own
+ * encoder/BLAS work, avoiding concurrent OpenBLAS contention. */
+static int stream_bg_encoder_wait_collect(stream_bg_encoder_t *bg,
+                                          int64_t expected_start,
+                                          int expected_n_samples,
+                                          float **out_enc, int *out_seq_len) {
+    if (!bg) return 0;
+    *out_enc = NULL;
+    *out_seq_len = 0;
+
+    BG_LOCK(bg);
+    while ((bg->has_work || bg->is_busy) && !bg->stop)
+        BG_WAIT(bg);
+
+    if (bg->has_result &&
+        bg->result_start_sample == expected_start &&
+        bg->result_n_samples == expected_n_samples) {
+        *out_enc = bg->result_enc;
+        *out_seq_len = bg->result_seq_len;
+        bg->result_enc = NULL;
+        bg->has_result = 0;
+        BG_UNLOCK(bg);
+        return 1;
+    }
+    BG_UNLOCK(bg);
+    return 0;
+}
+
+/* Wait for the background encoder to become idle (not busy, no pending work).
+ * Does not consume the result — call collect() afterwards.
+ * Used at the start of the encoding phase to ensure no concurrent
+ * OpenBLAS usage before the main thread begins its own encoding/prefill. */
+static void stream_bg_encoder_wait_idle(stream_bg_encoder_t *bg) {
+    if (!bg) return;
+    BG_LOCK(bg);
+    while ((bg->has_work || bg->is_busy) && !bg->stop)
+        BG_WAIT(bg);
     BG_UNLOCK(bg);
 }
 
@@ -1839,6 +1892,14 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     int n_emitted_text_tokens = 0;
     int emitted_text_cap = 8192;
     int stagnant_chunks = 0;
+    /* Stability promotion: track consecutive rounds where the unfixed
+     * tail tokens are identical.  When the tail hasn't changed for
+     * TAIL_STABLE_PROMOTE rounds, reduce effective rollback to 0 so
+     * the held-back tokens get emitted.  Resets when tail changes. */
+    #define QWEN_STREAM_TAIL_STABLE_PROMOTE 3
+    int *prev_tail_tokens = NULL;
+    int prev_tail_len = 0;
+    int tail_stable_rounds = 0;
     /* Result text accumulator */
     size_t result_cap = 4096;
     size_t result_len = 0;
@@ -1881,8 +1942,11 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     int prefill_reused_tokens = 0;
 
     /* Background encoder pipeline for live mode (Plan A: encoder-decoder overlap).
-     * The background thread pre-computes complete encoder windows while the
-     * decoder is busy, so window encoding is off the critical path. */
+     * The encoder uses OpenBLAS (cblas_sgemm) while the decoder uses only
+     * the custom BF16 thread pool — different pools, no contention.
+     * wait_collect ensures the bg encoder is idle before the main thread
+     * starts its own encoder/decoder work, preventing any concurrent BLAS
+     * or parallel_for calls. */
     stream_bg_encoder_t bg_enc_storage;
     stream_bg_encoder_t *bg_enc = NULL;
     if (live && use_enc_cache) {
@@ -1979,6 +2043,46 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         float *enc_output = NULL;
         int64_t full_end = (audio_cursor / enc_window_samples) * (int64_t)enc_window_samples;
 
+        /* Adaptive chunk coalescing (Plan D).
+         * Between full encoder-window boundaries the "partial tail" is
+         * re-encoded from scratch on every chunk.  Because the partial
+         * grows by chunk_sec each iteration the total encoder work
+         * within one 8-second window gap is O(n^2):
+         *   E(0.5) + E(1.0) + ... + E(8.0)  =  ~68 s of audio @ 0.5 s steps
+         * On a CPU with ~0.2 s/s throughput that alone costs ~14 s per 8 s
+         * of real-time audio, pushing RTF >> 1.
+         *
+         * Fix: only decode when the partial tail crosses a coalesce step
+         * boundary (default = enc_window_samples/2 ≈ 4 s).  This reduces
+         * partial re-encodes from 16 to 2 per window, cutting O(n^2)
+         * encoder work by ~5x while still producing text every ~4 s.
+         * The first chunk (chunk_idx==0) and final chunks always decode,
+         * and window-boundary crossings are never skipped.
+         */
+        if (use_enc_cache && !is_final && chunk_idx > 0) {
+            int64_t partial_span = audio_cursor - full_end;
+            if (partial_span > 0 && partial_span < enc_window_samples) {
+                int64_t coalesce_step = enc_window_samples / 2;
+                if (coalesce_step < chunk_samples) coalesce_step = chunk_samples;
+                int64_t prev_cursor = audio_cursor - chunk_samples;
+                int64_t prev_partial = prev_cursor - full_end;
+                /* Same coalesce bracket — skip this intermediate chunk */
+                if (prev_partial >= 0 &&
+                    partial_span / coalesce_step == prev_partial / coalesce_step) {
+                    if (qwen_verbose >= 2) {
+                        fprintf(stderr,
+                                "  Coalesce: skip partial %.1f s (next decode at %.1f s)\n",
+                                (float)partial_span / QWEN_SAMPLE_RATE,
+                                (float)(((partial_span / coalesce_step) + 1)
+                                        * coalesce_step) / QWEN_SAMPLE_RATE);
+                    }
+                    ctx->perf_total_ms += get_time_ms() - chunk_t0;
+                    chunk_idx++;
+                    continue;
+                }
+            }
+        }
+
         if (!use_enc_cache) {
             if (audio_cursor > INT_MAX) {
                 ctx->perf_total_ms += get_time_ms() - chunk_t0;
@@ -2005,6 +2109,12 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         } else {
             int enc_failed = 0;
 
+            /* Ensure bg encoder is idle before main-thread encoding.
+             * The main encoder path uses both OpenBLAS and parallel_for,
+             * so we must not overlap with the bg encoder (which uses
+             * OpenBLAS via its TLS inline-parallel_for mode). */
+            stream_bg_encoder_wait_idle(bg_enc);
+
             while (next_window_start < full_end) {
                 int64_t ws = next_window_start;
                 int64_t ws_local_off = ws - local_base_sample;
@@ -2016,7 +2126,8 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 float *win_enc = NULL;
                 int win_seq = 0;
 
-                /* Try background pre-computed result first */
+                /* Try background pre-computed result (non-blocking).
+                 * bg is known-idle from wait_idle above. */
                 int bg_hit = bg_enc &&
                     stream_bg_encoder_collect(bg_enc, ws, enc_window_samples,
                                              &win_enc, &win_seq);
@@ -2291,6 +2402,42 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             fflush(stderr);
         }
 
+        /* ---- Submit bg encoder BEFORE decode for overlap ----
+         * Prefill is done (used both OpenBLAS + parallel_for).
+         * The decode phase (seq=1) uses ONLY the custom parallel_for pool,
+         * never cblas_sgemm.  The bg encoder (TLS mode) uses ONLY OpenBLAS
+         * with inline parallel_for.  Different resources → safe overlap.
+         *
+         * We submit the next window that would be needed in the NEXT round.
+         * The bg thread encodes it during decode, and the result is collected
+         * at the start of the next round's encoding phase.
+         *
+         * Recovery/periodic resets happen AFTER decode (in the commit phase)
+         * and call invalidate() to discard any stale bg result.  The next
+         * round's collect() also checks sample-offset match, so even if
+         * invalidate races with a completing bg encode, the stale result
+         * will simply not match and be ignored. */
+        if (bg_enc && !is_final) {
+            int64_t next_full_end = ((audio_cursor + chunk_samples) / enc_window_samples)
+                                   * (int64_t)enc_window_samples;
+            if (next_window_start < next_full_end) {
+                int64_t ws_local_off = next_window_start - local_base_sample;
+                if (ws_local_off >= 0 &&
+                    ws_local_off + enc_window_samples <= local_n_samples) {
+                    stream_bg_encoder_submit(
+                        bg_enc,
+                        audio_samples + (size_t)ws_local_off,
+                        enc_window_samples,
+                        next_window_start);
+                    if (qwen_verbose >= 2) {
+                        fprintf(stderr,
+                                "  BG-Encoder: submitted window at %.1f s (overlap with decode)\n",
+                                (float)next_window_start / QWEN_SAMPLE_RATE);
+                    }
+                }
+            }
+        }
+
         /* ---- Autoregressive decode ---- */
         t0 = get_time_ms();
         int n_generated = 0;
@@ -2414,12 +2561,51 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
          * - intermediate chunks: keep last `rollback` text tokens unfixed,
          *   but if text is shorter than rollback keep only 1 token unfixed so
          *   streaming still advances,
-         * - final chunk: emit everything. */
+         * - final chunk: emit everything.
+         *
+         * Stability promotion: if the unfixed tail is identical across
+         * QWEN_STREAM_TAIL_STABLE_PROMOTE consecutive rounds, the decoder
+         * has settled — promote those tokens to committed (rollback=0). */
         int candidate_len = 0;
         if (is_final) {
             candidate_len = n_text_tokens;
         } else if (chunk_idx >= unfixed_chunks) {
-            candidate_len = n_text_tokens - rollback;
+            int effective_rollback = rollback;
+            /* Check tail stability */
+            int tail_len = n_text_tokens > rollback ? rollback : n_text_tokens;
+            int *tail_tokens = (n_text_tokens > 0) ? (raw_tokens + text_start + n_text_tokens - tail_len) : NULL;
+            if (tail_len > 0 && tail_len == prev_tail_len &&
+                memcmp(tail_tokens, prev_tail_tokens, (size_t)tail_len * sizeof(int)) == 0) {
+                tail_stable_rounds++;
+            } else {
+                tail_stable_rounds = (tail_len > 0) ? 1 : 0;
+            }
+            /* Save current tail for next round comparison */
+            if (tail_len > 0) {
+                if (tail_len > prev_tail_len) {
+                    int *tmp = (int *)realloc(prev_tail_tokens, (size_t)tail_len * sizeof(int));
+                    if (tmp) prev_tail_tokens = tmp;
+                }
+                if (prev_tail_tokens) {
+                    memcpy(prev_tail_tokens, tail_tokens, (size_t)tail_len * sizeof(int));
+                }
+            }
+            prev_tail_len = tail_len;
+
+            if (tail_stable_rounds >= QWEN_STREAM_TAIL_STABLE_PROMOTE) {
+                effective_rollback = 0;
+                if (qwen_verbose >= 2) {
+                    fprintf(stderr,
+                            "  Stability promotion: tail unchanged for %d rounds, "
+                            "promoting %d tokens\n",
+                            tail_stable_rounds, tail_len);
+                }
+                if (qwen_monitor) {
+                    fprintf(stderr, "\xe2\x9c\x93"); /* ✓ = stability promote */
+                    fflush(stderr);
+                }
+            }
+            candidate_len = n_text_tokens - effective_rollback;
             if (candidate_len <= 0 && n_text_tokens > 0) candidate_len = n_text_tokens - 1;
             if (candidate_len < 0) candidate_len = 0;
         }
@@ -2452,10 +2638,16 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             }
 
             if (recovery_reset) {
+                /* In auto-detect mode (no forced language), use zero carry
+                 * tokens so the model can freely re-detect language from
+                 * fresh audio.  Carrying stale text tokens from the previous
+                 * language biases the decoder and blocks language switching. */
+                int recovery_carry = (ctx->n_force_prompt_tokens > 0)
+                    ? QWEN_STREAM_RESET_CARRY_TOKENS : 0;
                 if (stream_reanchor_text_state(ctx,
                                                emitted_text_tokens,
                                                n_emitted_text_tokens,
-                                               QWEN_STREAM_RESET_CARRY_TOKENS,
+                                               recovery_carry,
                                                &raw_tokens, &raw_tokens_cap, &n_raw_tokens,
                                                &stable_text_tokens, &stable_text_cap,
                                                &n_stable_text_tokens) != 0) {
@@ -2463,14 +2655,14 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                     n_stable_text_tokens = 0;
                 }
                 prev_prefill_len = 0;
-                stream_clear_enc_cache(enc_cache,
-                                       &n_enc_cache,
-                                       &enc_cache_start,
-                                       &enc_cached_seq_total,
-                                       &next_window_start,
-                                       full_end);
+                /* Preserve encoder cache: completed windows are deterministic
+                 * (same audio → same output).  Only the decoder text state
+                 * is stale; re-encoding identical windows wastes CPU and
+                 * delays speech capture after long silence periods. */
                 stream_bg_encoder_invalidate(bg_enc);
                 stagnant_chunks = 0;
+                tail_stable_rounds = 0;
+                prev_tail_len = 0;
                 did_recovery_reset = 1;
                 if (qwen_monitor) {
                     fprintf(stderr, "!");
@@ -2634,28 +2826,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             }
         }
 
-        /* Submit next window for background pre-encoding if audio is available.
-         * The background encoder can work during the next chunk's wait + decode. */
-        if (bg_enc && !is_final && !did_recovery_reset && !did_periodic_reset) {
-            int64_t next_full_end = ((audio_cursor + chunk_samples) / enc_window_samples)
-                                   * (int64_t)enc_window_samples;
-            if (next_window_start < next_full_end) {
-                int64_t ws_local_off = next_window_start - local_base_sample;
-                if (ws_local_off >= 0 &&
-                    ws_local_off + enc_window_samples <= local_n_samples) {
-                    stream_bg_encoder_submit(
-                        bg_enc,
-                        audio_samples + (size_t)ws_local_off,
-                        enc_window_samples,
-                        next_window_start);
-                    if (qwen_verbose >= 2) {
-                        fprintf(stderr,
-                                "  BG-Encoder: submitted window at %.1f s\n",
-                                (float)next_window_start / QWEN_SAMPLE_RATE);
-                    }
-                }
-            }
-        }
+        /* (bg encoder submission moved to before decode for overlap) */
 
         ctx->perf_total_ms += get_time_ms() - chunk_t0;
         chunk_idx++;
@@ -2684,6 +2855,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     free(raw_tokens);
     free(stable_text_tokens);
     free(emitted_text_tokens);
+    free(prev_tail_tokens);
     qwen_tokenizer_free(tokenizer);
     free(compacted_samples);
     free(local_samples);
