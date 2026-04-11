@@ -78,6 +78,7 @@ if(QASR_ENABLE_CPU_BACKEND)
         src/backend/qwen_cpu/qwen_asr_kernels.c
         src/backend/qwen_cpu/qwen_asr_kernels_generic.c
         src/backend/qwen_cpu/qwen_asr_kernels_avx.c
+        src/backend/qwen_cpu/qwen_asr_perf.c
         src/backend/qwen_cpu/qwen_asr_safetensors.c
         src/backend/qwen_cpu/qwen_asr_tokenizer.c
     )
@@ -88,6 +89,19 @@ if(QASR_ENABLE_CPU_BACKEND)
     endif()
 
     add_library(qasr_cpu_c STATIC ${QASR_CPU_SOURCES})
+
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86|X86")
+        target_compile_definitions(qasr_cpu_c PRIVATE QWEN_X86_AVX2_AVAILABLE=1)
+        if(MSVC)
+            set_source_files_properties(
+                src/backend/qwen_cpu/qwen_asr_kernels_avx.c
+                PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+        else()
+            set_source_files_properties(
+                src/backend/qwen_cpu/qwen_asr_kernels_avx.c
+                PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+        endif()
+    endif()
 
     target_include_directories(qasr_cpu_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/qwen_cpu)
     target_compile_features(qasr_cpu_c PUBLIC c_std_11)

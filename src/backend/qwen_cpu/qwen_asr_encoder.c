@@ -15,13 +15,12 @@
 
 #include "qwen_asr.h"
 #include "qwen_asr_kernels.h"
+#include "qwen_asr_perf.h"
 #include "qwen_asr_safetensors.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-
-#define QWEN_ENC_QKV_FUSION_MIN_SEQ 8
 
 static int encoder_should_cancel(qwen_ctx_t *ctx) {
     if (ctx && ctx->cancel_cb && ctx->cancel_cb(ctx->cancel_cb_userdata)) {
@@ -398,9 +397,12 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     float *ffn_mid = (float *)malloc(total_tokens * ffn_dim * sizeof(float));
     float *ffn_out = (float *)malloc(total_tokens * d_model * sizeof(float));
     int fused_qkv_dim = d_model * 3;
+    qwen_enc_qkv_policy_t qkv_policy = qwen_get_encoder_qkv_policy();
+    qwen_enc_qkv_impl_t qkv_impl = qwen_select_encoder_qkv_impl(
+        qkv_policy, total_tokens, d_model, 1);
     int can_fuse_qkv = 0;
 
-    if (total_tokens >= QWEN_ENC_QKV_FUSION_MIN_SEQ) {
+    if (qkv_impl == QWEN_ENC_QKV_IMPL_PACKED) {
         qkv_out = (float *)malloc((size_t)total_tokens * fused_qkv_dim * sizeof(float));
         if (qkv_out) {
             can_fuse_qkv = 1;
@@ -408,6 +410,13 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
             free(qkv_out);
             qkv_out = NULL;
         }
+    }
+
+    if (qwen_verbose >= 2) {
+        fprintf(stderr, "encoder: qkv policy=%s selected=%s total_tokens=%d d_model=%d\n",
+                qwen_encoder_qkv_policy_name(qkv_policy),
+                qwen_encoder_qkv_impl_name(qkv_impl),
+                total_tokens, d_model);
     }
 
     float scale = 1.0f / sqrtf((float)head_dim);
@@ -427,7 +436,9 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
         qwen_layer_norm(x_norm, x, l->attn_norm_weight, l->attn_norm_bias,
                         total_tokens, d_model, 1e-5f);
 
-        if (can_fuse_qkv && l->qkv_weight_packed && l->qkv_bias_packed) {
+        if (can_fuse_qkv && l->qkv_weight_packed && l->qkv_bias_packed &&
+            qwen_select_encoder_qkv_impl(qkv_policy, total_tokens, d_model, 1) ==
+                QWEN_ENC_QKV_IMPL_PACKED) {
             qwen_linear_qkv_f32_packed(q, k, v,
                                        qkv_out,
                                        x_norm,

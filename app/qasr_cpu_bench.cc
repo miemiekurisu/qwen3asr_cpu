@@ -188,6 +188,17 @@ Stats BenchmarkFusedPacked(const Scenario &scenario, const Options &options) {
     }, options.warmup, scenario.iterations * options.scale);
 }
 
+Stats BenchmarkPolicy(const Scenario &scenario,
+                     const Options &options,
+                     qwen_enc_qkv_policy_t policy) {
+    const qwen_enc_qkv_impl_t impl = qwen_select_encoder_qkv_impl(
+        policy, scenario.seq_len, scenario.q_dim, 1);
+    if (impl == QWEN_ENC_QKV_IMPL_PACKED) {
+        return BenchmarkFusedPacked(scenario, options);
+    }
+    return BenchmarkSeparate(scenario, options);
+}
+
 bool ParseInt(std::string_view text, int *value) {
     try {
         *value = std::stoi(std::string(text));
@@ -249,27 +260,40 @@ int main(int argc, char **argv) {
     };
 
     std::cout << "threads=" << options.threads << " warmup=" << options.warmup << " scale=" << options.scale << "\n";
+    std::cout << "runtime_kernel_backend=" << qwen_get_runtime_kernel_backend_name()
+              << " default_qkv_policy=" << qwen_encoder_qkv_policy_name(qwen_get_encoder_qkv_policy())
+              << "\n";
     std::cout << std::left << std::setw(20) << "scenario"
               << std::right << std::setw(12) << "separate"
               << std::setw(14) << "fused_copy"
               << std::setw(16) << "fused_packed"
+              << std::setw(14) << "shape_auto"
+              << std::setw(14) << "auto_path"
               << std::setw(16) << "copy_speedup"
-              << std::setw(18) << "packed_speedup" << "\n";
+              << std::setw(18) << "packed_speedup"
+              << std::setw(16) << "auto_speedup" << "\n";
 
     for (const Scenario &scenario : scenarios) {
         const Stats separate = BenchmarkSeparate(scenario, options);
         const Stats fused_copy = BenchmarkFusedScratch(scenario, options);
         const Stats fused_packed = BenchmarkFusedPacked(scenario, options);
+        const Stats shape_auto = BenchmarkPolicy(scenario, options, QWEN_ENC_QKV_POLICY_SHAPE_AUTO);
+        const qwen_enc_qkv_impl_t shape_impl = qwen_select_encoder_qkv_impl(
+            QWEN_ENC_QKV_POLICY_SHAPE_AUTO, scenario.seq_len, scenario.q_dim, 1);
         const double copy_speedup = separate.avg_ms / fused_copy.avg_ms;
         const double packed_speedup = separate.avg_ms / fused_packed.avg_ms;
+        const double auto_speedup = separate.avg_ms / shape_auto.avg_ms;
 
         std::cout << std::left << std::setw(20) << scenario.name
                   << std::right << std::fixed << std::setprecision(3)
                   << std::setw(12) << separate.avg_ms
                   << std::setw(14) << fused_copy.avg_ms
                   << std::setw(16) << fused_packed.avg_ms
+                  << std::setw(14) << shape_auto.avg_ms
+                  << std::setw(14) << qwen_encoder_qkv_impl_name(shape_impl)
                   << std::setw(16) << copy_speedup
-                  << std::setw(18) << packed_speedup << "\n";
+                  << std::setw(18) << packed_speedup
+                  << std::setw(16) << auto_speedup << "\n";
     }
 
     return 0;

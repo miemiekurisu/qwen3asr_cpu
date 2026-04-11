@@ -11,7 +11,7 @@
 
 #include "qwen_asr_kernels_impl.h"
 
-#if defined(__AVX2__) && defined(__FMA__)
+#if defined(QWEN_X86_AVX2_AVAILABLE)
 
 #include <immintrin.h>
 #include <string.h>
@@ -499,4 +499,4 @@ void qwen_vec_scale_add_avx(float *dst, const float *src, float correction, int 
 #endif
 }
 
-#endif /* __AVX2__ && __FMA__ */
+#endif /* QWEN_X86_AVX2_AVAILABLE */

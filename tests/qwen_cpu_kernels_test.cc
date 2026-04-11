@@ -8,6 +8,7 @@ extern "C" {
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -21,6 +22,40 @@ void FillPseudoRandom(std::vector<float> *values, std::uint32_t seed) {
     std::uint32_t state = seed;
     for (float &value : *values) {
         value = NextPseudoRandom(&state);
+    }
+}
+
+std::uint16_t FloatToBfloat16(float value) {
+    std::uint32_t bits = 0;
+    std::uint16_t bf16 = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    bf16 = static_cast<std::uint16_t>(bits >> 16);
+    return bf16;
+}
+
+float Bfloat16ToFloat(std::uint16_t value) {
+    std::uint32_t bits = static_cast<std::uint32_t>(value) << 16;
+    float result = 0.0f;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+void RunReferenceBfloat16Linear(std::vector<float> *output,
+                                const std::vector<float> &x,
+                                const std::vector<std::uint16_t> &weights,
+                                const std::vector<float> *bias,
+                                int seq_len,
+                                int in_dim,
+                                int out_dim) {
+    for (int row = 0; row < seq_len; ++row) {
+        for (int out = 0; out < out_dim; ++out) {
+            float sum = bias ? (*bias)[static_cast<std::size_t>(out)] : 0.0f;
+            for (int column = 0; column < in_dim; ++column) {
+                sum += x[static_cast<std::size_t>(row * in_dim + column)] *
+                       Bfloat16ToFloat(weights[static_cast<std::size_t>(out * in_dim + column)]);
+            }
+            (*output)[static_cast<std::size_t>(row * out_dim + out)] = sum;
+        }
     }
 }
 
@@ -404,4 +439,81 @@ QASR_TEST(QwenLinearQkvF32PackedZeroSequenceLeavesOutputsUntouched) {
     QASR_EXPECT(std::fabs(q[0] - 9.0f) < 1e-6f);
     QASR_EXPECT(std::fabs(k[0] - 8.0f) < 1e-6f);
     QASR_EXPECT(std::fabs(v[0] - 7.0f) < 1e-6f);
+}
+
+QASR_TEST(QwenEncoderQkvPolicyBestKeepsCurrentProductionPath) {
+    const qwen_enc_qkv_impl_t below_threshold = qwen_select_encoder_qkv_impl(
+        QWEN_ENC_QKV_POLICY_BEST, 4, 1024, 1);
+    const qwen_enc_qkv_impl_t normal_prefill = qwen_select_encoder_qkv_impl(
+        QWEN_ENC_QKV_POLICY_BEST, 13, 1024, 1);
+
+    QASR_EXPECT_EQ(below_threshold, QWEN_ENC_QKV_IMPL_SEPARATE);
+    QASR_EXPECT_EQ(normal_prefill, QWEN_ENC_QKV_IMPL_PACKED);
+}
+
+QASR_TEST(QwenEncoderQkvPolicyShapeAutoFallsBackOnLargeWideShapes) {
+    const qwen_enc_qkv_impl_t large_wide = qwen_select_encoder_qkv_impl(
+        QWEN_ENC_QKV_POLICY_SHAPE_AUTO, 104, 1024, 1);
+    const qwen_enc_qkv_impl_t medium = qwen_select_encoder_qkv_impl(
+        QWEN_ENC_QKV_POLICY_SHAPE_AUTO, 52, 1024, 1);
+    const qwen_enc_qkv_impl_t no_packed = qwen_select_encoder_qkv_impl(
+        QWEN_ENC_QKV_POLICY_FORCE_PACKED, 13, 1024, 0);
+
+    QASR_EXPECT_EQ(large_wide, QWEN_ENC_QKV_IMPL_SEPARATE);
+    QASR_EXPECT_EQ(medium, QWEN_ENC_QKV_IMPL_PACKED);
+    QASR_EXPECT_EQ(no_packed, QWEN_ENC_QKV_IMPL_SEPARATE);
+}
+
+QASR_TEST(QwenLinearBf16MatchesReferenceForSingleToken) {
+    const int seq_len = 1;
+    const int in_dim = 9;
+    const int out_dim = 7;
+
+    std::vector<float> x(static_cast<std::size_t>(seq_len * in_dim));
+    std::vector<float> weights_f32(static_cast<std::size_t>(out_dim * in_dim));
+    std::vector<std::uint16_t> weights_bf16(static_cast<std::size_t>(out_dim * in_dim));
+    std::vector<float> bias(static_cast<std::size_t>(out_dim));
+    std::vector<float> actual(static_cast<std::size_t>(seq_len * out_dim), 0.0f);
+    std::vector<float> expected(static_cast<std::size_t>(seq_len * out_dim), 0.0f);
+
+    FillPseudoRandom(&x, 909u);
+    FillPseudoRandom(&weights_f32, 1001u);
+    FillPseudoRandom(&bias, 1003u);
+    for (std::size_t index = 0; index < weights_f32.size(); ++index) {
+        weights_bf16[index] = FloatToBfloat16(weights_f32[index]);
+    }
+
+    qwen_linear_bf16(actual.data(), x.data(), weights_bf16.data(), bias.data(),
+                     seq_len, in_dim, out_dim);
+    RunReferenceBfloat16Linear(&expected, x, weights_bf16, &bias, seq_len, in_dim, out_dim);
+
+    ExpectAllClose(actual, expected, 2e-4f);
+}
+
+QASR_TEST(QwenArgmaxMatvecBf16MatchesReference) {
+    const int in_dim = 11;
+    const int out_dim = 13;
+
+    std::vector<float> x(static_cast<std::size_t>(in_dim));
+    std::vector<float> weights_f32(static_cast<std::size_t>(out_dim * in_dim));
+    std::vector<std::uint16_t> weights_bf16(static_cast<std::size_t>(out_dim * in_dim));
+    std::vector<float> logits(static_cast<std::size_t>(out_dim), 0.0f);
+
+    FillPseudoRandom(&x, 2001u);
+    FillPseudoRandom(&weights_f32, 2003u);
+    for (std::size_t index = 0; index < weights_f32.size(); ++index) {
+        weights_bf16[index] = FloatToBfloat16(weights_f32[index]);
+    }
+
+    RunReferenceBfloat16Linear(&logits, x, weights_bf16, nullptr, 1, in_dim, out_dim);
+
+    int expected = 0;
+    for (int index = 1; index < out_dim; ++index) {
+        if (logits[static_cast<std::size_t>(index)] > logits[static_cast<std::size_t>(expected)]) {
+            expected = index;
+        }
+    }
+
+    const int actual = qwen_argmax_matvec_bf16(x.data(), weights_bf16.data(), in_dim, out_dim);
+    QASR_EXPECT_EQ(actual, expected);
 }

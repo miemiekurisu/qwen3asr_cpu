@@ -5,6 +5,7 @@
 
 #include "qwen_asr_kernels.h"
 #include "qwen_asr_kernels_impl.h"
+#include "qwen_asr_perf.h"
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
@@ -39,6 +40,58 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+typedef void (*qwen_bf16_matvec_fused_fn_t)(float *y, const float *x, const uint16_t *W_bf16,
+                                            const float *bias, int in_dim, int out_dim);
+typedef void (*qwen_argmax_bf16_range_fn_t)(const float *x, const uint16_t *W_bf16,
+                                            int in_dim, int start, int end,
+                                            int *best_out, float *best_val_out);
+typedef float (*qwen_dot_f32_fn_t)(const float *a, const float *b, int n);
+typedef void (*qwen_vec_scale_inplace_fn_t)(float *dst, float scale, int n);
+typedef void (*qwen_vec_axpy_inplace_fn_t)(float *dst, const float *src, float alpha, int n);
+typedef void (*qwen_vec_scale_add_fn_t)(float *dst, const float *src, float correction, int n);
+
+static qwen_bf16_matvec_fused_fn_t g_qwen_bf16_matvec_fused_fn = qwen_bf16_matvec_fused_generic;
+static qwen_argmax_bf16_range_fn_t g_qwen_argmax_bf16_range_fn = qwen_argmax_bf16_range_generic;
+static qwen_dot_f32_fn_t g_qwen_dot_f32_fn = qwen_dot_f32_generic;
+static qwen_vec_scale_inplace_fn_t g_qwen_vec_scale_inplace_fn = qwen_vec_scale_inplace_generic;
+static qwen_vec_axpy_inplace_fn_t g_qwen_vec_axpy_inplace_fn = qwen_vec_axpy_inplace_generic;
+static qwen_vec_scale_add_fn_t g_qwen_vec_scale_add_fn = qwen_vec_scale_add_generic;
+static const char *g_qwen_runtime_kernel_backend_name = "generic";
+static int g_qwen_runtime_kernel_backend_initialized = 0;
+
+static void qwen_init_runtime_kernel_backend(void) {
+    if (g_qwen_runtime_kernel_backend_initialized) {
+        return;
+    }
+
+#ifdef __ARM_NEON
+    g_qwen_bf16_matvec_fused_fn = qwen_bf16_matvec_fused_neon;
+    g_qwen_argmax_bf16_range_fn = qwen_argmax_bf16_range_neon;
+    g_qwen_dot_f32_fn = qwen_dot_f32_neon;
+    g_qwen_vec_scale_inplace_fn = qwen_vec_scale_inplace_neon;
+    g_qwen_vec_axpy_inplace_fn = qwen_vec_axpy_inplace_neon;
+    g_qwen_vec_scale_add_fn = qwen_vec_scale_add_neon;
+    g_qwen_runtime_kernel_backend_name = "neon";
+#elif defined(QWEN_X86_AVX2_AVAILABLE)
+    if (qwen_x86_cpu_supports_avx2_fma()) {
+        g_qwen_bf16_matvec_fused_fn = qwen_bf16_matvec_fused_avx;
+        g_qwen_argmax_bf16_range_fn = qwen_argmax_bf16_range_avx;
+        g_qwen_dot_f32_fn = qwen_dot_f32_avx;
+        g_qwen_vec_scale_inplace_fn = qwen_vec_scale_inplace_avx;
+        g_qwen_vec_axpy_inplace_fn = qwen_vec_axpy_inplace_avx;
+        g_qwen_vec_scale_add_fn = qwen_vec_scale_add_avx;
+        g_qwen_runtime_kernel_backend_name = "avx2";
+    }
+#endif
+
+    g_qwen_runtime_kernel_backend_initialized = 1;
+}
+
+const char *qwen_get_runtime_kernel_backend_name(void) {
+    qwen_init_runtime_kernel_backend();
+    return g_qwen_runtime_kernel_backend_name;
+}
 
 /* ========================================================================
  * Thread Pool
@@ -644,7 +697,8 @@ static const float *bf16_get_f32_view(const uint16_t *src, size_t n) {
  */
 static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
                                const float *bias, int in_dim, int out_dim) {
-    qwen_bf16_matvec_fused_impl(y, x, W_bf16, bias, in_dim, out_dim);
+    qwen_init_runtime_kernel_backend();
+    g_qwen_bf16_matvec_fused_fn(y, x, W_bf16, bias, in_dim, out_dim);
 }
 
 /* Threaded matvec: split output rows across threads */
@@ -924,7 +978,8 @@ void qwen_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
 static void argmax_bf16_range(const float *x, const uint16_t *W_bf16,
                                int in_dim, int start, int end,
                                int *best_out, float *best_val_out) {
-    qwen_argmax_bf16_range_impl(x, W_bf16, in_dim, start, end, best_out, best_val_out);
+    qwen_init_runtime_kernel_backend();
+    g_qwen_argmax_bf16_range_fn(x, W_bf16, in_dim, start, end, best_out, best_val_out);
 }
 
 typedef struct {
@@ -1476,22 +1531,26 @@ void qwen_softmax(float *x, int rows, int cols) {
  * ======================================================================== */
 
 static inline float qwen_dot_f32(const float *a, const float *b, int n) {
-    return qwen_dot_f32_impl(a, b, n);
+    qwen_init_runtime_kernel_backend();
+    return g_qwen_dot_f32_fn(a, b, n);
 }
 
 /* dst = dst * scale */
 static inline void qwen_vec_scale_inplace(float *dst, float scale, int n) {
-    qwen_vec_scale_inplace_impl(dst, scale, n);
+    qwen_init_runtime_kernel_backend();
+    g_qwen_vec_scale_inplace_fn(dst, scale, n);
 }
 
 /* dst += alpha * src */
 static inline void qwen_vec_axpy_inplace(float *dst, const float *src, float alpha, int n) {
-    qwen_vec_axpy_inplace_impl(dst, src, alpha, n);
+    qwen_init_runtime_kernel_backend();
+    g_qwen_vec_axpy_inplace_fn(dst, src, alpha, n);
 }
 
 /* dst = dst * correction + src */
 static inline void qwen_vec_scale_add(float *dst, const float *src, float correction, int n) {
-    qwen_vec_scale_add_impl(dst, src, correction, n);
+    qwen_init_runtime_kernel_backend();
+    g_qwen_vec_scale_add_fn(dst, src, correction, n);
 }
 
 /*

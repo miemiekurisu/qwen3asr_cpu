@@ -11,6 +11,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "qwen_asr_perf.h"
+
 /* ========================================================================
  * Basic Operations
  * ======================================================================== */
@@ -197,6 +199,9 @@ void qwen_set_threads(int n);
 
 /* Get number of available CPU cores */
 int qwen_get_num_cpus(void);
+
+/* Returns the selected runtime backend for the decoder hot kernels. */
+const char *qwen_get_runtime_kernel_backend_name(void);
 
 /* Global verbose flag */
 extern int qwen_verbose;
