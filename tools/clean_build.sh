@@ -184,9 +184,12 @@ fi
 # Configure
 configure_args=()
 if [[ -n "${preset}" ]]; then
-    configure_args+=(--preset "${preset}")
     if [[ -n "${generator}" ]]; then
-        configure_args+=(-G "${generator}")
+        # --preset and -G cannot be combined; fall back to manual configuration
+        # with the resolved build directory and cache variables from the preset.
+        configure_args+=(-S "${PROJECT_DIR}" -B "${build_dir}" -G "${generator}")
+    else
+        configure_args+=(--preset "${preset}")
     fi
 else
     configure_args+=(-S "${PROJECT_DIR}" -B "${build_dir}")
