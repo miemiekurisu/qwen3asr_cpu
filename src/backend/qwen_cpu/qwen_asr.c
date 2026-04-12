@@ -2095,6 +2095,10 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
          * encoder work by ~5x while producing text every ~4 s.
          * The first chunk (chunk_idx==0) and final chunks always decode,
          * and window-boundary crossings are never skipped.
+         *
+         * Energy gate: if the latest chunk has significant energy, skip
+         * the coalesce bracket check and decode immediately.  This avoids
+         * the 1-4 s latency penalty when speech resumes after silence.
          */
         if (use_enc_cache && !is_final && chunk_idx > 0) {
             int64_t partial_span = audio_cursor - full_end;
@@ -2103,8 +2107,45 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 if (coalesce_step < chunk_samples) coalesce_step = chunk_samples;
                 int64_t prev_cursor = audio_cursor - chunk_samples;
                 int64_t prev_partial = prev_cursor - full_end;
-                /* Same coalesce bracket — skip this intermediate chunk */
+
+                /* Energy gate: compute RMS of the latest chunk.  If the
+                 * chunk carries speech-level energy, force a decode round
+                 * even inside the same coalesce bracket.  The threshold
+                 * (0.003 ≈ -50 dBFS) is intentionally above the silence
+                 * floor of compact_silence (0.002) to avoid false positives
+                 * from background noise while catching actual speech. */
+                int energy_override = 0;
                 if (prev_partial >= 0 &&
+                    partial_span / coalesce_step == prev_partial / coalesce_step) {
+                    int64_t chunk_off = audio_cursor - chunk_samples;
+                    if (chunk_off >= 0 && chunk_off < audio_n_samples) {
+                        int64_t chunk_len = audio_cursor - chunk_off;
+                        if (chunk_len > audio_n_samples - chunk_off)
+                            chunk_len = audio_n_samples - chunk_off;
+                        const float *chunk_ptr = audio_samples + chunk_off;
+                        float energy = 0.0f;
+                        for (int64_t i = 0; i < chunk_len; i++) {
+                            float s = chunk_ptr[i];
+                            energy += s * s;
+                        }
+                        float rms = sqrtf(energy / (float)(chunk_len > 0 ? chunk_len : 1));
+                        if (rms >= 0.003f) {
+                            energy_override = 1;
+                            if (qwen_verbose >= 2) {
+                                fprintf(stderr,
+                                        "  Coalesce: energy override at %.1f s "
+                                        "(rms=%.4f, forcing decode)\n",
+                                        (float)audio_cursor / QWEN_SAMPLE_RATE,
+                                        rms);
+                            }
+                        }
+                    }
+                }
+
+                /* Same coalesce bracket — skip this intermediate chunk
+                 * unless energy gate says to decode. */
+                if (!energy_override &&
+                    prev_partial >= 0 &&
                     partial_span / coalesce_step == prev_partial / coalesce_step) {
                     if (qwen_verbose >= 2) {
                         fprintf(stderr,
