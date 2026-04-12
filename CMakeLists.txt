@@ -64,6 +64,8 @@ endif()
 include(QasrBlas)
 qasr_configure_blas(qasr_core)
 
+include(QasrOneDNN)
+
 if(QASR_ENABLE_CPU_BACKEND)
     if(NOT WIN32)
         find_package(Threads REQUIRED)
@@ -79,6 +81,7 @@ if(QASR_ENABLE_CPU_BACKEND)
         src/backend/qwen_cpu/qwen_asr_kernels_generic.c
         src/backend/qwen_cpu/qwen_asr_kernels_avx.c
         src/backend/qwen_cpu/qwen_asr_perf.c
+        src/backend/qwen_cpu/qwen_asr_onednn.c
         src/backend/qwen_cpu/qwen_asr_safetensors.c
         src/backend/qwen_cpu/qwen_asr_tokenizer.c
     )
@@ -120,6 +123,11 @@ if(QASR_ENABLE_CPU_BACKEND)
         target_compile_definitions(qasr_cpu_c PRIVATE USE_BLAS ACCELERATE_NEW_LAPACK)
     else()
         target_compile_definitions(qasr_cpu_c PRIVATE USE_BLAS USE_OPENBLAS)
+    endif()
+
+    qasr_configure_onednn(qasr_cpu_c)
+    if(QASR_HAS_ONEDNN)
+        target_compile_definitions(qasr_core PUBLIC QASR_ONEDNN_AVAILABLE=1)
     endif()
 
     target_compile_definitions(qasr_core PUBLIC QASR_CPU_BACKEND_ENABLED=1)
@@ -229,10 +237,12 @@ if(QASR_ENABLE_TESTS)
         tests/realtime_session_test.cc
         tests/json_test.cc
         tests/http_server_test.cc
+        tests/realfile_audio_test.cc
     )
 
     if(QASR_ENABLE_CPU_BACKEND)
         list(APPEND QASR_UNIT_TEST_SOURCES tests/qwen_cpu_kernels_test.cc)
+        list(APPEND QASR_UNIT_TEST_SOURCES tests/onednn_int8_test.cc)
     endif()
 
     add_executable(qasr_unit_tests ${QASR_UNIT_TEST_SOURCES})

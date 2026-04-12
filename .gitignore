@@ -9,7 +9,21 @@ Qwen3-ASR-*/
 *.wav
 *.aiff
 *.mp3
-!testfile/
-!testfile/*.mp3
-!testfile/README.md
 *.dSYM/
+
+# Internal design docs — not for public release
+docs/
+experience.md
+
+# Server / test log artifacts
+server_log*.txt
+test_out*.txt
+test_err*.txt
+test_res*.txt
+test_stderr*.txt
+test_output*.txt
+
+# Test audio files (large, download separately)
+testfile/*.mp3
+testfile/*.wav
+!testfile/README.md

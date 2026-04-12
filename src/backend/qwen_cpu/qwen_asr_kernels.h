@@ -175,7 +175,8 @@ void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
  */
 void qwen_causal_attention(float *out, const float *Q, const float *K, const float *V,
                             int seq_q, int seq_k, int n_heads, int n_kv_heads,
-                            int head_dim, float scale, int q_offset);
+                            int head_dim, float scale, int q_offset,
+                            float *score_buf);
 
 /* ========================================================================
  * Position Embeddings

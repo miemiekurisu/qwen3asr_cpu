@@ -39,6 +39,7 @@ struct ServerConfig {
     std::int32_t port = 8080;
     std::int32_t threads = 0;
     std::int32_t verbosity = 0;
+    bool decoder_int8 = false;
 };
 
 Status ParseBooleanText(std::string_view field_name, std::string_view text, bool * value);

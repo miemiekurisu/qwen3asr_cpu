@@ -7,6 +7,7 @@
 
 #include "qwen_asr.h"
 #include "qwen_asr_kernels.h"
+#include "qwen_asr_onednn.h"
 #include "qwen_asr_safetensors.h"
 #include "qwen_asr_audio.h"
 #include "qwen_asr_tokenizer.h"
@@ -324,6 +325,12 @@ qwen_ctx_t *qwen_clone_shared(const qwen_ctx_t *src) {
     ctx->past_text_conditioning = src->past_text_conditioning;
     ctx->skip_silence = src->skip_silence;
 
+    /* Cloned contexts do not own INT8 resources (they are per-context).
+     * The clone starts on the BF16 path; call qwen_set_decoder_int8() if needed. */
+    ctx->decoder_int8 = 0;
+    ctx->int8_dec_layers = NULL;
+    ctx->n_int8_dec_layers = 0;
+
     /* Cloned live contexts share model weights, but should not reuse prepared
      * prefill caches from the source context. Keep the clone on the plain BF16
      * prefill path to avoid sharing large prepared buffers across session state. */
@@ -468,6 +475,9 @@ void qwen_free(qwen_ctx_t *ctx) {
 
     #undef FREE0
 
+    /* INT8 decoder resources (oneDNN) */
+    qwen_decoder_free_int8(ctx);
+
     /* KV cache */
     free(ctx->kv_cache_k);
     free(ctx->kv_cache_v);
@@ -502,6 +512,33 @@ void qwen_free(qwen_ctx_t *ctx) {
     }
 
     free(ctx);
+}
+
+/* ========================================================================
+ * INT8 Decoder Acceleration
+ * ======================================================================== */
+
+int qwen_set_decoder_int8(qwen_ctx_t *ctx, int enable) {
+    if (!ctx) return -1;
+
+    if (enable) {
+        if (ctx->int8_dec_layers) {
+            /* Already prepared */
+            ctx->decoder_int8 = 1;
+            return 0;
+        }
+        int rc = qwen_decoder_prepare_int8(ctx);
+        if (rc != 0) {
+            ctx->decoder_int8 = 0;
+            return -1;
+        }
+        ctx->decoder_int8 = 1;
+        return 0;
+    } else {
+        qwen_decoder_free_int8(ctx);
+        ctx->decoder_int8 = 0;
+        return 0;
+    }
 }
 
 /* ========================================================================
@@ -2055,7 +2092,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
          * Fix: only decode when the partial tail crosses a coalesce step
          * boundary (default = enc_window_samples/2 ≈ 4 s).  This reduces
          * partial re-encodes from 16 to 2 per window, cutting O(n^2)
-         * encoder work by ~5x while still producing text every ~4 s.
+         * encoder work by ~5x while producing text every ~4 s.
          * The first chunk (chunk_idx==0) and final chunks always decode,
          * and window-boundary crossings are never skipped.
          */
@@ -2207,7 +2244,9 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
              * to keep decoder sequence length (and KV cache) bounded. */
             {
                 int evicted = 0;
+                int evicted_enc_tokens = 0;
                 while (n_enc_cache - enc_cache_start > QWEN_STREAM_MAX_ENC_WINDOWS) {
+                    evicted_enc_tokens += enc_cache[enc_cache_start].seq_len;
                     enc_cached_seq_total -= enc_cache[enc_cache_start].seq_len;
                     free(enc_cache[enc_cache_start].enc_output);
                     enc_cache[enc_cache_start].enc_output = NULL;
@@ -2217,6 +2256,35 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 if (evicted && qwen_monitor) {
                     fprintf(stderr, "\xe2\x9f\xb3");  /* ⟳ = window eviction */
                     fflush(stderr);
+                }
+
+                /* KV cache shift: when encoder windows are evicted, the
+                 * encoder tokens in the input sequence shift left.  Correct
+                 * the RoPE baked into K entries and memmove K/V so the
+                 * subsequent reuse comparison finds a long prefix match
+                 * instead of falling back to reused=prefix_len only. */
+                if (evicted_enc_tokens > 0 && prev_prefill_embeds &&
+                    prev_prefill_len > 0 && ctx->kv_cache_len > 0) {
+                    int plen = PREFIX_HEAD_LEN + ctx->n_prompt_tokens + PREFIX_TAIL_LEN;
+                    if (ctx->kv_cache_len > plen + evicted_enc_tokens) {
+                        qwen_kv_cache_shift(ctx, plen, evicted_enc_tokens);
+                        /* Shift prev_prefill_embeds to match */
+                        int src = plen + evicted_enc_tokens;
+                        if (prev_prefill_len > src) {
+                            int n_move = prev_prefill_len - src;
+                            memmove(prev_prefill_embeds + (size_t)plen * dim,
+                                    prev_prefill_embeds + (size_t)src * dim,
+                                    (size_t)n_move * dim * sizeof(float));
+                            prev_prefill_len -= evicted_enc_tokens;
+                        }
+                        if (qwen_verbose >= 2) {
+                            fprintf(stderr,
+                                    "  KV-shift: evicted %d enc tokens, "
+                                    "kv_cache_len=%d, prev_prefill_len=%d\n",
+                                    evicted_enc_tokens,
+                                    ctx->kv_cache_len, prev_prefill_len);
+                        }
+                    }
                 }
             }
 
@@ -2850,6 +2918,20 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         double reuse_pct = 100.0 * (double)prefill_reused_tokens / (double)prefill_total_tokens;
         fprintf(stderr, "  Prefill reuse: %d/%d tokens (%.1f%%)\n",
                 prefill_reused_tokens, prefill_total_tokens, reuse_pct);
+    }
+    if (qwen_verbose >= 2) {
+        const qwen_runtime_perf_t *rp = &ctx->runtime_perf;
+        double pf_total = rp->decoder_prefill_qkv_ms + rp->decoder_prefill_attn_ms +
+                          rp->decoder_prefill_wo_ms + rp->decoder_prefill_gate_up_ms +
+                          rp->decoder_prefill_down_ms;
+        if (pf_total > 0) {
+            fprintf(stderr,
+                    "  Prefill breakdown: qkv=%.0f attn=%.0f wo=%.0f gate_up=%.0f down=%.0f"
+                    " sum=%.0f ms\n",
+                    rp->decoder_prefill_qkv_ms, rp->decoder_prefill_attn_ms,
+                    rp->decoder_prefill_wo_ms, rp->decoder_prefill_gate_up_ms,
+                    rp->decoder_prefill_down_ms, pf_total);
+        }
     }
     free(prev_prefill_embeds);
     free(raw_tokens);

@@ -38,6 +38,9 @@ float qwen_dot_f32_avx(const float *a, const float *b, int n);
 void qwen_vec_scale_inplace_avx(float *dst, float scale, int n);
 void qwen_vec_axpy_inplace_avx(float *dst, const float *src, float alpha, int n);
 void qwen_vec_scale_add_avx(float *dst, const float *src, float correction, int n);
+void qwen_softmax_causal_avx(float *S, int seq_q, int seq_k, int q_offset);
 #endif
+
+void qwen_softmax_causal_generic(float *S, int seq_q, int seq_k, int q_offset);
 
 #endif /* QWEN_ASR_KERNELS_IMPL_H */

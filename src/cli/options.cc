@@ -156,6 +156,10 @@ Status ParseCliArguments(int argc, const char * const argv[], CliOptions * optio
             options->asr.emit_segments = true;
             continue;
         }
+        if (arg == "--decoder-int8") {
+            options->asr.decoder_int8 = true;
+            continue;
+        }
         return Status(StatusCode::kInvalidArgument, "unknown argument: " + std::string(arg));
     }
 
@@ -184,6 +188,7 @@ std::string BuildCliUsage(std::string_view program_name) {
     usage += "  --language <lang>\n";
     usage += "  --verbosity <n>\n";
     usage += "  --emit-tokens\n";
+    usage += "  --decoder-int8\n";
     usage += "  -h, --help\n";
     return usage;
 }

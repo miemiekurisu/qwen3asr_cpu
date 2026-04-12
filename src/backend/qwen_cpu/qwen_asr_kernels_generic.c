@@ -4,6 +4,7 @@
 
 #include "qwen_asr_kernels_impl.h"
 
+#include <math.h>
 #include <string.h>
 
 void qwen_bf16_matvec_fused_generic(float *y, const float *x, const uint16_t *W_bf16,
@@ -62,4 +63,29 @@ void qwen_vec_axpy_inplace_generic(float *dst, const float *src, float alpha, in
 
 void qwen_vec_scale_add_generic(float *dst, const float *src, float correction, int n) {
     for (int i = 0; i < n; i++) dst[i] = dst[i] * correction + src[i];
+}
+
+void qwen_softmax_causal_generic(float *S, int seq_q, int seq_k, int q_offset) {
+    for (int i = 0; i < seq_q; i++) {
+        float *row = S + (size_t)i * seq_k;
+        int valid_k = q_offset + i + 1;
+        if (valid_k > seq_k) valid_k = seq_k;
+
+        for (int j = valid_k; j < seq_k; j++) row[j] = -1e30f;
+
+        float max_val = row[0];
+        for (int j = 1; j < valid_k; j++) {
+            if (row[j] > max_val) max_val = row[j];
+        }
+
+        float sum = 0.0f;
+        for (int j = 0; j < seq_k; j++) {
+            float v = expf(row[j] - max_val);
+            row[j] = v;
+            sum += v;
+        }
+
+        float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+        for (int j = 0; j < seq_k; j++) row[j] *= inv_sum;
+    }
 }

@@ -12,6 +12,7 @@
 
 #include "qwen_asr.h"
 #include "qwen_asr_kernels.h"
+#include "qwen_asr_onednn.h"
 #include "qwen_asr_safetensors.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -441,6 +442,82 @@ static int ensure_rope_cache(qwen_ctx_t *ctx, int required_pos, int head_dim, fl
 }
 
 /* ========================================================================
+ * KV Cache Shift (for encoder window eviction with RoPE correction)
+ * ======================================================================== */
+
+void qwen_kv_cache_shift(qwen_ctx_t *ctx, int prefix_keep, int shift) {
+    if (shift <= 0) return;
+    int kv_len = ctx->kv_cache_len;
+    int src_start = prefix_keep + shift;
+    if (src_start >= kv_len) return;
+
+    int n_move = kv_len - src_start;
+    int n_layers = ctx->config.dec_layers;
+    int n_kv_heads = ctx->config.dec_kv_heads;
+    int head_dim = ctx->config.dec_head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+    int half = head_dim / 2;
+    float theta = ctx->config.dec_rope_theta;
+
+    /* Ensure rope cache covers the shift amount */
+    ensure_rope_cache(ctx, shift + 1, head_dim, theta);
+
+    /* cos/sin for the inverse rotation by 'shift' positions.
+     * R(-shift) = [[cos, sin], [-sin, cos]] undoes the position offset. */
+    const float *cos_d = ctx->rope_cache_cos + (size_t)shift * head_dim;
+    const float *sin_d = ctx->rope_cache_sin + (size_t)shift * head_dim;
+
+    for (int layer = 0; layer < n_layers; layer++) {
+        float *k_src = kv_cache_k_at(ctx, layer, src_start);
+
+        /* Apply inverse RoPE rotation in-place to K entries being shifted */
+        for (int pos = 0; pos < n_move; pos++) {
+            float *k = k_src + (size_t)pos * kv_dim;
+            for (int h = 0; h < n_kv_heads; h++) {
+                float *vec = k + h * head_dim;
+#if defined(__AVX2__) && defined(__FMA__)
+                int d = 0;
+                for (; d + 8 <= half; d += 8) {
+                    __m256 k1 = _mm256_loadu_ps(vec + d);
+                    __m256 k2 = _mm256_loadu_ps(vec + half + d);
+                    __m256 cc = _mm256_loadu_ps(cos_d + d);
+                    __m256 ss = _mm256_loadu_ps(sin_d + d);
+                    /* new1 =  k1*cos + k2*sin */
+                    __m256 new1 = _mm256_fmadd_ps(k1, cc, _mm256_mul_ps(k2, ss));
+                    /* new2 = -k1*sin + k2*cos */
+                    __m256 new2 = _mm256_fnmadd_ps(k1, ss, _mm256_mul_ps(k2, cc));
+                    _mm256_storeu_ps(vec + d, new1);
+                    _mm256_storeu_ps(vec + half + d, new2);
+                }
+                for (; d < half; d++) {
+                    float v1 = vec[d], v2 = vec[half + d];
+                    vec[d]        =  v1 * cos_d[d] + v2 * sin_d[d];
+                    vec[half + d] = -v1 * sin_d[d] + v2 * cos_d[d];
+                }
+#else
+                for (int d = 0; d < half; d++) {
+                    float v1 = vec[d], v2 = vec[half + d];
+                    vec[d]        =  v1 * cos_d[d] + v2 * sin_d[d];
+                    vec[half + d] = -v1 * sin_d[d] + v2 * cos_d[d];
+                }
+#endif
+            }
+        }
+
+        /* Move K entries from src_start to prefix_keep */
+        float *k_dst = kv_cache_k_at(ctx, layer, prefix_keep);
+        memmove(k_dst, k_src, (size_t)n_move * kv_dim * sizeof(float));
+
+        /* Move V entries (no rotation needed) */
+        float *v_src = kv_cache_v_at(ctx, layer, src_start);
+        float *v_dst = kv_cache_v_at(ctx, layer, prefix_keep);
+        memmove(v_dst, v_src, (size_t)n_move * kv_dim * sizeof(float));
+    }
+
+    ctx->kv_cache_len = kv_len - shift;
+}
+
+/* ========================================================================
  * Decoder Prefill (Multiple Tokens)
  * ======================================================================== */
 
@@ -460,6 +537,7 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
     float *qkv_out_scratch = NULL;
     float *linear_weight_scratch = NULL;
     size_t linear_weight_scratch_count = 0;
+    float *attn_score_buf = NULL;
 
     qwen_apply_prefill_thread_policy();
 
@@ -511,6 +589,14 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
             if (linear_weight_scratch_count > 0) {
                 scratch_count += linear_weight_scratch_count;
             }
+            /* Pre-allocate score buffer for GEMM-based attention.
+             * Size: n_heads * seq_len * max_kv_len floats.
+             * max_kv_len is not known here (start_pos computed later),
+             * but we can use kv_cache_len + seq_len as upper bound. */
+            size_t attn_score_count = (size_t)n_heads * (size_t)seq_len
+                                      * (size_t)(ctx->kv_cache_len + seq_len);
+            scratch_count += attn_score_count;
+
             if (qwen_float_arena_reserve(&ctx->prefill_scratch, scratch_count) != 0) return;
             qkv_out_scratch = qwen_float_arena_alloc(&ctx->prefill_scratch,
                                                      (size_t)seq_len * (size_t)total_qkv_dim);
@@ -520,6 +606,9 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
                                                                linear_weight_scratch_count);
                 if (!linear_weight_scratch) return;
             }
+            attn_score_buf = qwen_float_arena_alloc(&ctx->prefill_scratch,
+                                                    attn_score_count);
+            /* attn_score_buf may be NULL — attention will fallback to malloc */
         }
     }
 
@@ -532,16 +621,31 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
 
     float scale = 1.0f / sqrtf((float)head_dim);
 
+    double call_attn_ms = 0, call_wo_ms = 0, call_down_ms = 0;
+    double call_qkv_ms = 0, call_gate_up_ms = 0;
+
     for (int layer = 0; layer < cfg->dec_layers; layer++) {
         qwen_dec_layer_t *l = &dec->layers[layer];
+
+        /* INT8 layer pointer (NULL if unavailable) */
+        qwen_int8_dec_layer_t *il = NULL;
+        if (ctx->int8_dec_layers && layer < ctx->n_int8_dec_layers) {
+            il = &((qwen_int8_dec_layer_t *)ctx->int8_dec_layers)[layer];
+            if (!il->mm_wq) il = NULL;  /* guard against partial init */
+        }
 
         /* Input RMSNorm */
         qwen_rms_norm(x_norm, x, l->input_norm, seq_len, dim, eps);
 
-        /* QKV projections (fused single GEMM) */
-        if (ctx->runtime_profile.decoder_layer_timing) {
+        /* QKV projections — INT8 path uses separate Q/K/V matmuls,
+         * BF16/F32 path uses fused single GEMM */
+        {
             const double qkv_start = qwen_perf_now_ms();
-            if (seq_len > 1 && l->prefill_qkv_prepared.f32_data) {
+            if (il) {
+                qwen_int8_matvec(il->mm_wq, x_norm, seq_len, q);
+                qwen_int8_matvec(il->mm_wk, x_norm, seq_len, k);
+                qwen_int8_matvec(il->mm_wv, x_norm, seq_len, v);
+            } else if (seq_len > 1 && l->prefill_qkv_prepared.f32_data) {
                 qwen_linear_nobias_qkv_f32_packed(q, k, v,
                                                   qkv_out_scratch,
                                                   x_norm,
@@ -557,22 +661,7 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
                                                     l->wv_weight_bf16,
                                                     seq_len, dim, q_dim, kv_dim);
             }
-            ctx->runtime_perf.decoder_prefill_qkv_ms += qwen_perf_now_ms() - qkv_start;
-        } else if (seq_len > 1 && l->prefill_qkv_prepared.f32_data) {
-            qwen_linear_nobias_qkv_f32_packed(q, k, v,
-                                              qkv_out_scratch,
-                                              x_norm,
-                                              l->prefill_qkv_prepared.f32_data,
-                                              seq_len, dim, q_dim, kv_dim);
-        } else {
-            qwen_linear_nobias_bf16_qkv_prefill(q, k, v,
-                                                qkv_out_scratch,
-                                                linear_weight_scratch,
-                                                x_norm,
-                                                l->wq_weight_bf16,
-                                                l->wk_weight_bf16,
-                                                l->wv_weight_bf16,
-                                                seq_len, dim, q_dim, kv_dim);
+            call_qkv_ms += qwen_perf_now_ms() - qkv_start;
         }
 
         /* Per-head Q/K RMSNorm */
@@ -592,26 +681,41 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
         }
 
         /* Causal attention */
-        int total_seq = start_pos + seq_len;
-        float *full_k = kv_cache_k_at(ctx, layer, 0);
-        float *full_v = kv_cache_v_at(ctx, layer, 0);
-        qwen_causal_attention(attn_out, q, full_k, full_v,
-                               seq_len, total_seq, n_heads, n_kv_heads,
-                               head_dim, scale, start_pos);
+        {
+            const double attn_t0 = qwen_perf_now_ms();
+            int total_seq = start_pos + seq_len;
+            float *full_k = kv_cache_k_at(ctx, layer, 0);
+            float *full_v = kv_cache_v_at(ctx, layer, 0);
+            qwen_causal_attention(attn_out, q, full_k, full_v,
+                                   seq_len, total_seq, n_heads, n_kv_heads,
+                                   head_dim, scale, start_pos,
+                                   attn_score_buf);
+            call_attn_ms += qwen_perf_now_ms() - attn_t0;
+        }
 
         /* Output projection + residual */
-        qwen_linear_nobias_bf16_scratch(proj_out, attn_out, l->wo_weight_bf16,
-                        linear_weight_scratch,
-                        seq_len, q_dim, dim);
+        {
+            const double wo_t0 = qwen_perf_now_ms();
+            if (il) {
+                qwen_int8_matvec(il->mm_wo, attn_out, seq_len, proj_out);
+            } else {
+                qwen_linear_nobias_bf16_scratch(proj_out, attn_out, l->wo_weight_bf16,
+                                linear_weight_scratch,
+                                seq_len, q_dim, dim);
+            }
+            call_wo_ms += qwen_perf_now_ms() - wo_t0;
+        }
         qwen_add_inplace(x, proj_out, seq_len * dim);
 
         /* Post-attention RMSNorm */
         qwen_rms_norm(x_norm, x, l->post_attn_norm, seq_len, dim, eps);
 
         /* SwiGLU MLP */
-        if (ctx->runtime_profile.decoder_layer_timing) {
+        {
             const double gate_up_start = qwen_perf_now_ms();
-            if (l->prefill_gate_up_prepared.f32_data) {
+            if (il) {
+                qwen_int8_matvec(il->mm_gate_up, x_norm, seq_len, gate_up);
+            } else if (l->prefill_gate_up_prepared.f32_data) {
                 qwen_linear_nobias(gate_up, x_norm, l->prefill_gate_up_prepared.f32_data,
                                    seq_len, dim, 2 * intermediate);
             } else {
@@ -619,24 +723,41 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
                                                 linear_weight_scratch,
                                                 seq_len, dim, 2 * intermediate);
             }
-            ctx->runtime_perf.decoder_prefill_gate_up_ms += qwen_perf_now_ms() - gate_up_start;
-        } else {
-            if (l->prefill_gate_up_prepared.f32_data) {
-                qwen_linear_nobias(gate_up, x_norm, l->prefill_gate_up_prepared.f32_data,
-                                   seq_len, dim, 2 * intermediate);
-            } else {
-                qwen_linear_nobias_bf16_scratch(gate_up, x_norm, l->gate_up_fused_bf16,
-                                                linear_weight_scratch,
-                                                seq_len, dim, 2 * intermediate);
-            }
+            call_gate_up_ms += qwen_perf_now_ms() - gate_up_start;
         }
         qwen_swiglu_multiply(gate, gate_up, seq_len, intermediate);
-        qwen_linear_nobias_bf16_scratch(ffn_out, gate, l->down_weight_bf16,
-                                        linear_weight_scratch,
-                                        seq_len, intermediate, dim);
+        {
+            const double down_t0 = qwen_perf_now_ms();
+            if (il) {
+                qwen_int8_matvec(il->mm_down, gate, seq_len, ffn_out);
+            } else {
+                qwen_linear_nobias_bf16_scratch(ffn_out, gate, l->down_weight_bf16,
+                                                linear_weight_scratch,
+                                                seq_len, intermediate, dim);
+            }
+            call_down_ms += qwen_perf_now_ms() - down_t0;
+        }
 
         qwen_add_inplace(x, ffn_out, seq_len * dim);
 
+    }
+
+    /* Accumulate to runtime perf counters */
+    ctx->runtime_perf.decoder_prefill_qkv_ms += call_qkv_ms;
+    ctx->runtime_perf.decoder_prefill_attn_ms += call_attn_ms;
+    ctx->runtime_perf.decoder_prefill_wo_ms += call_wo_ms;
+    ctx->runtime_perf.decoder_prefill_gate_up_ms += call_gate_up_ms;
+    ctx->runtime_perf.decoder_prefill_down_ms += call_down_ms;
+
+    if (qwen_verbose >= 3) {
+        double total = call_qkv_ms + call_attn_ms + call_wo_ms +
+                       call_gate_up_ms + call_down_ms;
+        fprintf(stderr,
+                "  Prefill profile: seq=%d kv=%d | qkv=%.0f attn=%.0f wo=%.0f "
+                "gate_up=%.0f down=%.0f total=%.0f ms\n",
+                seq_len, start_pos,
+                call_qkv_ms, call_attn_ms, call_wo_ms,
+                call_gate_up_ms, call_down_ms, total);
     }
 
     ctx->kv_cache_len = start_pos + seq_len;
@@ -715,11 +836,25 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
         qwen_dec_layer_t *l = &dec->layers[layer];
 
         qwen_rms_norm(x_norm, x, l->input_norm, 1, dim, eps);
-        qwen_linear_nobias_bf16_qkv(q, k, v, x_norm,
-                                    l->wq_weight_bf16,
-                                    l->wk_weight_bf16,
-                                    l->wv_weight_bf16,
-                                    dim, q_dim, kv_dim);
+
+        /* INT8 path: use oneDNN matmul when available */
+        qwen_int8_dec_layer_t *il = NULL;
+        if (ctx->int8_dec_layers && layer < ctx->n_int8_dec_layers) {
+            il = &((qwen_int8_dec_layer_t *)ctx->int8_dec_layers)[layer];
+            if (!il->mm_wq) il = NULL;  /* guard against partial init */
+        }
+
+        if (il) {
+            qwen_int8_matvec(il->mm_wq, x_norm, 1, q);
+            qwen_int8_matvec(il->mm_wk, x_norm, 1, k);
+            qwen_int8_matvec(il->mm_wv, x_norm, 1, v);
+        } else {
+            qwen_linear_nobias_bf16_qkv(q, k, v, x_norm,
+                                        l->wq_weight_bf16,
+                                        l->wk_weight_bf16,
+                                        l->wv_weight_bf16,
+                                        dim, q_dim, kv_dim);
+        }
 
         /* Per-head Q/K RMSNorm */
         qwen_rms_norm_per_head(q, l->q_norm_weight, 1, n_heads, head_dim, eps);
@@ -738,19 +873,31 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
 
         qwen_causal_attention(attn_out, q, full_k, full_v,
                                1, total_seq, n_heads, n_kv_heads,
-                               head_dim, scale, pos);
+                               head_dim, scale, pos, NULL);
 
-        qwen_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
+        if (il) {
+            qwen_int8_matvec(il->mm_wo, attn_out, 1, proj_out);
+        } else {
+            qwen_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
+        }
         qwen_add_inplace(x, proj_out, dim);
 
         qwen_rms_norm(x_norm, x, l->post_attn_norm, 1, dim, eps);
 
         /* Fused gate+up matvec: one pass over x_norm, output interleaved [g0,u0,g1,u1,...] */
-        qwen_linear_nobias_bf16(gate_buf, x_norm, l->gate_up_fused_bf16,
-                                 1, dim, 2 * intermediate);
+        if (il) {
+            qwen_int8_matvec(il->mm_gate_up, x_norm, 1, gate_buf);
+        } else {
+            qwen_linear_nobias_bf16(gate_buf, x_norm, l->gate_up_fused_bf16,
+                                     1, dim, 2 * intermediate);
+        }
         /* In-place for seq=1: gate_buf[0:inter] receives SwiGLU output. */
         qwen_swiglu_multiply(gate_buf, gate_buf, 1, intermediate);
-        qwen_linear_nobias_bf16(ffn_out, gate_buf, l->down_weight_bf16, 1, intermediate, dim);
+        if (il) {
+            qwen_int8_matvec(il->mm_down, gate_buf, 1, ffn_out);
+        } else {
+            qwen_linear_nobias_bf16(ffn_out, gate_buf, l->down_weight_bf16, 1, intermediate, dim);
+        }
         qwen_add_inplace(x, ffn_out, dim);
     }
 

@@ -902,6 +902,11 @@ public:
         if (ctx_ == nullptr) {
             return Status(StatusCode::kInternal, "qwen_load failed");
         }
+        if (config.decoder_int8) {
+            if (qwen_set_decoder_int8(ctx_, 1) != 0) {
+                std::fprintf(stderr, "warning: decoder INT8 init failed, falling back to BF16\n");
+            }
+        }
         ctx_->past_text_conditioning = 1;
         ctx_->segment_sec = 30.0f;
         return OkStatus();
@@ -2020,6 +2025,10 @@ Status ParseServerArguments(int argc, const char * const argv[], ServerConfig * 
             ++index;
             continue;
         }
+        if (arg == "--decoder-int8") {
+            config->decoder_int8 = true;
+            continue;
+        }
         return Status(StatusCode::kInvalidArgument, "unknown argument: " + std::string(arg));
     }
 
@@ -2041,6 +2050,7 @@ std::string BuildServerUsage(std::string_view program_name) {
     usage += "  --ui-dir <dir>\n";
     usage += "  --threads <n>\n";
     usage += "  --verbosity <n>\n";
+    usage += "  --decoder-int8\n";
     usage += "  -h, --help\n";
     return usage;
 }

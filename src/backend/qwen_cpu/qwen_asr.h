@@ -209,6 +209,9 @@ typedef struct {
     double decoder_prefill_qkv_ms;
     double decoder_prefill_gate_up_prepare_ms;
     double decoder_prefill_gate_up_ms;
+    double decoder_prefill_attn_ms;
+    double decoder_prefill_wo_ms;
+    double decoder_prefill_down_ms;
     size_t decoder_prefill_qkv_bytes;
     size_t decoder_prefill_gate_up_bytes;
     int decoder_prefill_qkv_layers;
@@ -289,6 +292,11 @@ typedef struct {
     double perf_audio_ms;          /* input audio duration in milliseconds */
     double perf_encode_ms;         /* mel + encoder time in milliseconds */
     double perf_decode_ms;         /* decoder prefill + decode time in milliseconds */
+
+    /* INT8 decoder acceleration (optional, via oneDNN) */
+    int decoder_int8;              /* 0=disabled (default), 1=enabled */
+    void *int8_dec_layers;         /* qwen_int8_dec_layer_t[] or NULL */
+    int n_int8_dec_layers;         /* number of valid entries */
 } qwen_ctx_t;
 
 /* ========================================================================
@@ -332,6 +340,12 @@ void qwen_free(qwen_ctx_t *ctx);
 
 /* Internal runtime preparation step used after decoder weights are loaded. */
 int qwen_decoder_prepare_runtime(qwen_ctx_t *ctx);
+
+/* Enable or disable INT8 decoder acceleration (requires oneDNN).
+ * Must be called after qwen_load(). Quantizes weights on first enable.
+ * enable=0 frees INT8 resources and reverts to BF16 path.
+ * Returns 0 on success, -1 on failure (remains on BF16 path). */
+int qwen_set_decoder_int8(qwen_ctx_t *ctx, int enable);
 
 /* Set a callback to receive each decoded token as it's generated.
  * Set cb=NULL to disable. The callback is invoked during transcription. */
@@ -384,6 +398,9 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
 
 /* Decoder prefill (multiple tokens) */
 void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_len);
+
+/* KV cache shift: correct RoPE on K entries and move positions after eviction */
+void qwen_kv_cache_shift(qwen_ctx_t *ctx, int prefix_keep, int shift);
 
 /* Decoder forward (single token, uses KV cache, returns greedy token) */
 int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed);

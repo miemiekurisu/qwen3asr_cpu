@@ -14,6 +14,7 @@
 #if defined(QWEN_X86_AVX2_AVAILABLE)
 
 #include <immintrin.h>
+#include <math.h>
 #include <string.h>
 
 /* =====================================================================
@@ -497,6 +498,93 @@ void qwen_vec_scale_add_avx(float *dst, const float *src, float correction, int 
     }
     for (; i < n; i++) dst[i] = dst[i] * correction + src[i];
 #endif
+}
+
+/* =====================================================================
+ * AVX2 fast exp — polynomial approximation of exp(x).
+ * Uses range reduction x = n*ln2 + f, then degree-5 Taylor for e^f.
+ * Max relative error ~1.5e-4 (acceptable for softmax normalisation).
+ * ===================================================================== */
+static inline __m256 qwen_fast_exp_avx2(__m256 x) {
+    x = _mm256_max_ps(x, _mm256_set1_ps(-87.0f));
+    x = _mm256_min_ps(x, _mm256_set1_ps(88.0f));
+
+    __m256 t = _mm256_mul_ps(x, _mm256_set1_ps(1.44269504f));  /* x / ln2 */
+    __m256 n = _mm256_floor_ps(t);
+    __m256 f = _mm256_fnmadd_ps(n, _mm256_set1_ps(0.6931472f), x); /* f = x - n*ln2 */
+
+    /* e^f ≈ 1 + f(1 + f(1/2 + f(1/6 + f(1/24 + f/120)))) */
+    __m256 p = _mm256_set1_ps(1.0f / 120.0f);
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.0f / 24.0f));
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.0f / 6.0f));
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(0.5f));
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.0f));
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.0f));
+
+    /* 2^n via exponent bit manipulation */
+    __m256i ni = _mm256_cvtps_epi32(n);
+    ni = _mm256_add_epi32(ni, _mm256_set1_epi32(127));
+    ni = _mm256_slli_epi32(ni, 23);
+    return _mm256_mul_ps(p, _mm256_castsi256_ps(ni));
+}
+
+/* =====================================================================
+ * AVX2 causal softmax — row-wise masked softmax over score matrix.
+ * S[seq_q, seq_k], q_offset = global position of first query.
+ * ===================================================================== */
+void qwen_softmax_causal_avx(float *S, int seq_q, int seq_k, int q_offset) {
+    for (int i = 0; i < seq_q; i++) {
+        float *row = S + (size_t)i * seq_k;
+        int valid_k = q_offset + i + 1;
+        if (valid_k > seq_k) valid_k = seq_k;
+
+        /* Mask future positions */
+        for (int j = valid_k; j < seq_k; j++) row[j] = -1e30f;
+
+        /* Row max — AVX2 */
+        __m256 vmax = _mm256_set1_ps(-1e30f);
+        int j = 0;
+        for (; j + 8 <= seq_k; j += 8)
+            vmax = _mm256_max_ps(vmax, _mm256_loadu_ps(row + j));
+        __m128 mhi = _mm256_extractf128_ps(vmax, 1);
+        __m128 mlo = _mm256_castps256_ps128(vmax);
+        __m128 m4  = _mm_max_ps(mlo, mhi);
+        m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+        m4 = _mm_max_ss(m4, _mm_shuffle_ps(m4, m4, 1));
+        float max_val = _mm_cvtss_f32(m4);
+        for (; j < seq_k; j++)
+            if (row[j] > max_val) max_val = row[j];
+
+        /* exp(row - max) and sum — AVX2 fast exp */
+        __m256 vmax_bc = _mm256_set1_ps(max_val);
+        __m256 vsum = _mm256_setzero_ps();
+        j = 0;
+        for (; j + 8 <= seq_k; j += 8) {
+            __m256 v = _mm256_sub_ps(_mm256_loadu_ps(row + j), vmax_bc);
+            __m256 e = qwen_fast_exp_avx2(v);
+            _mm256_storeu_ps(row + j, e);
+            vsum = _mm256_add_ps(vsum, e);
+        }
+        __m128 shi = _mm256_extractf128_ps(vsum, 1);
+        __m128 slo = _mm256_castps256_ps128(vsum);
+        __m128 s4  = _mm_add_ps(slo, shi);
+        s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+        s4 = _mm_add_ss(s4, _mm_shuffle_ps(s4, s4, 1));
+        float sum = _mm_cvtss_f32(s4);
+        for (; j < seq_k; j++) {
+            float e = expf(row[j] - max_val);
+            row[j] = e;
+            sum += e;
+        }
+
+        /* Normalise — AVX2 */
+        float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+        __m256 vinv = _mm256_set1_ps(inv_sum);
+        j = 0;
+        for (; j + 8 <= seq_k; j += 8)
+            _mm256_storeu_ps(row + j, _mm256_mul_ps(_mm256_loadu_ps(row + j), vinv));
+        for (; j < seq_k; j++) row[j] *= inv_sum;
+    }
 }
 
 #endif /* QWEN_X86_AVX2_AVAILABLE */

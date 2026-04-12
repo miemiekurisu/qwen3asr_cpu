@@ -295,6 +295,12 @@ AsrRunResult RunAsr(const AsrRunOptions & options) {
         return result;
     }
 
+    if (options.decoder_int8) {
+        if (qwen_set_decoder_int8(ctx, 1) != 0) {
+            std::fprintf(stderr, "warning: decoder INT8 init failed, falling back to BF16\n");
+        }
+    }
+
     ctx->stream_max_new_tokens = static_cast<int>(options.stream_max_new_tokens);
 
     if (!options.prompt.empty() && qwen_set_prompt(ctx, options.prompt.c_str()) != 0) {

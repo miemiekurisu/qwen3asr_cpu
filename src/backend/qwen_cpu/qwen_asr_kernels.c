@@ -1814,18 +1814,169 @@ static void causal_attn_worker(int tid, int n_threads, void *arg) {
                                 t->head_dim, t->scale, t->q_offset, h0, h1);
 }
 
+/* ========================================================================
+ * GEMM-based Causal Attention for Prefill (seq_q > 1)
+ *
+ * Replaces per-query dot-product loop with two cblas_sgemm calls:
+ *   1. S = scale * Q × K^T     (score matrix)
+ *   2. O = softmax(S) × V      (output)
+ * This dramatically improves cache utilisation because OpenBLAS GEMM
+ * kernels tile for L1/L2, whereas the dot-product loop re-reads the
+ * entire K/V cache once per query with poor spatial locality.
+ * ======================================================================== */
+
+#ifdef USE_BLAS
+
+/* Per-head GEMM attention — called from parallel_for worker. */
+static void qwen_causal_attention_gemm_head(
+    float *out, const float *Q, const float *K, const float *V,
+    int seq_q, int seq_k, int n_heads, int n_kv_heads, int head_dim,
+    float scale, int q_offset, float *score_buf, int h)
+{
+    int heads_per_kv = n_heads / n_kv_heads;
+    int q_hidden = n_heads * head_dim;
+    int kv_hidden = n_kv_heads * head_dim;
+    int kv_h = h / heads_per_kv;
+
+    float *S = score_buf;
+
+    /* S[seq_q, seq_k] = scale * Q_h × K_kv_h^T
+     * Q_h rows: Q + i*q_hidden + h*head_dim, stride=q_hidden
+     * K_kv_h rows: K + j*kv_hidden + kv_h*head_dim, stride=kv_hidden */
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                seq_q, seq_k, head_dim,
+                scale,
+                Q + h * head_dim, q_hidden,
+                K + kv_h * head_dim, kv_hidden,
+                0.0f,
+                S, seq_k);
+
+    /* Causal mask + row-wise softmax */
+    for (int i = 0; i < seq_q; i++) {
+        float *row = S + (size_t)i * seq_k;
+        int valid_k = q_offset + i + 1;
+        if (valid_k > seq_k) valid_k = seq_k;
+
+        /* Mask future positions */
+        for (int j = valid_k; j < seq_k; j++) row[j] = -1e30f;
+
+        /* Row max */
+        float max_val = row[0];
+        for (int j = 1; j < valid_k; j++) {
+            if (row[j] > max_val) max_val = row[j];
+        }
+
+        /* exp(row - max) + sum */
+        float sum = 0.0f;
+        for (int j = 0; j < seq_k; j++) {
+            float v = expf(row[j] - max_val);
+            row[j] = v;
+            sum += v;
+        }
+
+        /* Normalise */
+        float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+        for (int j = 0; j < seq_k; j++) row[j] *= inv_sum;
+    }
+
+    /* O_h[seq_q, head_dim] = softmax(S) × V_kv_h
+     * V_kv_h rows: V + j*kv_hidden + kv_h*head_dim, stride=kv_hidden */
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                seq_q, head_dim, seq_k,
+                1.0f,
+                S, seq_k,
+                V + kv_h * head_dim, kv_hidden,
+                0.0f,
+                out + h * head_dim, q_hidden);
+}
+
+typedef struct {
+    float *out;
+    const float *Q;
+    const float *K;
+    const float *V;
+    int seq_q, seq_k;
+    int n_heads, n_kv_heads;
+    int head_dim;
+    float scale;
+    int q_offset;
+    float *score_buf;   /* [n_heads * seq_q * seq_k] */
+} causal_attn_gemm_task_t;
+
+static void causal_attn_gemm_worker(int tid, int n_threads, void *arg) {
+    causal_attn_gemm_task_t *t = (causal_attn_gemm_task_t *)arg;
+    int chunk = (t->n_heads + n_threads - 1) / n_threads;
+    int h0 = tid * chunk;
+    int h1 = h0 + chunk;
+    if (h1 > t->n_heads) h1 = t->n_heads;
+
+    size_t score_stride = (size_t)t->seq_q * t->seq_k;
+
+    for (int h = h0; h < h1; h++) {
+        qwen_causal_attention_gemm_head(
+            t->out, t->Q, t->K, t->V,
+            t->seq_q, t->seq_k, t->n_heads, t->n_kv_heads,
+            t->head_dim, t->scale, t->q_offset,
+            t->score_buf + (size_t)h * score_stride,
+            h);
+    }
+}
+
+#endif /* USE_BLAS */
+
 void qwen_causal_attention(float *out, const float *Q, const float *K, const float *V,
                             int seq_q, int seq_k, int n_heads, int n_kv_heads,
-                            int head_dim, float scale, int q_offset) {
+                            int head_dim, float scale, int q_offset,
+                            float *score_buf) {
     if (tp.n_threads > 1 && n_heads >= 2 && (seq_q >= 2 || seq_k >= 128)) {
-        causal_attn_task_t task = {
-            .out = out, .Q = Q, .K = K, .V = V,
-            .seq_q = seq_q, .seq_k = seq_k,
-            .n_heads = n_heads, .n_kv_heads = n_kv_heads,
-            .head_dim = head_dim, .scale = scale, .q_offset = q_offset
-        };
-        parallel_for(causal_attn_worker, &task);
-        return;
+#ifdef USE_BLAS
+        /* For prefill (seq_q > 1), use GEMM-based attention which has
+         * much better cache behaviour than the per-query dot-product loop.
+         * We temporarily force OpenBLAS to 1 thread since parallel_for
+         * already distributes heads across our custom thread pool. */
+        if (seq_q > 1) {
+            int free_local = 0;
+            if (!score_buf) {
+                size_t score_count = (size_t)n_heads * seq_q * seq_k;
+                score_buf = (float *)malloc(score_count * sizeof(float));
+                if (!score_buf) goto dot_product;
+                free_local = 1;
+            }
+            {
+                int saved_blas_threads = 0;
+#if defined(USE_OPENBLAS)
+                saved_blas_threads = openblas_get_num_threads();
+                openblas_set_num_threads(1);
+#endif
+                causal_attn_gemm_task_t task = {
+                    .out = out, .Q = Q, .K = K, .V = V,
+                    .seq_q = seq_q, .seq_k = seq_k,
+                    .n_heads = n_heads, .n_kv_heads = n_kv_heads,
+                    .head_dim = head_dim, .scale = scale,
+                    .q_offset = q_offset, .score_buf = score_buf
+                };
+                parallel_for(causal_attn_gemm_worker, &task);
+#if defined(USE_OPENBLAS)
+                if (saved_blas_threads > 0)
+                    openblas_set_num_threads(saved_blas_threads);
+#endif
+            }
+            if (free_local) free(score_buf);
+            return;
+        }
+#endif /* USE_BLAS */
+
+dot_product:
+        {
+            causal_attn_task_t task = {
+                .out = out, .Q = Q, .K = K, .V = V,
+                .seq_q = seq_q, .seq_k = seq_k,
+                .n_heads = n_heads, .n_kv_heads = n_kv_heads,
+                .head_dim = head_dim, .scale = scale, .q_offset = q_offset
+            };
+            parallel_for(causal_attn_worker, &task);
+            return;
+        }
     }
 
     qwen_causal_attention_heads(out, Q, K, V,
