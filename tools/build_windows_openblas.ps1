@@ -233,6 +233,15 @@ try {
         }
 
         if (-not $SkipTests) {
+            # Ensure libopenblas.dll is reachable by the test executable.
+            # OpenBLAS_DIR points to <prefix>/lib/cmake/openblas; the DLL
+            # lives under <prefix>/bin.
+            $openBlasPrefix = (Resolve-Path (Join-Path $resolvedOpenBlas "../../..")).Path
+            $openBlasBin = Join-Path $openBlasPrefix "bin"
+            if (Test-Path $openBlasBin) {
+                Add-ToPath $openBlasBin
+            }
+
             & $ctest --preset $Preset
             if ($LASTEXITCODE -ne 0) {
                 throw "CTest failed."

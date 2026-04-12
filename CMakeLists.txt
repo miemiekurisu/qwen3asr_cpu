@@ -238,6 +238,7 @@ if(QASR_ENABLE_TESTS)
         tests/json_test.cc
         tests/http_server_test.cc
         tests/realfile_audio_test.cc
+        tests/silence_gap_test.cc
     )
 
     if(QASR_ENABLE_CPU_BACKEND)
