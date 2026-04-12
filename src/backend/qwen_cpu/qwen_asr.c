@@ -1965,6 +1965,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     }
 
     int chunk_idx = 0;
+    int window_has_speech = 0;
     int64_t audio_cursor = 0;
     stream_enc_window_t *enc_cache = NULL;
     int n_enc_cache = 0;
@@ -2086,38 +2087,55 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
          * re-encoded from scratch every chunk → O(n²) cost per window.
          *
          * Strategy – skip MORE during silence, LESS during speech:
-         *  1) SILENT chunk (RMS < threshold) → always skip.  Never
-         *     waste compute decoding silence.  Saves ~2 decode cycles
-         *     per 8 s window of silence vs the old fixed-bracket logic.
+         *  1) SILENT chunk (RMS < threshold) → always skip.
          *  2) SPEECH onset (silence → speech transition) → force decode
          *     immediately for minimum latency (~0.5 s response).
          *  3) Continuous SPEECH → coalesce with a tight step of
-         *     enc_window/4 ≈ 2 s (was enc_window/2 ≈ 4 s), so text
-         *     updates appear twice as often during active speech.
+         *     enc_window/4 ≈ 2 s, so text updates appear often.
+         *  4) ALL-SILENT WINDOW → skip boundary decode too.  Prevents
+         *     the model from hallucinating on silence, which causes
+         *     unbounded prefix growth and eventual crash.
          *
-         * The first chunk (chunk_idx==0) and final chunks always decode,
-         * and window-boundary crossings (partial_span==0) are never skipped.
+         * The first chunk (chunk_idx==0) and final chunks always decode.
          */
         if (use_enc_cache && !is_final && chunk_idx > 0) {
             int64_t partial_span = audio_cursor - full_end;
-            if (partial_span > 0 && partial_span < enc_window_samples) {
-                /* RMS of the current 0.5 s chunk. */
-                int64_t chunk_off = audio_cursor - chunk_samples;
-                float cur_rms = 0.0f;
-                if (chunk_off >= 0 && chunk_off < audio_n_samples) {
-                    int64_t clen = chunk_samples;
-                    if (clen > audio_n_samples - chunk_off)
-                        clen = audio_n_samples - chunk_off;
-                    const float *cptr = audio_samples + chunk_off;
-                    float e = 0.0f;
-                    for (int64_t i = 0; i < clen; i++) {
-                        float s = cptr[i];
-                        e += s * s;
-                    }
-                    cur_rms = sqrtf(e / (float)(clen > 0 ? clen : 1));
-                }
 
-                const float sil_thresh = 0.003f; /* ≈ -50 dBFS */
+            /* RMS of the current 0.5 s chunk (needed for all paths). */
+            int64_t chunk_off = audio_cursor - chunk_samples;
+            float cur_rms = 0.0f;
+            if (chunk_off >= 0 && chunk_off < audio_n_samples) {
+                int64_t clen = chunk_samples;
+                if (clen > audio_n_samples - chunk_off)
+                    clen = audio_n_samples - chunk_off;
+                const float *cptr = audio_samples + chunk_off;
+                float e = 0.0f;
+                for (int64_t i = 0; i < clen; i++) {
+                    float s = cptr[i];
+                    e += s * s;
+                }
+                cur_rms = sqrtf(e / (float)(clen > 0 ? clen : 1));
+            }
+
+            const float sil_thresh = 0.003f; /* ≈ -50 dBFS */
+            if (cur_rms >= sil_thresh) window_has_speech = 1;
+
+            /* (4) Window boundary — skip if entire window was silent. */
+            if (partial_span == 0) {
+                if (!window_has_speech) {
+                    if (qwen_verbose >= 2) {
+                        fprintf(stderr,
+                                "  Coalesce: skip boundary at %.1f s "
+                                "(all-silent window)\n",
+                                (float)audio_cursor / QWEN_SAMPLE_RATE);
+                    }
+                    ctx->perf_total_ms += get_time_ms() - chunk_t0;
+                    chunk_idx++;
+                    continue;
+                }
+                window_has_speech = 0; /* reset for next window */
+                /* Fall through to encoder/decoder. */
+            } else if (partial_span > 0 && partial_span < enc_window_samples) {
 
                 /* (1) Silent chunk → unconditional skip. */
                 if (cur_rms < sil_thresh) {
