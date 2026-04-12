@@ -2080,112 +2080,109 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         float *enc_output = NULL;
         int64_t full_end = (audio_cursor / enc_window_samples) * (int64_t)enc_window_samples;
 
-        /* Adaptive chunk coalescing (Plan D).
+        /* Energy-adaptive coalescing.
+         *
          * Between full encoder-window boundaries the "partial tail" is
-         * re-encoded from scratch on every chunk.  Because the partial
-         * grows by chunk_sec each iteration the total encoder work
-         * within one 8-second window gap is O(n^2):
-         *   E(0.5) + E(1.0) + ... + E(8.0)  =  ~68 s of audio @ 0.5 s steps
-         * On a CPU with ~0.2 s/s throughput that alone costs ~14 s per 8 s
-         * of real-time audio, pushing RTF >> 1.
+         * re-encoded from scratch every chunk → O(n²) cost per window.
          *
-         * Fix: only decode when the partial tail crosses a coalesce step
-         * boundary (default = enc_window_samples/2 ≈ 4 s).  This reduces
-         * partial re-encodes from 16 to 2 per window, cutting O(n^2)
-         * encoder work by ~5x while producing text every ~4 s.
+         * Strategy – skip MORE during silence, LESS during speech:
+         *  1) SILENT chunk (RMS < threshold) → always skip.  Never
+         *     waste compute decoding silence.  Saves ~2 decode cycles
+         *     per 8 s window of silence vs the old fixed-bracket logic.
+         *  2) SPEECH onset (silence → speech transition) → force decode
+         *     immediately for minimum latency (~0.5 s response).
+         *  3) Continuous SPEECH → coalesce with a tight step of
+         *     enc_window/4 ≈ 2 s (was enc_window/2 ≈ 4 s), so text
+         *     updates appear twice as often during active speech.
+         *
          * The first chunk (chunk_idx==0) and final chunks always decode,
-         * and window-boundary crossings are never skipped.
-         *
-         * Energy gate: if the latest chunk has significant energy, skip
-         * the coalesce bracket check and decode immediately.  This avoids
-         * the 1-4 s latency penalty when speech resumes after silence.
+         * and window-boundary crossings (partial_span==0) are never skipped.
          */
         if (use_enc_cache && !is_final && chunk_idx > 0) {
             int64_t partial_span = audio_cursor - full_end;
             if (partial_span > 0 && partial_span < enc_window_samples) {
-                int64_t coalesce_step = enc_window_samples / 2;
-                if (coalesce_step < chunk_samples) coalesce_step = chunk_samples;
-                int64_t prev_cursor = audio_cursor - chunk_samples;
-                int64_t prev_partial = prev_cursor - full_end;
-
-                /* Energy gate – speech-onset detector.
-                 *
-                 * Only force an extra decode when speech RESUMES after a
-                 * silent gap (silence → speech transition).  During
-                 * continuous speech both the current and previous chunks
-                 * are energetic, so the gate stays closed and normal
-                 * coalescing keeps the O(n²) re-encode cost in check.
-                 *
-                 * Threshold 0.003 ≈ -50 dBFS, above compact_silence
-                 * floor (0.002) to reject background noise. */
-                int energy_override = 0;
-                if (prev_partial >= 0 &&
-                    partial_span / coalesce_step == prev_partial / coalesce_step) {
-                    int64_t chunk_off = audio_cursor - chunk_samples;
-                    if (chunk_off >= 0 && chunk_off < audio_n_samples) {
-                        int64_t chunk_len = chunk_samples;
-                        if (chunk_len > audio_n_samples - chunk_off)
-                            chunk_len = audio_n_samples - chunk_off;
-                        const float *chunk_ptr = audio_samples + chunk_off;
-
-                        /* RMS of the current chunk. */
-                        float cur_energy = 0.0f;
-                        for (int64_t i = 0; i < chunk_len; i++) {
-                            float s = chunk_ptr[i];
-                            cur_energy += s * s;
-                        }
-                        float cur_rms = sqrtf(cur_energy / (float)(chunk_len > 0 ? chunk_len : 1));
-
-                        if (cur_rms >= 0.003f) {
-                            /* Current chunk has speech.  Check whether the
-                             * PREVIOUS chunk was silent — if so, this is a
-                             * silence→speech onset and we force decode. */
-                            int64_t prev_off = chunk_off - chunk_samples;
-                            int prev_was_silent = 1; /* assume onset if no prev */
-                            if (prev_off >= 0) {
-                                int64_t prev_len = chunk_samples;
-                                if (prev_len > chunk_off - prev_off)
-                                    prev_len = chunk_off - prev_off;
-                                if (prev_off + prev_len <= audio_n_samples && prev_len > 0) {
-                                    const float *prev_ptr = audio_samples + prev_off;
-                                    float prev_e = 0.0f;
-                                    for (int64_t i = 0; i < prev_len; i++) {
-                                        float s = prev_ptr[i];
-                                        prev_e += s * s;
-                                    }
-                                    float prev_rms = sqrtf(prev_e / (float)prev_len);
-                                    prev_was_silent = (prev_rms < 0.003f) ? 1 : 0;
-                                }
-                            }
-                            if (prev_was_silent) {
-                                energy_override = 1;
-                                if (qwen_verbose >= 2) {
-                                    fprintf(stderr,
-                                            "  Coalesce: speech onset at %.1f s "
-                                            "(rms=%.4f, prev silent, forcing decode)\n",
-                                            (float)audio_cursor / QWEN_SAMPLE_RATE,
-                                            cur_rms);
-                                }
-                            }
-                        }
+                /* RMS of the current 0.5 s chunk. */
+                int64_t chunk_off = audio_cursor - chunk_samples;
+                float cur_rms = 0.0f;
+                if (chunk_off >= 0 && chunk_off < audio_n_samples) {
+                    int64_t clen = chunk_samples;
+                    if (clen > audio_n_samples - chunk_off)
+                        clen = audio_n_samples - chunk_off;
+                    const float *cptr = audio_samples + chunk_off;
+                    float e = 0.0f;
+                    for (int64_t i = 0; i < clen; i++) {
+                        float s = cptr[i];
+                        e += s * s;
                     }
+                    cur_rms = sqrtf(e / (float)(clen > 0 ? clen : 1));
                 }
 
-                /* Same coalesce bracket — skip this intermediate chunk
-                 * unless energy gate says to decode. */
-                if (!energy_override &&
-                    prev_partial >= 0 &&
-                    partial_span / coalesce_step == prev_partial / coalesce_step) {
+                const float sil_thresh = 0.003f; /* ≈ -50 dBFS */
+
+                /* (1) Silent chunk → unconditional skip. */
+                if (cur_rms < sil_thresh) {
                     if (qwen_verbose >= 2) {
                         fprintf(stderr,
-                                "  Coalesce: skip partial %.1f s (next decode at %.1f s)\n",
+                                "  Coalesce: skip silent %.1f s (rms=%.4f)\n",
                                 (float)partial_span / QWEN_SAMPLE_RATE,
-                                (float)(((partial_span / coalesce_step) + 1)
-                                        * coalesce_step) / QWEN_SAMPLE_RATE);
+                                cur_rms);
                     }
                     ctx->perf_total_ms += get_time_ms() - chunk_t0;
                     chunk_idx++;
                     continue;
+                }
+
+                /* (2) Speech onset — silence→speech transition. */
+                int is_onset = 0;
+                {
+                    int64_t prev_off = chunk_off - chunk_samples;
+                    if (prev_off >= 0 &&
+                        prev_off + chunk_samples <= audio_n_samples) {
+                        const float *pp = audio_samples + prev_off;
+                        float pe = 0.0f;
+                        for (int64_t i = 0; i < chunk_samples; i++) {
+                            float s = pp[i];
+                            pe += s * s;
+                        }
+                        float prev_rms = sqrtf(pe / (float)chunk_samples);
+                        if (prev_rms < sil_thresh) is_onset = 1;
+                    } else {
+                        is_onset = 1; /* no prev chunk → treat as onset */
+                    }
+                }
+
+                if (is_onset) {
+                    if (qwen_verbose >= 2) {
+                        fprintf(stderr,
+                                "  Coalesce: speech onset at %.1f s "
+                                "(rms=%.4f, forcing decode)\n",
+                                (float)audio_cursor / QWEN_SAMPLE_RATE,
+                                cur_rms);
+                    }
+                    /* Fall through to encoder/decoder. */
+                } else {
+                    /* (3) Continuous speech — tight 2 s coalescing. */
+                    int64_t coalesce_step = enc_window_samples / 4;
+                    if (coalesce_step < chunk_samples)
+                        coalesce_step = chunk_samples;
+                    int64_t prev_cursor = audio_cursor - chunk_samples;
+                    int64_t prev_partial = prev_cursor - full_end;
+                    if (prev_partial >= 0 &&
+                        partial_span / coalesce_step ==
+                            prev_partial / coalesce_step) {
+                        if (qwen_verbose >= 2) {
+                            fprintf(stderr,
+                                    "  Coalesce: skip partial %.1f s "
+                                    "(next decode at %.1f s)\n",
+                                    (float)partial_span / QWEN_SAMPLE_RATE,
+                                    (float)(((partial_span / coalesce_step) + 1)
+                                            * coalesce_step)
+                                        / QWEN_SAMPLE_RATE);
+                        }
+                        ctx->perf_total_ms += get_time_ms() - chunk_t0;
+                        chunk_idx++;
+                        continue;
+                    }
                 }
             }
         }
