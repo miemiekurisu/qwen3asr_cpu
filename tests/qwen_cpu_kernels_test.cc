@@ -939,6 +939,12 @@ QASR_TEST(QwenEncoderQkvPolicyShapeAutoFallsBackOnLargeWideShapes) {
 }
 
 QASR_TEST(QwenEncoderQkvPolicyShapeAutoKeepsPackedOnHighPrefillThreads) {
+    /* This test requires >= 12 logical CPUs; thread override is clamped to
+     * the actual CPU count, so on small CI runners (4 vCPU) the override
+     * would be clamped below the threshold and produce SEPARATE instead. */
+    if (qwen_get_num_cpus() < 12) {
+        return;
+    }
     qwen_set_thread_policy_override(12, 8);
     const qwen_enc_qkv_impl_t large_wide = qwen_select_encoder_qkv_impl(
         QWEN_ENC_QKV_POLICY_SHAPE_AUTO, 104, 1024, 1);
