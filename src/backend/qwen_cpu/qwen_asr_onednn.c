@@ -93,6 +93,53 @@ void qwen_int8_weight_free(qwen_int8_weight_t *w) {
     w->data_bytes = 0;
 }
 
+int qwen_int8_quantize_f32(qwen_int8_weight_t *dst,
+                           const float *src_f32,
+                           size_t rows, size_t cols) {
+    if (!dst || !src_f32 || rows == 0 || cols == 0) return -1;
+
+    size_t data_bytes = rows * cols;
+    int8_t *data = (int8_t *)malloc(data_bytes);
+    float *scales = (float *)malloc(rows * sizeof(float));
+    if (!data || !scales) {
+        free(data);
+        free(scales);
+        return -1;
+    }
+
+    for (size_t r = 0; r < rows; r++) {
+        const float *row_src = src_f32 + r * cols;
+        float amax = 0.0f;
+
+        for (size_t c = 0; c < cols; c++) {
+            float av = fabsf(row_src[c]);
+            if (av > amax) amax = av;
+        }
+
+        float scale = amax / 127.0f;
+        if (scale == 0.0f) scale = 1.0f;
+        scales[r] = scale;
+
+        float inv_scale = 127.0f / amax;
+        if (amax == 0.0f) inv_scale = 0.0f;
+
+        int8_t *row_dst = data + r * cols;
+        for (size_t c = 0; c < cols; c++) {
+            int32_t q = (int32_t)roundf(row_src[c] * inv_scale);
+            if (q > 127) q = 127;
+            if (q < -127) q = -127;
+            row_dst[c] = (int8_t)q;
+        }
+    }
+
+    dst->data = data;
+    dst->row_scale = scales;
+    dst->rows = rows;
+    dst->cols = cols;
+    dst->data_bytes = data_bytes;
+    return 0;
+}
+
 /* ========================================================================
  * oneDNN Implementation (when USE_ONEDNN is defined)
  * ======================================================================== */
@@ -578,6 +625,119 @@ void qwen_decoder_free_int8(void *ctx_ptr) {
     ctx->n_int8_dec_layers = 0;
 }
 
+/* ========================================================================
+ * Encoder INT8 Preparation
+ * ======================================================================== */
+
+static void free_int8_enc_layer(qwen_int8_enc_layer_t *il) {
+    if (!il) return;
+    qwen_onednn_matmul_free(il->mm_qkv);
+    qwen_onednn_matmul_free(il->mm_wo);
+    qwen_onednn_matmul_free(il->mm_fc1);
+    qwen_onednn_matmul_free(il->mm_fc2);
+    qwen_int8_weight_free(&il->qkv_int8);
+    qwen_int8_weight_free(&il->wo_int8);
+    qwen_int8_weight_free(&il->fc1_int8);
+    qwen_int8_weight_free(&il->fc2_int8);
+    memset(il, 0, sizeof(*il));
+}
+
+int qwen_encoder_prepare_int8(void *ctx_ptr) {
+    qwen_ctx_t *ctx = (qwen_ctx_t *)ctx_ptr;
+    if (!ctx) return -1;
+
+    const qwen_config_t *cfg = &ctx->config;
+    const int d_model = cfg->enc_d_model;
+    const int ffn_dim = cfg->enc_ffn_dim;
+
+    if (qwen_onednn_init() != 0) {
+        if (qwen_verbose >= 1)
+            fprintf(stderr, "encoder: INT8 preparation skipped (oneDNN init failed)\n");
+        return -1;
+    }
+
+    double start_ms = qwen_perf_now_ms();
+
+    if (ctx->int8_enc_layers) {
+        qwen_encoder_free_int8(ctx);
+    }
+    ctx->int8_enc_layers = calloc((size_t)cfg->enc_layers, sizeof(qwen_int8_enc_layer_t));
+    if (!ctx->int8_enc_layers) return -1;
+    ctx->n_int8_enc_layers = cfg->enc_layers;
+
+    size_t total_int8_bytes = 0;
+
+    for (int i = 0; i < cfg->enc_layers; i++) {
+        qwen_enc_layer_t *l = &ctx->encoder.layers[i];
+        qwen_int8_enc_layer_t *il = &((qwen_int8_enc_layer_t *)ctx->int8_enc_layers)[i];
+
+        /* Quantize packed QKV [3*d_model, d_model] from F32 */
+        if (l->qkv_weight_packed) {
+            if (qwen_int8_quantize_f32(&il->qkv_int8, l->qkv_weight_packed,
+                                       (size_t)(3 * d_model), (size_t)d_model) != 0) goto fail;
+            il->mm_qkv = qwen_onednn_matmul_create(&il->qkv_int8);
+            if (!il->mm_qkv) goto fail;
+        }
+
+        /* Quantize wo [d_model, d_model] from F32 */
+        if (qwen_int8_quantize_f32(&il->wo_int8, l->wo_weight,
+                                   (size_t)d_model, (size_t)d_model) != 0) goto fail;
+
+        /* Quantize fc1 [ffn_dim, d_model] from F32 */
+        if (qwen_int8_quantize_f32(&il->fc1_int8, l->fc1_weight,
+                                   (size_t)ffn_dim, (size_t)d_model) != 0) goto fail;
+
+        /* Quantize fc2 [d_model, ffn_dim] from F32 */
+        if (qwen_int8_quantize_f32(&il->fc2_int8, l->fc2_weight,
+                                   (size_t)d_model, (size_t)ffn_dim) != 0) goto fail;
+
+        il->mm_wo = qwen_onednn_matmul_create(&il->wo_int8);
+        il->mm_fc1 = qwen_onednn_matmul_create(&il->fc1_int8);
+        il->mm_fc2 = qwen_onednn_matmul_create(&il->fc2_int8);
+
+        if (!il->mm_wo || !il->mm_fc1 || !il->mm_fc2) {
+            if (qwen_verbose >= 1)
+                fprintf(stderr, "encoder: INT8 oneDNN primitive creation failed at layer %d\n", i);
+            goto fail;
+        }
+
+        total_int8_bytes += il->qkv_int8.data_bytes + il->wo_int8.data_bytes +
+                            il->fc1_int8.data_bytes + il->fc2_int8.data_bytes;
+
+        if (qwen_verbose >= 2) {
+            fprintf(stderr, "encoder: INT8 layer %d prepared\n", i);
+        }
+    }
+
+    double elapsed = qwen_perf_now_ms() - start_ms;
+    if (qwen_verbose >= 1) {
+        fprintf(stderr,
+                "encoder: INT8 prepared layers=%d int8_bytes=%.1f MB ms=%.1f\n",
+                cfg->enc_layers,
+                (double)total_int8_bytes / (1024.0 * 1024.0),
+                elapsed);
+    }
+
+    return 0;
+
+fail:
+    qwen_encoder_free_int8(ctx);
+    return -1;
+}
+
+void qwen_encoder_free_int8(void *ctx_ptr) {
+    qwen_ctx_t *ctx = (qwen_ctx_t *)ctx_ptr;
+    if (!ctx || !ctx->int8_enc_layers) return;
+
+    qwen_int8_enc_layer_t *layers = (qwen_int8_enc_layer_t *)ctx->int8_enc_layers;
+    for (int i = 0; i < ctx->n_int8_enc_layers; i++) {
+        free_int8_enc_layer(&layers[i]);
+    }
+    free(layers);
+    ctx->int8_enc_layers = NULL;
+    ctx->n_int8_enc_layers = 0;
+}
+
 #else /* !USE_ONEDNN */
 
 /* ========================================================================
@@ -607,5 +767,14 @@ int qwen_decoder_prepare_int8(void *ctx) {
 }
 
 void qwen_decoder_free_int8(void *ctx) { (void)ctx; }
+
+int qwen_encoder_prepare_int8(void *ctx) {
+    (void)ctx;
+    if (qwen_verbose >= 1)
+        fprintf(stderr, "encoder: INT8 not available (compiled without oneDNN)\n");
+    return -1;
+}
+
+void qwen_encoder_free_int8(void *ctx) { (void)ctx; }
 
 #endif /* USE_ONEDNN */

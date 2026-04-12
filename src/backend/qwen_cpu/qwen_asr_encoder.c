@@ -15,6 +15,7 @@
 
 #include "qwen_asr.h"
 #include "qwen_asr_kernels.h"
+#include "qwen_asr_onednn.h"
 #include "qwen_asr_perf.h"
 #include "qwen_asr_safetensors.h"
 #include <stdio.h>
@@ -28,6 +29,16 @@ static int encoder_should_cancel(qwen_ctx_t *ctx) {
         return 1;
     }
     return 0;
+}
+
+/* Add bias vector to each row of a [seq_len, dim] matrix. */
+static void add_bias_inplace(float *y, const float *bias, int seq_len, int dim) {
+    for (int s = 0; s < seq_len; s++) {
+        float *row = y + s * dim;
+        for (int d = 0; d < dim; d++) {
+            row[d] += bias[d];
+        }
+    }
 }
 
 /* ========================================================================
@@ -404,7 +415,8 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
         qkv_policy, total_tokens, d_model, 1);
     int can_fuse_qkv = 0;
 
-    if (qkv_impl == QWEN_ENC_QKV_IMPL_PACKED) {
+    if (qkv_impl == QWEN_ENC_QKV_IMPL_PACKED ||
+        (ctx->encoder_int8 && ctx->int8_enc_layers)) {
         qkv_out = (float *)malloc((size_t)total_tokens * fused_qkv_dim * sizeof(float));
         if (qkv_out) {
             can_fuse_qkv = 1;
@@ -423,6 +435,18 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
 
     float scale = 1.0f / sqrtf((float)head_dim);
 
+    /* Get INT8 layers if encoder INT8 is enabled */
+    qwen_int8_enc_layer_t *int8_layers = NULL;
+    int use_int8 = 0;
+    if (ctx->encoder_int8 && ctx->int8_enc_layers &&
+        ctx->n_int8_enc_layers == cfg->enc_layers) {
+        int8_layers = (qwen_int8_enc_layer_t *)ctx->int8_enc_layers;
+        use_int8 = 1;
+        if (qwen_verbose >= 2) {
+            fprintf(stderr, "encoder: using INT8 path\n");
+        }
+    }
+
     for (int layer = 0; layer < cfg->enc_layers; layer++) {
         if (encoder_should_cancel(ctx)) {
             free(x); free(x_norm); free(q); free(k); free(v);
@@ -433,12 +457,23 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
         }
 
         qwen_enc_layer_t *l = &enc->layers[layer];
+        qwen_int8_enc_layer_t *il = use_int8 ? &int8_layers[layer] : NULL;
 
         /* ---- Self-attention ---- */
         qwen_layer_norm(x_norm, x, l->attn_norm_weight, l->attn_norm_bias,
                         total_tokens, d_model, 1e-5f);
 
-        if (can_fuse_qkv && l->qkv_weight_packed && l->qkv_bias_packed &&
+        if (il && il->mm_qkv && l->qkv_bias_packed && qkv_out) {
+            /* INT8 packed QKV: matmul → add bias → split */
+            qwen_int8_matvec(il->mm_qkv, x_norm, total_tokens, qkv_out);
+            add_bias_inplace(qkv_out, l->qkv_bias_packed, total_tokens, 3 * d_model);
+            for (int s = 0; s < total_tokens; s++) {
+                const float *row = qkv_out + (size_t)s * (3 * d_model);
+                memcpy(q + (size_t)s * d_model, row, (size_t)d_model * sizeof(float));
+                memcpy(k + (size_t)s * d_model, row + d_model, (size_t)d_model * sizeof(float));
+                memcpy(v + (size_t)s * d_model, row + 2 * d_model, (size_t)d_model * sizeof(float));
+            }
+        } else if (can_fuse_qkv && l->qkv_weight_packed && l->qkv_bias_packed &&
             qwen_select_encoder_qkv_impl(qkv_policy, total_tokens, d_model, 1) ==
                 QWEN_ENC_QKV_IMPL_PACKED) {
             qwen_linear_qkv_f32_packed(q, k, v,
@@ -461,8 +496,13 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
                                       window_starts, n_windows);
 
         /* Output projection + residual */
-        qwen_linear(proj_out, attn_out, l->wo_weight, l->wo_bias,
-                     total_tokens, d_model, d_model);
+        if (il && il->mm_wo) {
+            qwen_int8_matvec(il->mm_wo, attn_out, total_tokens, proj_out);
+            add_bias_inplace(proj_out, l->wo_bias, total_tokens, d_model);
+        } else {
+            qwen_linear(proj_out, attn_out, l->wo_weight, l->wo_bias,
+                         total_tokens, d_model, d_model);
+        }
         qwen_add_inplace(x, proj_out, total_tokens * d_model);
 
         /* ---- FFN ---- */
@@ -470,11 +510,21 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
                         total_tokens, d_model, 1e-5f);
 
         /* GELU FFN: fc1 -> GELU -> fc2 */
-        qwen_linear(ffn_mid, x_norm, l->fc1_weight, l->fc1_bias,
-                     total_tokens, d_model, ffn_dim);
+        if (il && il->mm_fc1) {
+            qwen_int8_matvec(il->mm_fc1, x_norm, total_tokens, ffn_mid);
+            add_bias_inplace(ffn_mid, l->fc1_bias, total_tokens, ffn_dim);
+        } else {
+            qwen_linear(ffn_mid, x_norm, l->fc1_weight, l->fc1_bias,
+                         total_tokens, d_model, ffn_dim);
+        }
         qwen_gelu(ffn_mid, total_tokens * ffn_dim);
-        qwen_linear(ffn_out, ffn_mid, l->fc2_weight, l->fc2_bias,
-                     total_tokens, ffn_dim, d_model);
+        if (il && il->mm_fc2) {
+            qwen_int8_matvec(il->mm_fc2, ffn_mid, total_tokens, ffn_out);
+            add_bias_inplace(ffn_out, l->fc2_bias, total_tokens, d_model);
+        } else {
+            qwen_linear(ffn_out, ffn_mid, l->fc2_weight, l->fc2_bias,
+                         total_tokens, ffn_dim, d_model);
+        }
         qwen_add_inplace(x, ffn_out, total_tokens * d_model);
 
     }

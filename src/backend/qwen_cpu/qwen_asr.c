@@ -331,6 +331,12 @@ qwen_ctx_t *qwen_clone_shared(const qwen_ctx_t *src) {
     ctx->int8_dec_layers = NULL;
     ctx->n_int8_dec_layers = 0;
 
+    /* Encoder INT8: clone does not share (handles have mutable per-call state).
+     * Call qwen_set_encoder_int8() on the clone if needed. */
+    ctx->encoder_int8 = 0;
+    ctx->int8_enc_layers = NULL;
+    ctx->n_int8_enc_layers = 0;
+
     /* Cloned live contexts share model weights, but should not reuse prepared
      * prefill caches from the source context. Keep the clone on the plain BF16
      * prefill path to avoid sharing large prepared buffers across session state. */
@@ -478,6 +484,9 @@ void qwen_free(qwen_ctx_t *ctx) {
     /* INT8 decoder resources (oneDNN) */
     qwen_decoder_free_int8(ctx);
 
+    /* INT8 encoder resources (oneDNN) */
+    qwen_encoder_free_int8(ctx);
+
     /* KV cache */
     free(ctx->kv_cache_k);
     free(ctx->kv_cache_v);
@@ -537,6 +546,29 @@ int qwen_set_decoder_int8(qwen_ctx_t *ctx, int enable) {
     } else {
         qwen_decoder_free_int8(ctx);
         ctx->decoder_int8 = 0;
+        return 0;
+    }
+}
+
+int qwen_set_encoder_int8(qwen_ctx_t *ctx, int enable) {
+    if (!ctx) return -1;
+
+    if (enable) {
+        if (ctx->int8_enc_layers) {
+            /* Already prepared */
+            ctx->encoder_int8 = 1;
+            return 0;
+        }
+        int rc = qwen_encoder_prepare_int8(ctx);
+        if (rc != 0) {
+            ctx->encoder_int8 = 0;
+            return -1;
+        }
+        ctx->encoder_int8 = 1;
+        return 0;
+    } else {
+        qwen_encoder_free_int8(ctx);
+        ctx->encoder_int8 = 0;
         return 0;
     }
 }
@@ -1570,6 +1602,11 @@ static int stream_bg_encoder_init(stream_bg_encoder_t *bg, const qwen_ctx_t *src
     bg->enc_ctx = qwen_clone_shared(src_ctx);
     if (!bg->enc_ctx) return -1;
 
+    /* Propagate encoder INT8 to background encoder context */
+    if (src_ctx->encoder_int8) {
+        qwen_set_encoder_int8(bg->enc_ctx, 1);
+    }
+
 #ifdef _WIN32
     InitializeCriticalSection(&bg->mutex);
     InitializeConditionVariable(&bg->cond);
@@ -1929,6 +1966,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     int n_emitted_text_tokens = 0;
     int emitted_text_cap = 8192;
     int stagnant_chunks = 0;
+    int post_reset_dup_check = 0;
     /* Stability promotion: track consecutive rounds where the unfixed
      * tail tokens are identical.  When the tail hasn't changed for
      * TAIL_STABLE_PROMOTE rounds, reduce effective rollback to 0 so
@@ -2104,11 +2142,11 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             /* RMS of the current 0.5 s chunk (needed for all paths). */
             int64_t chunk_off = audio_cursor - chunk_samples;
             float cur_rms = 0.0f;
-            if (chunk_off >= 0 && chunk_off < audio_n_samples) {
+            if (chunk_off >= local_base_sample && chunk_off < audio_n_samples) {
                 int64_t clen = chunk_samples;
                 if (clen > audio_n_samples - chunk_off)
                     clen = audio_n_samples - chunk_off;
-                const float *cptr = audio_samples + chunk_off;
+                const float *cptr = audio_samples + (chunk_off - local_base_sample);
                 float e = 0.0f;
                 for (int64_t i = 0; i < clen; i++) {
                     float s = cptr[i];
@@ -2150,13 +2188,18 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                     continue;
                 }
 
-                /* (2) Speech onset — silence→speech transition. */
+                /* (2) Speech onset — silence→speech transition.
+                 *
+                 * After a window boundary + trim, prev chunk data has been
+                 * discarded (prev_off < local_base_sample).  The boundary
+                 * decode already ran, so treat as continuous speech rather
+                 * than a false onset that wastes a full decode cycle. */
                 int is_onset = 0;
                 {
                     int64_t prev_off = chunk_off - chunk_samples;
-                    if (prev_off >= 0 &&
+                    if (prev_off >= local_base_sample &&
                         prev_off + chunk_samples <= audio_n_samples) {
-                        const float *pp = audio_samples + prev_off;
+                        const float *pp = audio_samples + (prev_off - local_base_sample);
                         float pe = 0.0f;
                         for (int64_t i = 0; i < chunk_samples; i++) {
                             float s = pp[i];
@@ -2164,8 +2207,39 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                         }
                         float prev_rms = sqrtf(pe / (float)chunk_samples);
                         if (prev_rms < sil_thresh) is_onset = 1;
+                    } else if (partial_span <= chunk_samples) {
+                        /* First partial after boundary: prev was trimmed.
+                         * Boundary decode just ran — not a real onset. */
+                        is_onset = 0;
                     } else {
-                        is_onset = 1; /* no prev chunk → treat as onset */
+                        is_onset = 1; /* genuinely no prev data */
+                    }
+                }
+
+                /* Lag-adaptive coalescing: when decode falls behind
+                 * real-time audio, widen the step to let it catch up.
+                 * This doesn't lose data — the next decode covers the
+                 * full audio range anyway; we just skip intermediate
+                 * partial updates that the user can't see in time. */
+                int64_t decode_lag_samples = audio_n_samples - audio_cursor;
+
+                /* 3-tier lag thresholds:
+                 *   lag < 2s  → normal (onset allowed, step=enc/3≈2.67s)
+                 *   2s-4s    → moderate (onset allowed, step=enc/2≈4s)
+                 *   > 4s     → severe (suppress onset, step=enc/2≈4s) */
+                int64_t lag_severe  = 4 * (int64_t)QWEN_SAMPLE_RATE;
+                int64_t lag_moderate = 2 * (int64_t)QWEN_SAMPLE_RATE;
+
+                if (is_onset && decode_lag_samples > lag_severe) {
+                    /* Suppress onset decode when severely lagging. */
+                    is_onset = 0;
+                    if (qwen_verbose >= 2) {
+                        fprintf(stderr,
+                                "  Coalesce: suppress onset at %.1f s "
+                                "(lag=%.1f s, rms=%.4f)\n",
+                                (float)audio_cursor / QWEN_SAMPLE_RATE,
+                                (float)decode_lag_samples / QWEN_SAMPLE_RATE,
+                                cur_rms);
                     }
                 }
 
@@ -2173,14 +2247,22 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                     if (qwen_verbose >= 2) {
                         fprintf(stderr,
                                 "  Coalesce: speech onset at %.1f s "
-                                "(rms=%.4f, forcing decode)\n",
+                                "(rms=%.4f, forcing decode, lag=%.1f s)\n",
                                 (float)audio_cursor / QWEN_SAMPLE_RATE,
-                                cur_rms);
+                                cur_rms,
+                                (float)decode_lag_samples / QWEN_SAMPLE_RATE);
                     }
                     /* Fall through to encoder/decoder. */
                 } else {
-                    /* (3) Continuous speech — tight 2 s coalescing. */
-                    int64_t coalesce_step = enc_window_samples / 4;
+                    /* (3) Continuous speech coalescing — 3-tier step:
+                     * Normal:   enc_window/3 ≈ 2.67 s (3 decodes/window)
+                     * Moderate: enc_window/2 ≈ 4 s    (2 decodes/window)
+                     * Severe:   enc_window/2 ≈ 4 s    (2 decodes/window) */
+                    int64_t coalesce_step;
+                    if (decode_lag_samples > lag_moderate)
+                        coalesce_step = enc_window_samples / 2;
+                    else
+                        coalesce_step = enc_window_samples / 3;
                     if (coalesce_step < chunk_samples)
                         coalesce_step = chunk_samples;
                     int64_t prev_cursor = audio_cursor - chunk_samples;
@@ -2191,11 +2273,12 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                         if (qwen_verbose >= 2) {
                             fprintf(stderr,
                                     "  Coalesce: skip partial %.1f s "
-                                    "(next decode at %.1f s)\n",
+                                    "(next decode at %.1f s, lag=%.1f s)\n",
                                     (float)partial_span / QWEN_SAMPLE_RATE,
                                     (float)(((partial_span / coalesce_step) + 1)
                                             * coalesce_step)
-                                        / QWEN_SAMPLE_RATE);
+                                        / QWEN_SAMPLE_RATE,
+                                    (float)decode_lag_samples / QWEN_SAMPLE_RATE);
                         }
                         ctx->perf_total_ms += get_time_ms() - chunk_t0;
                         chunk_idx++;
@@ -2816,6 +2899,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 stagnant_chunks = 0;
                 tail_stable_rounds = 0;
                 prev_tail_len = 0;
+                post_reset_dup_check = 1;
                 did_recovery_reset = 1;
                 if (qwen_monitor) {
                     fprintf(stderr, "!");
@@ -2864,7 +2948,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                             break;
                         }
                     }
-                    if (revised_committed_prefix) {
+                    if (revised_committed_prefix || post_reset_dup_check) {
                         emit_start = qwen_stream_skip_recent_duplicate_prefix(
                             emitted_text_tokens,
                             n_emitted_text_tokens,
@@ -2874,6 +2958,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                             QWEN_STREAM_OVERLAP_MIN_TOKENS,
                             QWEN_STREAM_DUP_SUPPRESS_MAX_TOKENS,
                             QWEN_STREAM_DUP_SUPPRESS_LOOKBACK_TOKENS);
+                        post_reset_dup_check = 0;
                     }
                 }
 

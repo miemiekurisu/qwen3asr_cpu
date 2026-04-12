@@ -907,6 +907,11 @@ public:
                 std::fprintf(stderr, "warning: decoder INT8 init failed, falling back to BF16\n");
             }
         }
+        if (config.encoder_int8) {
+            if (qwen_set_encoder_int8(ctx_, 1) != 0) {
+                std::fprintf(stderr, "warning: encoder INT8 init failed, falling back to F32\n");
+            }
+        }
         ctx_->past_text_conditioning = 1;
         ctx_->segment_sec = 30.0f;
         return OkStatus();
@@ -2029,6 +2034,10 @@ Status ParseServerArguments(int argc, const char * const argv[], ServerConfig * 
             config->decoder_int8 = true;
             continue;
         }
+        if (arg == "--encoder-int8") {
+            config->encoder_int8 = true;
+            continue;
+        }
         return Status(StatusCode::kInvalidArgument, "unknown argument: " + std::string(arg));
     }
 
@@ -2051,6 +2060,7 @@ std::string BuildServerUsage(std::string_view program_name) {
     usage += "  --threads <n>\n";
     usage += "  --verbosity <n>\n";
     usage += "  --decoder-int8\n";
+    usage += "  --encoder-int8\n";
     usage += "  -h, --help\n";
     return usage;
 }
