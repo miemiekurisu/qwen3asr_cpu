@@ -22,6 +22,7 @@ struct AsrRunOptions {
     bool emit_tokens = false;
     bool emit_segments = false;
     bool decoder_int8 = false;
+    bool encoder_int8 = false;
     std::string prompt;
     std::string language;
 };

@@ -297,6 +297,11 @@ typedef struct {
     int decoder_int8;              /* 0=disabled (default), 1=enabled */
     void *int8_dec_layers;         /* qwen_int8_dec_layer_t[] or NULL */
     int n_int8_dec_layers;         /* number of valid entries */
+
+    /* INT8 encoder acceleration (optional, via oneDNN) */
+    int encoder_int8;              /* 0=disabled (default), 1=enabled */
+    void *int8_enc_layers;         /* qwen_int8_enc_layer_t[] or NULL */
+    int n_int8_enc_layers;         /* number of valid entries */
 } qwen_ctx_t;
 
 /* ========================================================================
@@ -346,6 +351,12 @@ int qwen_decoder_prepare_runtime(qwen_ctx_t *ctx);
  * enable=0 frees INT8 resources and reverts to BF16 path.
  * Returns 0 on success, -1 on failure (remains on BF16 path). */
 int qwen_set_decoder_int8(qwen_ctx_t *ctx, int enable);
+
+/* Enable or disable INT8 encoder acceleration (requires oneDNN).
+ * Must be called after qwen_load(). Quantizes F32 encoder weights to INT8.
+ * enable=0 frees INT8 resources and reverts to F32 path.
+ * Returns 0 on success, -1 on failure (remains on F32 path). */
+int qwen_set_encoder_int8(qwen_ctx_t *ctx, int enable);
 
 /* Set a callback to receive each decoded token as it's generated.
  * Set cb=NULL to disable. The callback is invoked during transcription. */

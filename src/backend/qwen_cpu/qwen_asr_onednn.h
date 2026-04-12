@@ -37,6 +37,12 @@ int qwen_int8_quantize_bf16(qwen_int8_weight_t *dst,
                             const uint16_t *src_bf16,
                             size_t rows, size_t cols);
 
+/* Quantize an F32 weight matrix to per-row symmetric INT8.
+ * Returns 0 on success, -1 on allocation failure. */
+int qwen_int8_quantize_f32(qwen_int8_weight_t *dst,
+                           const float *src_f32,
+                           size_t rows, size_t cols);
+
 /* Free quantized weight buffers. */
 void qwen_int8_weight_free(qwen_int8_weight_t *w);
 
@@ -98,6 +104,35 @@ int qwen_decoder_prepare_int8(void *ctx_ptr);
 
 /* Free all INT8 decoder resources for all layers. */
 void qwen_decoder_free_int8(void *ctx_ptr);
+
+/* ========================================================================
+ * Per-Layer INT8 Encoder Weights
+ * ======================================================================== */
+
+typedef struct {
+    /* Fused QKV [3*d_model, d_model] */
+    qwen_int8_weight_t  qkv_int8;
+
+    /* Output projection [d_model, d_model] */
+    qwen_int8_weight_t  wo_int8;
+
+    /* FFN fc1 [ffn_dim, d_model], fc2 [d_model, ffn_dim] */
+    qwen_int8_weight_t  fc1_int8;
+    qwen_int8_weight_t  fc2_int8;
+
+    /* oneDNN matmul handles */
+    qwen_onednn_matmul_t *mm_qkv;
+    qwen_onednn_matmul_t *mm_wo;
+    qwen_onednn_matmul_t *mm_fc1;
+    qwen_onednn_matmul_t *mm_fc2;
+} qwen_int8_enc_layer_t;
+
+/* Prepare INT8 weights + oneDNN primitives for all encoder layers.
+ * Returns 0 on success, -1 on failure (caller should fall back to F32). */
+int qwen_encoder_prepare_int8(void *ctx_ptr);
+
+/* Free all INT8 encoder resources for all layers. */
+void qwen_encoder_free_int8(void *ctx_ptr);
 
 /* Execute a single INT8 matmul (decode M=1 or general).
  * Returns 0 on success, -1 on failure. */
