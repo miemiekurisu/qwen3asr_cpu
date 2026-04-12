@@ -2998,6 +2998,64 @@ int RunServer(const ServerConfig & config) {
         SetJsonResponse(response, body);
     });
 
+    server.Post("/api/realtime/eof", [&](const HttpRequest & request, HttpResponse & response) {
+        if (!request.has_param("session_id")) {
+            SetErrorResponse(response, Status(StatusCode::kInvalidArgument, "session_id is required"), 400);
+            return;
+        }
+        const std::string session_id = request.get_param_value("session_id");
+        std::shared_ptr<RealtimeSession> session;
+        Status status = FindRealtimeSession(session_id, &session);
+        if (!status.ok()) {
+            SetErrorResponse(response, status, StatusToHttpCode(status));
+            return;
+        }
+        RealtimeLiveWorker * worker = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(session->mu);
+            worker = session->live_worker.get();
+        }
+        if (worker != nullptr && worker->live_ready) {
+            FinishManualLiveAudio(&worker->live);
+        }
+        RealtimeSessionSnapshot snapshot;
+        status = SnapshotRealtimeSessionState(session, false, &snapshot);
+        if (!status.ok()) {
+            SetErrorResponse(response, status, StatusToHttpCode(status));
+            return;
+        }
+        SetJsonResponse(response, BuildRealtimeJson(snapshot, false, true));
+    });
+
+    server.GetStream("/api/realtime/stream", [&](const HttpRequest & request, StreamWriter writer) {
+        const std::string session_id = request.get_param_value("session_id");
+        if (session_id.empty()) {
+            writer(BuildSseData("{\"error\":\"session_id is required\"}"));
+            return;
+        }
+        std::shared_ptr<RealtimeSession> session;
+        {
+            Status status = FindRealtimeSession(session_id, &session);
+            if (!status.ok()) {
+                writer(BuildSseData("{\"error\":\"session not found\"}"));
+                return;
+            }
+        }
+        for (;;) {
+            RealtimeSessionSnapshot snapshot;
+            SnapshotRealtimeSessionState(session, false, &snapshot);
+            Json body = BuildRealtimeJson(snapshot, false, true);
+            if (!writer(BuildSseData(body.dump()))) {
+                break;
+            }
+            if (snapshot.finalized) {
+                writer("data: [DONE]\n\n");
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    });
+
     server.Get("/api/capture/status", [&](const HttpRequest &, HttpResponse & response) {
         std::shared_ptr<HostCaptureSession> capture;
         {

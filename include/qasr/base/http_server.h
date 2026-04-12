@@ -51,6 +51,14 @@ struct HttpResponse {
     std::vector<std::pair<std::string, std::string>> headers_;
 };
 
+/// Callback for streaming responses. Returns false when the write fails
+/// (e.g. the client disconnected), signalling the handler to stop.
+using StreamWriter = std::function<bool(const std::string & data)>;
+
+/// Handler for streaming endpoints (e.g. SSE).  The handler blocks until
+/// streaming is complete and calls \p writer to push data to the client.
+using StreamHandler = std::function<void(const HttpRequest &, StreamWriter writer)>;
+
 /// Minimal self-owned HTTP/1.1 server.
 /// Pre: call Get/Post to register routes before listen().
 /// Post: listen() blocks until the server is stopped.
@@ -67,6 +75,12 @@ public:
 
     void Get(const std::string & pattern, Handler handler);
     void Post(const std::string & pattern, Handler handler);
+
+    /// Register a streaming GET handler.  The server sends HTTP headers with
+    /// Content-Type: text/event-stream immediately, then invokes \p handler
+    /// which may call the StreamWriter repeatedly.  Connection is closed when
+    /// the handler returns.
+    void GetStream(const std::string & pattern, StreamHandler handler);
 
     void set_thread_pool_size(std::size_t workers, std::size_t queue_limit);
     void set_keep_alive_max_count(int count);

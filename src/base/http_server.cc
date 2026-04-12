@@ -213,6 +213,12 @@ struct Route {
     HttpServer::Handler handler;
 };
 
+struct StreamRoute {
+    std::string method;
+    std::string pattern;
+    StreamHandler handler;
+};
+
 // Extract the boundary string from Content-Type header.
 std::string ExtractBoundary(const std::string & content_type) {
     const std::string marker = "boundary=";
@@ -308,6 +314,7 @@ private:
 
 struct HttpServer::Impl {
     std::vector<Route> routes;
+    std::vector<StreamRoute> stream_routes;
     std::size_t thread_pool_workers = 4;
     std::size_t thread_pool_queue_limit = 64;
     int keep_alive_max_count = 100;
@@ -399,6 +406,34 @@ struct HttpServer::Impl {
             HttpRequest request;
             if (!ParseRequest(client_fd, request)) break;
 
+            // --- Try stream routes first (e.g. SSE) ---
+            bool handled_as_stream = false;
+            for (const auto & sr : stream_routes) {
+                if (sr.method != request.method) continue;
+                std::unordered_map<std::string, std::string> path_params;
+                if (HttpServer::MatchRoute(sr.pattern, request.path, path_params)) {
+                    HttpRequest req_copy = request;
+                    req_copy.path_params = std::move(path_params);
+
+                    // Send SSE headers immediately.
+                    std::string hdr = "HTTP/1.1 200 OK\r\n"
+                                      "Content-Type: text/event-stream\r\n"
+                                      "Cache-Control: no-cache\r\n"
+                                      "Connection: close\r\n"
+                                      "Access-Control-Allow-Origin: *\r\n"
+                                      "\r\n";
+                    if (!SendAll(client_fd, hdr)) { handled_as_stream = true; break; }
+
+                    StreamWriter writer = [client_fd](const std::string & data) -> bool {
+                        return SendAll(client_fd, data);
+                    };
+                    sr.handler(req_copy, writer);
+                    handled_as_stream = true;
+                    break;
+                }
+            }
+            if (handled_as_stream) break; // close connection after streaming
+
             HttpResponse response;
             if (!MatchAndDispatch(request, response)) {
                 response.status = 404;
@@ -450,6 +485,10 @@ void HttpServer::Get(const std::string & pattern, Handler handler) {
 
 void HttpServer::Post(const std::string & pattern, Handler handler) {
     impl_->routes.push_back({"POST", pattern, std::move(handler)});
+}
+
+void HttpServer::GetStream(const std::string & pattern, StreamHandler handler) {
+    impl_->stream_routes.push_back({"GET", pattern, std::move(handler)});
 }
 
 void HttpServer::set_thread_pool_size(std::size_t workers, std::size_t queue_limit) {

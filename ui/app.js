@@ -453,19 +453,104 @@ async function finalizeOfflineStreamSession(format) {
     return null;
   }
   const sessionId = offlineState.sessionId;
+
+  // Signal end-of-audio (non-blocking).
+  const eofPrefix = offlineState.stopRequested ? "停止中..." : "后处理中...";
+  offlineStatus.textContent = eofPrefix;
+  try {
+    await fetch(`/api/realtime/eof?session_id=${encodeURIComponent(sessionId)}`, {
+      method: "POST",
+      body: "",
+    });
+  } catch (_err) {
+    // Best-effort; the stream will still work if eof was already set.
+  }
+
+  // Open SSE stream for progressive updates while worker finishes.
+  const streamResult = await new Promise((resolve, reject) => {
+    const url = `/api/realtime/stream?session_id=${encodeURIComponent(sessionId)}`;
+    const es = new EventSource(url);
+    let lastData = null;
+
+    es.onmessage = (event) => {
+      if (event.data === "[DONE]") {
+        es.close();
+        resolve(lastData);
+        return;
+      }
+      try {
+        const data = JSON.parse(event.data);
+        lastData = data;
+        // Offline batch: show full accumulated stable_text, not windowed
+        // recent_segments. The user needs to see the entire transcript growing.
+        const frame = ensureTranscriptFrame(offlineResult);
+        const fullStable = data.stable_text || "";
+        const trailing = data.live_partial_text || data.partial_text || "";
+        if (data.finalized) {
+          frame.finalLine.textContent = data.text || fullStable;
+          frame.finalLine.style.display = "block";
+          frame.historyLine.textContent = "";
+          frame.historyLine.style.display = "none";
+          frame.stableLine.textContent = "";
+          frame.partialLine.textContent = "";
+          frame.liveLine.style.display = "none";
+        } else {
+          frame.finalLine.textContent = "";
+          frame.finalLine.style.display = "none";
+          frame.historyLine.textContent = fullStable;
+          frame.historyLine.style.display = fullStable ? "block" : "none";
+          frame.stableLine.textContent = "";
+          frame.partialLine.textContent = trailing;
+          frame.liveLine.style.display = trailing ? "block" : "none";
+        }
+        updateOfflineStreamStatus(data, format, false);
+      } catch (_parseErr) {
+        // Ignore malformed events.
+      }
+    };
+
+    es.onerror = () => {
+      es.close();
+      if (lastData) {
+        resolve(lastData);
+      } else {
+        reject(new Error("streaming connection lost"));
+      }
+    };
+  });
+
+  // Final cleanup: join worker thread, release session.
   offlineState.sessionId = "";
   updateControlAvailability();
-  const response = await fetch(`/api/realtime/stop?session_id=${encodeURIComponent(sessionId)}`, {
-    method: "POST",
-    body: "",
-  });
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.error?.message || "离线流式会话停止失败");
+  try {
+    const response = await fetch(`/api/realtime/stop?session_id=${encodeURIComponent(sessionId)}`, {
+      method: "POST",
+      body: "",
+    });
+    const data = await response.json();
+    if (response.ok) {
+      // Show full final text, not windowed view.
+      const frame = ensureTranscriptFrame(offlineResult);
+      const finalText = data.text || data.stable_text || "";
+      frame.finalLine.textContent = finalText;
+      frame.finalLine.style.display = finalText ? "block" : "none";
+      frame.historyLine.textContent = "";
+      frame.historyLine.style.display = "none";
+      frame.stableLine.textContent = "";
+      frame.partialLine.textContent = "";
+      frame.liveLine.style.display = "none";
+      updateOfflineStreamStatus(data, format, true);
+      return data;
+    }
+  } catch (_err) {
+    // Best-effort cleanup.
   }
-  renderTranscript(offlineResult, data, "尚无结果");
-  updateOfflineStreamStatus(data, format, true);
-  return data;
+
+  // Fallback: use last streamed snapshot.
+  if (streamResult) {
+    updateOfflineStreamStatus(streamResult, format, true);
+  }
+  return streamResult;
 }
 
 async function releaseOfflineStreamSession() {
@@ -516,7 +601,17 @@ async function submitOfflineViaStream(file, startTime, format) {
         continue;
       }
       const data = await sendOfflineStreamChunk(offlineState.sessionId, pcmChunk);
-      renderTranscript(offlineResult, data, "尚无结果");
+      // Offline batch: show full accumulated stable_text, not windowed view.
+      const frame = ensureTranscriptFrame(offlineResult);
+      const fullStable = data.stable_text || "";
+      const trailing = data.live_partial_text || data.partial_text || "";
+      frame.finalLine.textContent = "";
+      frame.finalLine.style.display = "none";
+      frame.historyLine.textContent = fullStable;
+      frame.historyLine.style.display = fullStable ? "block" : "none";
+      frame.stableLine.textContent = "";
+      frame.partialLine.textContent = trailing;
+      frame.liveLine.style.display = trailing ? "block" : "none";
       updateOfflineStreamStatus(data, format, false);
     }
     await finalizeOfflineStreamSession(format);

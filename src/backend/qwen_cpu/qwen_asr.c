@@ -2107,13 +2107,6 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         audio_cursor += chunk_samples;
         if (audio_cursor > audio_n_samples) audio_cursor = audio_n_samples;
 
-        /* When stop is requested (eof), snap cursor to end so we process
-         * at most one final chunk instead of grinding through residual audio.
-         * This makes the stop responsive (<1 decode cycle). */
-        if (live && live_eof && audio_cursor < audio_n_samples) {
-            audio_cursor = audio_n_samples;
-        }
-
         int is_final = live ? (live_eof && audio_cursor >= audio_n_samples)
                             : (audio_cursor >= audio_n_samples);
 
@@ -2698,8 +2691,6 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         while (n_generated < max_new_tokens) {
             n_generated++;
             if (token == QWEN_TOKEN_ENDOFTEXT || token == QWEN_TOKEN_IM_END) break;
-            /* Abort decode immediately when stop is requested or cancelled. */
-            if (live && live->eof) break;
             if (qwen_should_cancel(ctx)) break;
 
             chunk_tokens[n_chunk_tokens++] = token;
