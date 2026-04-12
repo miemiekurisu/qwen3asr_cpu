@@ -6,7 +6,20 @@ function(qasr_configure_blas target_name)
         return()
     endif()
 
-    find_package(OpenBLAS REQUIRED)
+    find_package(OpenBLAS QUIET)
+    if(NOT OpenBLAS_FOUND)
+        # Debian/Ubuntu libopenblas-dev ships pkg-config but no CMake config.
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(OpenBLAS REQUIRED IMPORTED_TARGET openblas)
+            target_compile_definitions(${target_name} PUBLIC QASR_BLAS_OPENBLAS=1)
+            target_link_libraries(${target_name} PUBLIC PkgConfig::OpenBLAS)
+            return()
+        endif()
+        message(FATAL_ERROR
+            "OpenBLAS not found. Install libopenblas-dev (Debian/Ubuntu) "
+            "or set OpenBLAS_DIR to the CMake config directory.")
+    endif()
     target_compile_definitions(${target_name} PUBLIC QASR_BLAS_OPENBLAS=1)
 
     if(TARGET OpenBLAS::OpenBLAS)
