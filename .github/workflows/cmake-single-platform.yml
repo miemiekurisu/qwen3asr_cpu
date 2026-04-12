@@ -1,0 +1,99 @@
+name: Linux Build and Release
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  BUILD_PRESET: linux-openblas
+  BUILD_DIR: build/linux-openblas
+  PKG_NAME: qwen3asr_cpu-linux-x86_64
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            libopenblas-dev
+
+      - name: Configure
+        run: cmake --preset "${BUILD_PRESET}"
+
+      - name: Build
+        run: cmake --build --preset "${BUILD_PRESET}" --parallel
+
+      - name: Test
+        run: ctest --preset "${BUILD_PRESET}"
+
+      - name: Prepare package directory
+        run: |
+          rm -rf dist
+          mkdir -p "dist/${PKG_NAME}"
+
+          cp "${BUILD_DIR}/qasr_cli" "dist/${PKG_NAME}/"
+          cp "${BUILD_DIR}/qasr_server" "dist/${PKG_NAME}/"
+
+          if [ -f "${BUILD_DIR}/qasr_cpu_bench" ]; then
+            cp "${BUILD_DIR}/qasr_cpu_bench" "dist/${PKG_NAME}/"
+          fi
+
+          cp README.md "dist/${PKG_NAME}/"
+          cp LICENSE "dist/${PKG_NAME}/"
+          cp NOTICE.md "dist/${PKG_NAME}/"
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG_NAME }}
+          path: dist/${{ env.PKG_NAME }}
+          retention-days: 7
+
+      - name: Create release archive
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tar -C dist -czf "${PKG_NAME}-${GITHUB_REF_NAME}.tar.gz" "${PKG_NAME}"
+
+      - name: Upload release archive artifact
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-archive
+          path: ${{ env.PKG_NAME }}-${{ github.ref_name }}.tar.gz
+          retention-days: 7
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build-linux
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release archive
+        uses: actions/download-artifact@v5
+        with:
+          name: release-archive
+          path: .
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.PKG_NAME }}-${{ github.ref_name }}.tar.gz
+          generate_release_notes: true
