@@ -777,12 +777,14 @@ async function stopRealtimeCapture() {
       body: "",
     });
     const data = await response.json();
+    const prevStats = realtimeStatus.textContent;
     if (response.ok) {
       renderTranscript(realtimeResult, data, "尚无结果");
       syncRealtimeArchive(data);
-      realtimeStatus.textContent = data.text
-        ? `会话 ${sessionId} 已停止，终稿已出`
-        : `会话 ${sessionId} 已停止`;
+      const stopLabel = data.text ? "已停止，终稿已出" : "已停止";
+      realtimeStatus.textContent = prevStats
+        ? `${prevStats} / ${stopLabel}`
+        : `会话 ${sessionId} ${stopLabel}`;
     } else {
       realtimeStatus.textContent = data.error ? data.error.message : "停止失败";
     }
