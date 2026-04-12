@@ -27,3 +27,4 @@ test_output*.txt
 testfile/*.mp3
 testfile/*.wav
 !testfile/README.md
+experience.md
