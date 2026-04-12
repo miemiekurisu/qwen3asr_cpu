@@ -2108,35 +2108,64 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 int64_t prev_cursor = audio_cursor - chunk_samples;
                 int64_t prev_partial = prev_cursor - full_end;
 
-                /* Energy gate: compute RMS of the latest chunk.  If the
-                 * chunk carries speech-level energy, force a decode round
-                 * even inside the same coalesce bracket.  The threshold
-                 * (0.003 ≈ -50 dBFS) is intentionally above the silence
-                 * floor of compact_silence (0.002) to avoid false positives
-                 * from background noise while catching actual speech. */
+                /* Energy gate – speech-onset detector.
+                 *
+                 * Only force an extra decode when speech RESUMES after a
+                 * silent gap (silence → speech transition).  During
+                 * continuous speech both the current and previous chunks
+                 * are energetic, so the gate stays closed and normal
+                 * coalescing keeps the O(n²) re-encode cost in check.
+                 *
+                 * Threshold 0.003 ≈ -50 dBFS, above compact_silence
+                 * floor (0.002) to reject background noise. */
                 int energy_override = 0;
                 if (prev_partial >= 0 &&
                     partial_span / coalesce_step == prev_partial / coalesce_step) {
                     int64_t chunk_off = audio_cursor - chunk_samples;
                     if (chunk_off >= 0 && chunk_off < audio_n_samples) {
-                        int64_t chunk_len = audio_cursor - chunk_off;
+                        int64_t chunk_len = chunk_samples;
                         if (chunk_len > audio_n_samples - chunk_off)
                             chunk_len = audio_n_samples - chunk_off;
                         const float *chunk_ptr = audio_samples + chunk_off;
-                        float energy = 0.0f;
+
+                        /* RMS of the current chunk. */
+                        float cur_energy = 0.0f;
                         for (int64_t i = 0; i < chunk_len; i++) {
                             float s = chunk_ptr[i];
-                            energy += s * s;
+                            cur_energy += s * s;
                         }
-                        float rms = sqrtf(energy / (float)(chunk_len > 0 ? chunk_len : 1));
-                        if (rms >= 0.003f) {
-                            energy_override = 1;
-                            if (qwen_verbose >= 2) {
-                                fprintf(stderr,
-                                        "  Coalesce: energy override at %.1f s "
-                                        "(rms=%.4f, forcing decode)\n",
-                                        (float)audio_cursor / QWEN_SAMPLE_RATE,
-                                        rms);
+                        float cur_rms = sqrtf(cur_energy / (float)(chunk_len > 0 ? chunk_len : 1));
+
+                        if (cur_rms >= 0.003f) {
+                            /* Current chunk has speech.  Check whether the
+                             * PREVIOUS chunk was silent — if so, this is a
+                             * silence→speech onset and we force decode. */
+                            int64_t prev_off = chunk_off - chunk_samples;
+                            int prev_was_silent = 1; /* assume onset if no prev */
+                            if (prev_off >= 0) {
+                                int64_t prev_len = chunk_samples;
+                                if (prev_len > chunk_off - prev_off)
+                                    prev_len = chunk_off - prev_off;
+                                if (prev_off + prev_len <= audio_n_samples && prev_len > 0) {
+                                    const float *prev_ptr = audio_samples + prev_off;
+                                    float prev_e = 0.0f;
+                                    for (int64_t i = 0; i < prev_len; i++) {
+                                        float s = prev_ptr[i];
+                                        prev_e += s * s;
+                                    }
+                                    float prev_rms = sqrtf(prev_e / (float)prev_len);
+                                    prev_was_silent = (prev_rms < 0.003f) ? 1 : 0;
+                                }
+                            }
+                            if (prev_was_silent) {
+                                energy_override = 1;
+                                if (qwen_verbose >= 2) {
+                                    fprintf(stderr,
+                                            "  Coalesce: speech onset at %.1f s "
+                                            "(rms=%.4f, prev silent, forcing decode)\n",
+                                            (float)audio_cursor / QWEN_SAMPLE_RATE,
+                                            cur_rms);
+                                }
                             }
                         }
                     }
