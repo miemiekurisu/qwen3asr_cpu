@@ -1,4 +1,5 @@
 #include "qwen_asr_perf.h"
+#include "qwen_asr_kernels.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -579,8 +580,7 @@ int qwen_x86_cpu_supports_avx2_fma(void) {
     __cpuidex(cpu_info, 7, 0);
     avx2 = (cpu_info[1] & (1 << 5)) != 0;
     return avx2 ? 1 : 0;
-#elif (defined(__GNUC__) || defined(__clang__)) &&
-      (defined(__x86_64__) || defined(__i386__))
+#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
     return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
 #else
     return 0;

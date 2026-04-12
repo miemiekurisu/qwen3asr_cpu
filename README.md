@@ -8,7 +8,7 @@
 
 ## English
 
-A high-performance C/C++ inference server for **Qwen3-ASR-0.6B**, optimized for CPU-only real-time streaming speech recognition. Features an OpenAI-compatible REST API, WebSocket streaming, and a built-in web UI — no GPU required.
+A high-performance C/C++ inference server for **Qwen3-ASR**, optimized for CPU-only real-time streaming speech recognition. Supports both **0.6B** and **1.7B** models. Features an OpenAI-compatible REST API, WebSocket streaming, and a built-in web UI — no GPU required.
 
 ### Features
 
@@ -26,11 +26,12 @@ A high-performance C/C++ inference server for **Qwen3-ASR-0.6B**, optimized for 
 - **Cross-platform**: Windows (MSVC), Linux (GCC/Clang), macOS (Accelerate)
 - **Pure C17/C++17**: No Python runtime required
 
-### Supported Model
+### Supported Models
 
 | Model | Parameters | Description |
 |-------|-----------|-------------|
-| [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) | ~0.6B | Streaming & offline ASR, 30+ languages |
+| Qwen3-ASR-0.6B ([HuggingFace](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) \| [ModelScope](https://modelscope.cn/models/Qwen/Qwen3-ASR-0.6B)) | ~0.6B | **Recommended for realtime streaming** — fast, low memory |
+| Qwen3-ASR-1.7B ([HuggingFace](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) \| [ModelScope](https://modelscope.cn/models/Qwen/Qwen3-ASR-1.7B)) | ~1.7B | Higher accuracy, better for offline batch transcription |
 
 ### Performance
 
@@ -63,7 +64,7 @@ Benchmark on 109-second Mandarin audio, Intel 16-thread CPU (Windows, OpenBLAS 0
 | Ninja | 1.10+ | Yes | [ninja-build.org](https://ninja-build.org/) | Ships with VS 2022 |
 | OpenBLAS | 0.3.x | Yes* | [github.com/OpenMathLib/OpenBLAS](https://github.com/OpenMathLib/OpenBLAS/releases) | *macOS uses Accelerate instead |
 | oneDNN | 3.x | No | Auto-downloaded by CMake | Enables INT8 decoder (~30% speedup) |
-| Model | — | Yes | [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) | safetensors format, ~1.2 GB |
+| Model | — | Yes | See [Supported Models](#supported-models) | safetensors format; 0.6B ~1.2 GB, 1.7B ~3.4 GB |
 
 > **oneDNN** is automatically downloaded and compiled from source during CMake configure if not found on the system. No manual installation needed. Set `QASR_ENABLE_ONEDNN=OFF` to disable.
 
@@ -241,7 +242,7 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 
 ## 中文
 
-高性能 C/C++ 实现的 **Qwen3-ASR-0.6B** 推理服务器，专为纯 CPU 实时流式语音识别优化。内置 OpenAI 兼容 REST API、WebSocket 流式接口和 Web UI — 无需 GPU。
+高性能 C/C++ 实现的 **Qwen3-ASR** 推理服务器，专为纯 CPU 实时流式语音识别优化。支持 **0.6B** 和 **1.7B** 两种模型。内置 OpenAI 兼容 REST API、WebSocket 流式接口和 Web UI — 无需 GPU。
 
 ### 特性
 
@@ -263,7 +264,8 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 
 | 模型 | 参数量 | 说明 |
 |------|--------|------|
-| [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) | ~6 亿 | 流式与离线 ASR，支持 30+ 语言 |
+| Qwen3-ASR-0.6B ([HuggingFace](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) \| [ModelScope](https://modelscope.cn/models/Qwen/Qwen3-ASR-0.6B)) | ~6 亿 | **推荐用于实时流式** — 速度快、内存占用低 |
+| Qwen3-ASR-1.7B ([HuggingFace](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) \| [ModelScope](https://modelscope.cn/models/Qwen/Qwen3-ASR-1.7B)) | ~17 亿 | 精度更高，适合离线批量转写 |
 
 ### 性能
 
@@ -296,7 +298,7 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 | Ninja | 1.10+ | 是 | [ninja-build.org](https://ninja-build.org/) | VS 2022 自带 |
 | OpenBLAS | 0.3.x | 是* | [github.com/OpenMathLib/OpenBLAS](https://github.com/OpenMathLib/OpenBLAS/releases) | *macOS 使用 Accelerate 替代 |
 | oneDNN | 3.x | 否 | CMake 自动下载 | 启用 INT8 解码器（提速 ~30%） |
-| 模型 | — | 是 | [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) | safetensors 格式，约 1.2 GB |
+| 模型 | — | 是 | 见[支持的模型](#支持的模型) | safetensors 格式；0.6B ~1.2 GB，1.7B ~3.4 GB |
 
 > **oneDNN** 会在 CMake 配置阶段自动下载并编译源码，无需手动安装。设置 `QASR_ENABLE_ONEDNN=OFF` 可禁用。
 
