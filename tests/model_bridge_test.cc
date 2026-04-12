@@ -91,7 +91,7 @@ QASR_TEST(ValidateAsrRunOptionsRejectsBrokenValues) {
 
 QASR_TEST(RunAsrRejectsMissingModelDir) {
     qasr::AsrRunOptions options;
-    options.model_dir = "/tmp/does-not-exist-qwen-asr-provider";
+    options.model_dir = "/tmp/does-not-exist-qwen3asr-cpu";
     options.audio_path = "/tmp/does-not-exist.wav";
     options.stream_max_new_tokens = 1;
     options.segment_max_codepoints = 32;

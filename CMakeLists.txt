@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(qwen_asr_provider VERSION 0.1.0 LANGUAGES C CXX)
+project(qwen3asr_cpu VERSION 0.1.0 LANGUAGES C CXX)
 
 include(CTest)
 

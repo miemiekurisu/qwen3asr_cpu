@@ -2506,7 +2506,7 @@ int RunServer(const ServerConfig & config) {
                 {"id", served_model_id},
                 {"object", "model"},
                 {"created", 0},
-                {"owned_by", "qwen-asr-provider"},
+                {"owned_by", "qwen3asr_cpu"},
             })
         });
         SetJsonResponse(response, payload);

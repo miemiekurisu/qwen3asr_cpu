@@ -4,7 +4,7 @@ This repository contains first-party code and a copied third-party component.
 
 ## First-party project
 
-- Name: qwen-asr-provider
+- Name: qwen3asr_cpu
 - License: MIT
 - Copyright: 2026 miemiekurisu
 - License file: `LICENSE`

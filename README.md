@@ -1,4 +1,4 @@
-# Qwen-ASR-Provider
+# qwen3asr_cpu
 
 [English](#english) | [中文](#中文)
 
@@ -186,7 +186,7 @@ ffmpeg -i input.mp3 -ar 16000 -ac 1 -c:a pcm_s16le output.wav
 ### Project Structure
 
 ```
-qwen-asr-provider/
+qwen3asr_cpu/
 ├── app/
 │   ├── qasr_cli.cc              # CLI entry point
 │   └── qasr_server.cc           # Server entry point
@@ -420,7 +420,7 @@ ffmpeg -i input.mp3 -ar 16000 -ac 1 -c:a pcm_s16le output.wav
 ### 项目结构
 
 ```
-qwen-asr-provider/
+qwen3asr_cpu/
 ├── app/
 │   ├── qasr_cli.cc              # CLI 入口
 │   └── qasr_server.cc           # 服务器入口
