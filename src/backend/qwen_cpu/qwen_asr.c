@@ -1967,6 +1967,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     int emitted_text_cap = 8192;
     int stagnant_chunks = 0;
     int post_reset_dup_check = 0;
+    int last_periodic_reset_chunk = 0;
     /* Stability promotion: track consecutive rounds where the unfixed
      * tail tokens are identical.  When the tail hasn't changed for
      * TAIL_STABLE_PROMOTE rounds, reduce effective rollback to 0 so
@@ -2902,6 +2903,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 tail_stable_rounds = 0;
                 prev_tail_len = 0;
                 post_reset_dup_check = 1;
+                last_periodic_reset_chunk = chunk_idx;
                 did_recovery_reset = 1;
                 if (qwen_monitor) {
                     fprintf(stderr, "!");
@@ -3001,12 +3003,17 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                     (!is_final &&
                      ctx->past_text_conditioning &&
                      chunk_idx >= unfixed_chunks &&
-                     ((chunk_idx + 1) % QWEN_STREAM_RESET_INTERVAL_CHUNKS == 0));
+                     (chunk_idx - last_periodic_reset_chunk >= QWEN_STREAM_RESET_INTERVAL_CHUNKS));
                 if (periodic_reset) {
+                    /* Gentle compaction: carry up to MAX_PREFIX tokens so
+                     * the model's text context is virtually unchanged.
+                     * Preserve encoder cache (windows are deterministic).
+                     * Only the raw_tokens array is compacted to prevent
+                     * unbounded growth of the token history. */
                     if (stream_reanchor_text_state(ctx,
                                                    emitted_text_tokens,
                                                    n_emitted_text_tokens,
-                                                   QWEN_STREAM_RESET_CARRY_TOKENS,
+                                                   QWEN_STREAM_MAX_PREFIX_TOKENS,
                                                    &raw_tokens, &raw_tokens_cap, &n_raw_tokens,
                                                    &stable_text_tokens, &stable_text_cap,
                                                    &n_stable_text_tokens) != 0) {
@@ -3014,13 +3021,10 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                         n_stable_text_tokens = 0;
                     }
                     prev_prefill_len = 0;
-                    stream_clear_enc_cache(enc_cache,
-                                           &n_enc_cache,
-                                           &enc_cache_start,
-                                           &enc_cached_seq_total,
-                                           &next_window_start,
-                                           full_end);
-                    stream_bg_encoder_invalidate(bg_enc);
+                    post_reset_dup_check = 1;
+                    tail_stable_rounds = 0;
+                    prev_tail_len = 0;
+                    last_periodic_reset_chunk = chunk_idx;
                     did_periodic_reset = 1;
                 }
             }
