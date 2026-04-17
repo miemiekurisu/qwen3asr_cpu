@@ -61,6 +61,16 @@ void EncoderCache::Store(std::int32_t window_index, std::vector<float> data,
             return;
         }
     }
+    // Enforce capacity limit: evict the oldest (lowest window_index) entry.
+    if (max_entries_ > 0 && entries_.size() >= max_entries_) {
+        auto oldest = entries_.begin();
+        for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+            if (it->window_index < oldest->window_index) {
+                oldest = it;
+            }
+        }
+        entries_.erase(oldest);
+    }
     entries_.push_back({window_index, std::move(data), seq_len});
 }
 

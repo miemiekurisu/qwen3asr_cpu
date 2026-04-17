@@ -864,6 +864,7 @@ struct ModelDecodeOptions {
     std::string language;
     int stream_max_new_tokens = 32;
     float stream_chunk_sec = 0.0f;
+    float temperature = -1.0f;
     bool use_stream_path = false;
     std::function<void(std::string_view)> token_callback;
     std::function<bool()> cancel_callback;
@@ -914,6 +915,9 @@ public:
         }
         ctx_->past_text_conditioning = 1;
         ctx_->segment_sec = 30.0f;
+        if (config.temperature >= 0.0f) {
+            ctx_->decode_temperature = config.temperature;
+        }
         return OkStatus();
     }
 
@@ -935,6 +939,11 @@ public:
         ctx_->stream_max_new_tokens = decode.stream_max_new_tokens;
         if (decode.stream_chunk_sec > 0.0f) {
             ctx_->stream_chunk_sec = decode.stream_chunk_sec;
+        }
+        if (decode.temperature >= 0.0f) {
+            ctx_->decode_temperature = decode.temperature;
+        } else if (config_.temperature >= 0.0f) {
+            ctx_->decode_temperature = config_.temperature;
         }
         if (qwen_set_prompt(ctx_, decode.prompt.empty() ? nullptr : decode.prompt.c_str()) != 0) {
             result.status = Status(StatusCode::kInvalidArgument, "failed to set prompt");
@@ -984,6 +993,11 @@ public:
 
         qwen_verbose = config_.verbosity;
         ctx_->stream_max_new_tokens = decode.stream_max_new_tokens;
+        if (decode.temperature >= 0.0f) {
+            ctx_->decode_temperature = decode.temperature;
+        } else if (config_.temperature >= 0.0f) {
+            ctx_->decode_temperature = config_.temperature;
+        }
         if (qwen_set_prompt(ctx_, decode.prompt.empty() ? nullptr : decode.prompt.c_str()) != 0) {
             result.status = Status(StatusCode::kInvalidArgument, "failed to set prompt");
             return result;
@@ -1034,6 +1048,10 @@ public:
 
     int verbosity() const noexcept {
         return config_.verbosity;
+    }
+
+    float temperature() const noexcept {
+        return config_.temperature;
     }
 
 private:
@@ -1926,6 +1944,9 @@ Status ValidateServerConfig(const ServerConfig & config) {
     if (config.verbosity < 0) {
         return Status(StatusCode::kInvalidArgument, "verbosity must be >= 0");
     }
+    if (config.temperature > 2.0f) {
+        return Status(StatusCode::kOutOfRange, "temperature must be <= 2.0");
+    }
     if (config.ui_dir.empty()) {
         return Status(StatusCode::kInvalidArgument, "ui_dir must not be empty");
     }
@@ -2038,6 +2059,21 @@ Status ParseServerArguments(int argc, const char * const argv[], ServerConfig * 
             config->encoder_int8 = true;
             continue;
         }
+        if (arg == "--temperature") {
+            const char * value = nullptr;
+            Status status = RequireValue(argc, argv, index, "--temperature", &value);
+            if (!status.ok()) {
+                return status;
+            }
+            char * endp = nullptr;
+            float t = std::strtof(value, &endp);
+            if (endp == value || *endp != '\0') {
+                return Status(StatusCode::kInvalidArgument, "temperature must be a valid float");
+            }
+            config->temperature = t;
+            ++index;
+            continue;
+        }
         return Status(StatusCode::kInvalidArgument, "unknown argument: " + std::string(arg));
     }
 
@@ -2059,6 +2095,7 @@ std::string BuildServerUsage(std::string_view program_name) {
     usage += "  --ui-dir <dir>\n";
     usage += "  --threads <n>\n";
     usage += "  --verbosity <n>\n";
+    usage += "  --temperature <float>  (default: auto, 0=greedy, >0=sampling)\n";
     usage += "  --decoder-int8\n";
     usage += "  --encoder-int8\n";
     usage += "  -h, --help\n";
@@ -2178,6 +2215,7 @@ int RunServer(const ServerConfig & config) {
         const float stream_chunk_sec = RealtimeStreamChunkSeconds(realtime_policy);
         const int stream_max_new_tokens = RealtimeStreamMaxNewTokens(realtime_policy);
         const int verbosity = model.verbosity();
+        const float temperature = model.temperature();
         const std::string forced_language = session->language;
 
         worker->thread = std::thread([
@@ -2187,6 +2225,7 @@ int RunServer(const ServerConfig & config) {
             stream_chunk_sec,
             stream_max_new_tokens,
             verbosity,
+            temperature,
             forced_language,
             &metrics]() {
             qwen_verbose = verbosity;
@@ -2194,6 +2233,9 @@ int RunServer(const ServerConfig & config) {
             live_ctx->past_text_conditioning = 1;
             live_ctx->stream_chunk_sec = stream_chunk_sec;
             live_ctx->stream_max_new_tokens = stream_max_new_tokens;
+            if (temperature >= 0.0f) {
+                live_ctx->decode_temperature = temperature;
+            }
 
             std::function<void(std::string_view)> token_callback = [&session](std::string_view piece) {
                 if (piece.empty()) {

@@ -1,6 +1,7 @@
 #include "qasr/cli/options.h"
 
 #include <charconv>
+#include <cstdlib>
 #include <string>
 
 namespace qasr {
@@ -144,6 +145,21 @@ Status ParseCliArguments(int argc, const char * const argv[], CliOptions * optio
             ++index;
             continue;
         }
+        if (arg == "--temperature") {
+            const char * value = nullptr;
+            Status status = RequireValue(argc, argv, index, "--temperature", &value);
+            if (!status.ok()) {
+                return status;
+            }
+            char * endp = nullptr;
+            float t = std::strtof(value, &endp);
+            if (endp == value || *endp != '\0') {
+                return Status(StatusCode::kInvalidArgument, "temperature must be a valid float");
+            }
+            options->asr.temperature = t;
+            ++index;
+            continue;
+        }
         if (arg == "--stream") {
             options->asr.stream = true;
             continue;
@@ -190,6 +206,7 @@ std::string BuildCliUsage(std::string_view program_name) {
     usage += "  --segment-max-codepoints <n>\n";
     usage += "  --prompt <text>\n";
     usage += "  --language <lang>\n";
+    usage += "  --temperature <float>  (default: auto, 0=greedy, >0=sampling)\n";
     usage += "  --verbosity <n>\n";
     usage += "  --emit-tokens\n";
     usage += "  --decoder-int8\n";

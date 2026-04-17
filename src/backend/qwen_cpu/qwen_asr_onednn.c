@@ -223,7 +223,10 @@ void qwen_onednn_shutdown(void) {
 #ifdef _WIN32
     InitOnceInitialize(&g_onednn_once);
 #else
-    g_onednn_once = PTHREAD_ONCE_INIT;
+    {
+        static const pthread_once_t once_init = PTHREAD_ONCE_INIT;
+        memcpy(&g_onednn_once, &once_init, sizeof(g_onednn_once));
+    }
 #endif
 }
 

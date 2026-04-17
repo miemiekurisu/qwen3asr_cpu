@@ -39,6 +39,7 @@ struct ServerConfig {
     std::int32_t port = 8080;
     std::int32_t threads = 0;
     std::int32_t verbosity = 0;
+    float temperature = -1.0f;
     bool decoder_int8 = false;
     bool encoder_int8 = false;
 };
