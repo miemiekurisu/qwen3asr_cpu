@@ -903,7 +903,142 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
 
     ctx->kv_cache_len = pos + 1;
 
-    /* Final norm + streaming argmax (no logits buffer needed) */
+    /* Final norm + output projection */
     qwen_rms_norm(x, x, dec->norm, 1, dim, eps);
+
+    /* Temperature sampling / repetition penalty mode: compute full logits.
+     * Used by batch fallback and streaming temperature escalation. */
+    int need_logits = (ctx->decode_temperature > 0.01f) ||
+                      (ctx->decode_repetition_penalty > 1.001f &&
+                       ctx->rep_pen_ring_count > 0);
+
+    if (need_logits) {
+        /* Lazy-allocate logits buffer */
+        if (!ctx->dec_logits_buf) {
+            ctx->dec_logits_buf = (float *)malloc((size_t)cfg->vocab_size * sizeof(float));
+            if (!ctx->dec_logits_buf)
+                return qwen_argmax_matvec_bf16(x, dec->tok_embeddings_bf16, dim, cfg->vocab_size);
+        }
+
+        /* logits = x @ tok_embeddings^T */
+        qwen_matmul_t_bf16(ctx->dec_logits_buf, x, dec->tok_embeddings_bf16,
+                           1, dim, cfg->vocab_size);
+
+        /* Frequency-scaled repetition penalty: penalize each recent token
+         * by base_pen ^ min(freq, 10).  Tokens appearing many times in
+         * the ring buffer get exponentially stronger penalty, decisively
+         * breaking period-2 and other short-cycle degenerate loops. */
+        if (ctx->decode_repetition_penalty > 1.001f && ctx->rep_pen_ring_count > 0) {
+            float base_pen = ctx->decode_repetition_penalty;
+            /* Build frequency table of tokens in ring buffer */
+            int freq_tokens[QWEN_REP_PEN_RING_SIZE];
+            int freq_counts[QWEN_REP_PEN_RING_SIZE];
+            int n_unique = 0;
+            for (int r = 0; r < ctx->rep_pen_ring_count; r++) {
+                int ring_idx = (ctx->rep_pen_ring_pos - 1 - r) & (QWEN_REP_PEN_RING_SIZE - 1);
+                int tid = ctx->rep_pen_ring[ring_idx];
+                if (tid < 0 || tid >= cfg->vocab_size) continue;
+                int found = 0;
+                for (int d = 0; d < n_unique; d++) {
+                    if (freq_tokens[d] == tid) { freq_counts[d]++; found = 1; break; }
+                }
+                if (!found) {
+                    freq_tokens[n_unique] = tid;
+                    freq_counts[n_unique] = 1;
+                    n_unique++;
+                }
+            }
+            /* Apply penalty: pen = base_pen ^ min(count, 10) */
+            for (int d = 0; d < n_unique; d++) {
+                int tid = freq_tokens[d];
+                int cnt = freq_counts[d];
+                if (cnt > 10) cnt = 10;
+                float pen = 1.0f;
+                for (int p = 0; p < cnt; p++) pen *= base_pen;
+                if (ctx->dec_logits_buf[tid] > 0)
+                    ctx->dec_logits_buf[tid] /= pen;
+                else
+                    ctx->dec_logits_buf[tid] *= pen;
+            }
+        }
+
+        /* If temperature > 0: apply temp scaling + top-k/top-p + sample.
+         * Otherwise: argmax over (possibly penalized) logits. */
+        if (ctx->decode_temperature > 0.01f) {
+            /* Apply temperature */
+            float inv_temp = 1.0f / ctx->decode_temperature;
+            for (int i = 0; i < cfg->vocab_size; i++)
+                ctx->dec_logits_buf[i] *= inv_temp;
+
+            /* Find top-k (k=40) candidates */
+            #define DECODE_TOP_K 40
+            int top_idx[DECODE_TOP_K];
+            float top_val[DECODE_TOP_K];
+            for (int j = 0; j < DECODE_TOP_K; j++) {
+                top_val[j] = -1e30f;
+                top_idx[j] = 0;
+            }
+            for (int i = 0; i < cfg->vocab_size; i++) {
+                if (ctx->dec_logits_buf[i] > top_val[DECODE_TOP_K - 1]) {
+                    int p = DECODE_TOP_K - 1;
+                    while (p > 0 && ctx->dec_logits_buf[i] > top_val[p - 1]) p--;
+                    if (p < DECODE_TOP_K - 1) {
+                        memmove(&top_val[p + 1], &top_val[p],
+                                (size_t)(DECODE_TOP_K - 1 - p) * sizeof(float));
+                        memmove(&top_idx[p + 1], &top_idx[p],
+                                (size_t)(DECODE_TOP_K - 1 - p) * sizeof(int));
+                    }
+                    top_val[p] = ctx->dec_logits_buf[i];
+                    top_idx[p] = i;
+                }
+            }
+
+            /* Softmax over top-k */
+            float max_logit = top_val[0];
+            float sum = 0.0f;
+            for (int j = 0; j < DECODE_TOP_K; j++) {
+                top_val[j] = expf(top_val[j] - max_logit);
+                sum += top_val[j];
+            }
+
+            /* Top-p filtering (p=0.9): truncate to cumulative 90% */
+            float cumul = 0.0f;
+            int n_active = 0;
+            for (int j = 0; j < DECODE_TOP_K; j++) {
+                top_val[j] /= sum;
+                cumul += top_val[j];
+                n_active = j + 1;
+                if (cumul >= 0.9f) break;
+            }
+
+            /* Re-normalize after top-p truncation */
+            float psum = 0.0f;
+            for (int j = 0; j < n_active; j++) psum += top_val[j];
+
+            /* LCG random sample */
+            ctx->sample_rng_state = ctx->sample_rng_state * 1664525u + 1013904223u;
+            float r = (float)(ctx->sample_rng_state >> 8) / 16777216.0f; /* 0..1 */
+            r *= psum;
+            float cs = 0.0f;
+            for (int j = 0; j < n_active; j++) {
+                cs += top_val[j];
+                if (cs >= r) return top_idx[j];
+            }
+            return top_idx[0];
+        }
+
+        /* Penalty-only (temp=0): argmax over penalized logits */
+        int best_id = 0;
+        float best_val = ctx->dec_logits_buf[0];
+        for (int i = 1; i < cfg->vocab_size; i++) {
+            if (ctx->dec_logits_buf[i] > best_val) {
+                best_val = ctx->dec_logits_buf[i];
+                best_id = i;
+            }
+        }
+        return best_id;
+    }
+
+    /* Greedy: streaming argmax (no logits buffer needed) */
     return qwen_argmax_matvec_bf16(x, dec->tok_embeddings_bf16, dim, cfg->vocab_size);
 }

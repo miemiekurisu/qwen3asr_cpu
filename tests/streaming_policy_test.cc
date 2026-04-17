@@ -204,3 +204,52 @@ QASR_TEST(EvictOldHistoryNoEvictionNeeded) {
     QASR_EXPECT(s.ok());
     QASR_EXPECT_EQ(cache.size(), std::size_t(1));
 }
+
+// --- EncoderCache capacity limit ---
+
+QASR_TEST(EncoderCacheUnlimitedByDefault) {
+    qasr::EncoderCache cache;
+    QASR_EXPECT_EQ(cache.max_entries(), std::size_t(0));
+    for (int i = 0; i < 100; ++i) {
+        cache.Store(i, std::vector<float>(10, 0.0f), 1);
+    }
+    QASR_EXPECT_EQ(cache.size(), std::size_t(100));
+}
+
+QASR_TEST(EncoderCacheCapacityEvictsOldest) {
+    qasr::EncoderCache cache(3);
+    QASR_EXPECT_EQ(cache.max_entries(), std::size_t(3));
+    cache.Store(10, std::vector<float>(10, 0.0f), 1);
+    cache.Store(20, std::vector<float>(10, 0.0f), 1);
+    cache.Store(30, std::vector<float>(10, 0.0f), 1);
+    QASR_EXPECT_EQ(cache.size(), std::size_t(3));
+
+    // Adding a 4th entry should evict the oldest (window 10)
+    cache.Store(40, std::vector<float>(10, 0.0f), 1);
+    QASR_EXPECT_EQ(cache.size(), std::size_t(3));
+    QASR_EXPECT(!cache.Has(10));
+    QASR_EXPECT(cache.Has(20));
+    QASR_EXPECT(cache.Has(30));
+    QASR_EXPECT(cache.Has(40));
+}
+
+QASR_TEST(EncoderCacheCapacityReplaceDoesNotEvict) {
+    qasr::EncoderCache cache(2);
+    cache.Store(0, std::vector<float>(10, 1.0f), 1);
+    cache.Store(1, std::vector<float>(10, 2.0f), 1);
+    // Replacing window 0 should not trigger eviction
+    cache.Store(0, std::vector<float>(10, 3.0f), 5);
+    QASR_EXPECT_EQ(cache.size(), std::size_t(2));
+    QASR_EXPECT(cache.Has(0));
+    QASR_EXPECT(cache.Has(1));
+}
+
+QASR_TEST(EncoderCacheCapacityOneSlot) {
+    qasr::EncoderCache cache(1);
+    cache.Store(0, std::vector<float>(4, 0.0f), 1);
+    QASR_EXPECT_EQ(cache.size(), std::size_t(1));
+    cache.Store(1, std::vector<float>(4, 0.0f), 1);
+    QASR_EXPECT_EQ(cache.size(), std::size_t(1));
+    QASR_EXPECT(!cache.Has(0));
+    QASR_EXPECT(cache.Has(1));
+}

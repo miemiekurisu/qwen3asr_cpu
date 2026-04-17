@@ -256,6 +256,9 @@ Status ValidateAsrRunOptions(const AsrRunOptions & options) {
     if (options.verbosity < 0) {
         return Status(StatusCode::kInvalidArgument, "verbosity must be >= 0");
     }
+    if (options.temperature > 2.0f) {
+        return Status(StatusCode::kOutOfRange, "temperature must be <= 2.0");
+    }
     if (options.emit_tokens && options.emit_segments) {
         return Status(StatusCode::kInvalidArgument, "emit_tokens and emit_segments are mutually exclusive");
     }
@@ -308,6 +311,10 @@ AsrRunResult RunAsr(const AsrRunOptions & options) {
     }
 
     ctx->stream_max_new_tokens = static_cast<int>(options.stream_max_new_tokens);
+
+    if (options.temperature >= 0.0f) {
+        ctx->decode_temperature = options.temperature;
+    }
 
     if (!options.prompt.empty() && qwen_set_prompt(ctx, options.prompt.c_str()) != 0) {
         qwen_free(ctx);

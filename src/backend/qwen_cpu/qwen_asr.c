@@ -497,6 +497,7 @@ void qwen_free(qwen_ctx_t *ctx) {
     free(ctx->dec_attn_out); free(ctx->dec_proj_out);
     free(ctx->dec_gate); free(ctx->dec_up); free(ctx->dec_ffn_out);
     free(ctx->dec_rope_cos); free(ctx->dec_rope_sin);
+    free(ctx->dec_logits_buf);
 
     /* Persistent decoder prefill buffers */
     free(ctx->pref_x); free(ctx->pref_x_norm);
@@ -730,7 +731,26 @@ static float *compact_silence(const float *samples, int n_samples, int *out_samp
     }
     free(is_voice);
 
-    float *out = (float *)malloc((size_t)n_samples * sizeof(float));
+    /* Pre-count exact output size to avoid allocating a full-input-size
+     * buffer.  For long audio this saves hundreds of MB. */
+    int out_size = 0;
+    {
+        int sc = 0;
+        for (int w = 0; w < n_win; w++) {
+            int start = w * win;
+            int end_s = start + win;
+            if (end_s > n_samples) end_s = n_samples;
+            int len = end_s - start;
+            if (padded[w]) { out_size += len; sc = 0; }
+            else { sc++; if (sc <= pass_windows) out_size += len; }
+        }
+    }
+    if (out_size == 0) {
+        out_size = n_samples;
+        if (out_size > QWEN_SAMPLE_RATE / 2) out_size = QWEN_SAMPLE_RATE / 2;
+    }
+
+    float *out = (float *)malloc((size_t)out_size * sizeof(float));
     if (!out) {
         free(rms_vals);
         free(padded);
@@ -850,14 +870,26 @@ static int find_split_point(const float *samples, int n_samples,
     return best_center;
 }
 
+/* Forward declaration (defined below, after streaming helpers) */
+static int stream_tail_repeat_blocks(const int *tokens, int n_tokens, int max_period,
+                                     int *out_period);
+
 /*
  * Transcribe a single audio segment. Returns malloc'd text or NULL.
  * The tokenizer is passed in so we only load it once.
+ * If out_repeat_break is non-NULL, *out_repeat_break is set to 1 when
+ * the decode was terminated early due to repetition detection.
+ * out_entropy receives the token entropy of the last 32 generated tokens
+ * (whisper.cpp-style quality metric; < 2.4 indicates degenerate repetition).
+ * temperature: 0 = greedy argmax, > 0 = top-k/top-p sampling.
  */
 static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
                                 int n_samples, qwen_tokenizer_t *tokenizer,
                                 const int *past_tokens, int n_past_tokens,
-                                int *out_text_tokens) {
+                                int *out_text_tokens, int *out_repeat_break,
+                                float temperature, float *out_entropy) {
+    if (out_repeat_break) *out_repeat_break = 0;
+    if (out_entropy) *out_entropy = 99.0f; /* default: good */
     const qwen_config_t *cfg = &ctx->config;
     int dim = cfg->dec_hidden;
     double seg_t0 = get_time_ms();
@@ -980,6 +1012,12 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
     int prefill_len = total_seq - 1; /* prefill all but last */
     qwen_decoder_prefill(ctx, input_embeds, prefill_len);
 
+    /* Set temperature for sampling (0 = greedy) */
+    float saved_temperature = ctx->decode_temperature;
+    ctx->decode_temperature = temperature;
+    if (temperature > 0.01f && ctx->sample_rng_state == 0)
+        ctx->sample_rng_state = 42u; /* seed RNG if not set */
+
     /* First token from last prefill position */
     float *last_embed = input_embeds + (size_t)prefill_len * dim;
     int token = qwen_decoder_forward(ctx, last_embed);
@@ -991,17 +1029,39 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
 
     /* ---- Autoregressive decode ---- */
     t0 = get_time_ms();
-    int max_tokens = 2048;
+    /* Dynamic max tokens: at most ~15 tokens/sec of audio (very generous
+     * ceiling for fast speech + timestamps), hard floor of 256, hard cap 2048.
+     * This prevents runaway hallucination on segments where the model fails
+     * to hit EOS.  Normal 30s segment ≈ 150-300 tokens; 15 tok/s × 30s = 450. */
+    float seg_sec = (float)n_samples / (float)QWEN_SAMPLE_RATE;
+    int max_tokens = (int)(seg_sec * 15.0f);
+    if (max_tokens < 256) max_tokens = 256;
+    if (max_tokens > 2048) max_tokens = 2048;
     int n_generated = 0;
     /* If language is forced, <asr_text> is already part of prompt suffix. */
     int past_asr_text = (ctx->n_force_prompt_tokens > 0 || n_past_tokens > 0) ? 1 : 0;
+
+    /* Repetition detection for batch decode (aligned with streaming path
+     * guardrails).  The streaming loop has MAX_REPEAT_TOKEN_RUN and
+     * stream_tail_repeat_blocks(); this adds equivalent protection to the
+     * batch/segment decode path which previously had none.
+     * All constants and logic are platform-independent. */
+    #define BATCH_MAX_REPEAT_RUN      12   /* same as QWEN_STREAM_MAX_REPEAT_TOKEN_RUN */
+    #define BATCH_REPEAT_MAX_PERIOD   128  /* longer than streaming (6) to catch CJK sentence loops */
+    #define BATCH_REPEAT_MIN_REPEATS  3    /* trigger after 3 identical blocks */
+    #define BATCH_REPEAT_CHECK_EVERY  4    /* check every N text tokens */
+    int gen_tok_cap = 256;
+    int n_gen_toks = 0;
+    int *gen_toks = (int *)malloc((size_t)gen_tok_cap * sizeof(int));
+    size_t *gen_text_off = (size_t *)malloc((size_t)gen_tok_cap * sizeof(size_t));
+    int repeat_break = 0;
 
     size_t text_cap = 4096;
     size_t text_len = 0;
     char *text = (char *)malloc(text_cap);
     text[0] = '\0';
 
-    while (n_generated < max_tokens) {
+    while (n_generated < max_tokens && !repeat_break) {
         if (qwen_should_cancel(ctx)) break;
         n_generated++;
 
@@ -1012,34 +1072,138 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
         if (token == QWEN_TOKEN_ASR_TEXT) {
             past_asr_text = 1;
         } else if (past_asr_text) {
-            /* Decode and emit this text token */
-            const char *piece = qwen_tokenizer_decode(tokenizer, token);
-            size_t piece_len = strlen(piece);
-            if (text_len + piece_len + 1 > text_cap) {
-                while (text_len + piece_len + 1 > text_cap) text_cap *= 2;
-                text = (char *)realloc(text, text_cap);
+            /* --- Repetition tracking --- */
+            if (gen_toks && gen_text_off) {
+                if (n_gen_toks >= gen_tok_cap) {
+                    gen_tok_cap *= 2;
+                    int *tmp_gt = (int *)realloc(gen_toks, (size_t)gen_tok_cap * sizeof(int));
+                    size_t *tmp_go = (size_t *)realloc(gen_text_off, (size_t)gen_tok_cap * sizeof(size_t));
+                    if (tmp_gt) gen_toks = tmp_gt; else { free(gen_toks); gen_toks = NULL; }
+                    if (tmp_go) gen_text_off = tmp_go; else { free(gen_text_off); gen_text_off = NULL; }
+                }
             }
-            memcpy(text + text_len, piece, piece_len);
-            text_len += piece_len;
-            text[text_len] = '\0';
-            n_text_tokens++;
+            if (gen_toks && gen_text_off) {
+                gen_text_off[n_gen_toks] = text_len;
+                gen_toks[n_gen_toks] = token;
+                n_gen_toks++;
 
-            /* Stream token via callback */
-            if (ctx->token_cb)
-                ctx->token_cb(piece, ctx->token_cb_userdata);
+                /* (a) Consecutive same-token run */
+                if (n_gen_toks >= BATCH_MAX_REPEAT_RUN) {
+                    int run = 1;
+                    for (int j = n_gen_toks - 2; j >= 0 && gen_toks[j] == token; j--) {
+                        if (++run >= BATCH_MAX_REPEAT_RUN) break;
+                    }
+                    if (run >= BATCH_MAX_REPEAT_RUN) {
+                        int keep = n_gen_toks - run + 1;
+                        text_len = gen_text_off[keep];
+                        text[text_len] = '\0';
+                        n_text_tokens = keep;
+                        repeat_break = 1;
+                        if (qwen_verbose >= 1)
+                            fprintf(stderr, "  Batch decode: repeat-token break (run=%d)\n", run);
+                    }
+                }
+
+                /* (b) Block-level repetition (catches repeated phrases/sentences) */
+                if (!repeat_break &&
+                    n_gen_toks >= BATCH_REPEAT_MIN_REPEATS * 2 &&
+                    (n_gen_toks % BATCH_REPEAT_CHECK_EVERY) == 0) {
+                    int period = 0;
+                    int reps = stream_tail_repeat_blocks(gen_toks, n_gen_toks,
+                                                         BATCH_REPEAT_MAX_PERIOD, &period);
+                    if (period > 0 && reps >= BATCH_REPEAT_MIN_REPEATS) {
+                        int keep = n_gen_toks - (reps - 1) * period;
+                        if (keep < 1) keep = 1;
+                        text_len = gen_text_off[keep];
+                        text[text_len] = '\0';
+                        n_text_tokens = keep;
+                        repeat_break = 1;
+                        if (qwen_verbose >= 1)
+                            fprintf(stderr, "  Batch decode: block-repeat break (period=%d, reps=%d)\n",
+                                    period, reps);
+                    }
+                }
+            }
+
+            if (!repeat_break) {
+                /* Decode and emit this text token */
+                const char *piece = qwen_tokenizer_decode(tokenizer, token);
+                size_t piece_len = strlen(piece);
+                if (text_len + piece_len + 1 > text_cap) {
+                    while (text_len + piece_len + 1 > text_cap) text_cap *= 2;
+                    text = (char *)realloc(text, text_cap);
+                }
+                memcpy(text + text_len, piece, piece_len);
+                text_len += piece_len;
+                text[text_len] = '\0';
+                n_text_tokens++;
+
+                /* Stream token via callback */
+                if (ctx->token_cb)
+                    ctx->token_cb(piece, ctx->token_cb_userdata);
+            }
         }
 
         /* Embed and generate next token */
-        tok_embed_bf16_to_f32(tmp_embed, ctx->decoder.tok_embeddings_bf16, token, dim);
-        token = qwen_decoder_forward(ctx, tmp_embed);
+        if (!repeat_break) {
+            tok_embed_bf16_to_f32(tmp_embed, ctx->decoder.tok_embeddings_bf16, token, dim);
+            token = qwen_decoder_forward(ctx, tmp_embed);
+        }
     }
 
     double decode_ms = get_time_ms() - t0;
-    if (qwen_verbose >= 2)
-        fprintf(stderr, "  Decode: %d tokens (%.0f ms, %.1f ms/token)\n",
-                n_generated, decode_ms,
-                n_generated > 0 ? decode_ms / n_generated : 0);
 
+    /* Restore temperature */
+    ctx->decode_temperature = saved_temperature;
+
+    if (qwen_verbose >= 2)
+        fprintf(stderr, "  Decode: %d tokens (%.0f ms, %.1f ms/token%s%s)\n",
+                n_generated, decode_ms,
+                n_generated > 0 ? decode_ms / n_generated : 0,
+                repeat_break ? ", repeat-break" : "",
+                temperature > 0.01f ? ", temp-sample" : "");
+
+    /* Compute token entropy over the last 32 tokens (whisper.cpp-style).
+     * Low entropy (< 2.4) means the model produced very few unique tokens
+     * → degenerate repetition, even if our block-pattern detector missed it. */
+    if (out_entropy && gen_toks && n_gen_toks > 0) {
+        #define ENTROPY_WINDOW 32
+        int start_idx = n_gen_toks > ENTROPY_WINDOW ? n_gen_toks - ENTROPY_WINDOW : 0;
+        int cnt = n_gen_toks - start_idx;
+
+        /* Count unique tokens in the window using a simple linear scan.
+         * Window is at most 32 elements, so O(n²) is fine. */
+        int unique_ids[ENTROPY_WINDOW];
+        int unique_counts[ENTROPY_WINDOW];
+        int n_unique = 0;
+        for (int i = start_idx; i < n_gen_toks; i++) {
+            int tid = gen_toks[i];
+            int found = 0;
+            for (int u = 0; u < n_unique; u++) {
+                if (unique_ids[u] == tid) { unique_counts[u]++; found = 1; break; }
+            }
+            if (!found && n_unique < ENTROPY_WINDOW) {
+                unique_ids[n_unique] = tid;
+                unique_counts[n_unique] = 1;
+                n_unique++;
+            }
+        }
+
+        float entropy = 0.0f;
+        for (int u = 0; u < n_unique; u++) {
+            float p = (float)unique_counts[u] / (float)cnt;
+            entropy -= p * logf(p);
+        }
+        *out_entropy = entropy;
+
+        if (qwen_verbose >= 2)
+            fprintf(stderr, "  Token entropy: %.3f (last %d tokens, %d unique)\n",
+                    entropy, cnt, n_unique);
+    }
+
+    if (repeat_break && out_repeat_break) *out_repeat_break = 1;
+    free(gen_toks);
+    free(gen_text_off);
     free(tmp_embed);
 
     /* Trim whitespace */
@@ -1058,6 +1222,36 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
     return text;
 }
 
+/* Count how many fixed-size byte windows from `seg` appear anywhere in
+ * the tail of `ref`.  Returns the fraction of matching windows (0.0-1.0).
+ * Uses a small window (SEG_OVERLAP_WIN bytes) so slight per-character
+ * variations between near-duplicate CJK paragraphs still match. */
+static float seg_byte_window_overlap(const char *ref, size_t ref_len,
+                                     const char *seg, size_t seg_len) {
+    #define SEG_OVERLAP_WIN 12   /* ~4 CJK chars or ~2 words */
+    #define SEG_OVERLAP_STEP 6   /* 50% overlap between windows */
+    if (seg_len < SEG_OVERLAP_WIN || ref_len < SEG_OVERLAP_WIN) return 0.0f;
+
+    /* Only search in the tail of ref (last 2x seg_len, capped) */
+    size_t check_len = seg_len * 2;
+    if (check_len > ref_len) check_len = ref_len;
+    const char *ref_tail = ref + ref_len - check_len;
+    size_t tail_len = check_len;
+
+    int n_windows = 0;
+    int n_matches = 0;
+    for (size_t i = 0; i + SEG_OVERLAP_WIN <= seg_len; i += SEG_OVERLAP_STEP) {
+        n_windows++;
+        for (size_t j = 0; j + SEG_OVERLAP_WIN <= tail_len; j++) {
+            if (memcmp(seg + i, ref_tail + j, SEG_OVERLAP_WIN) == 0) {
+                n_matches++;
+                break;
+            }
+        }
+    }
+    return n_windows > 0 ? (float)n_matches / (float)n_windows : 0.0f;
+}
+
 static int should_retry_unconditioned_segment(const char *full_result,
                                               const char *seg_text,
                                               int core_samples,
@@ -1074,10 +1268,28 @@ static int should_retry_unconditioned_segment(const char *full_result,
         if (n_text_tokens < min_tokens) return 1;
     }
 
-    /* Exact duplicate span already present in accumulated text: likely drift. */
     if (full_result && full_result[0] != '\0') {
         size_t seg_len = strlen(seg_text);
+        size_t res_len = strlen(full_result);
+
+        /* Exact duplicate span already present in accumulated text. */
         if (seg_len >= 48 && strstr(full_result, seg_text) != NULL) return 1;
+
+        /* Fuzzy overlap: catches near-duplicate CJK paragraphs where the
+         * model parrots conditioning text with minor token-level variations.
+         * Threshold 0.40 = 40% of 12-byte windows match the result tail.
+         * This is conservative enough to avoid false positives on genuinely
+         * similar speech (e.g. repeated instructions in the audio). */
+        if (seg_len >= 48) {
+            float overlap = seg_byte_window_overlap(full_result, res_len,
+                                                    seg_text, seg_len);
+            if (overlap >= 0.40f) {
+                if (qwen_verbose >= 1)
+                    fprintf(stderr, "Segment mode: fuzzy overlap %.0f%% with result tail, retrying\n",
+                            overlap * 100.0f);
+                return 1;
+            }
+        }
     }
 
     return 0;
@@ -1161,15 +1373,26 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
 
     /* Determine segment boundaries.
      * Clamp search window to half the segment size so split points
-     * can never overlap and produce zero-length segments. */
+     * can never overlap and produce zero-length segments.
+     * Auto-enable splitting for long audio even when segment_sec is 0:
+     * encoding a 57-minute file as one segment requires ~30 GB and OOM-kills. */
+    float effective_segment_sec = ctx->segment_sec;
+    if (effective_segment_sec <= 0 &&
+        audio_n_samples > 30 * QWEN_SAMPLE_RATE) {
+        effective_segment_sec = 30.0f;
+        if (qwen_verbose >= 1)
+            fprintf(stderr, "Auto-enabling 30s segmentation for %.0fs audio\n",
+                    (float)audio_n_samples / QWEN_SAMPLE_RATE);
+    }
     float search = ctx->search_sec;
-    if (search > ctx->segment_sec / 2.0f) search = ctx->segment_sec / 2.0f;
-    int target_samples = (int)(ctx->segment_sec * QWEN_SAMPLE_RATE);
+    if (effective_segment_sec > 0 && search > effective_segment_sec / 2.0f)
+        search = effective_segment_sec / 2.0f;
+    int target_samples = (int)(effective_segment_sec * QWEN_SAMPLE_RATE);
     int margin_samples = (int)(search * QWEN_SAMPLE_RATE);
 
-    /* No splitting if segment_sec is 0 or audio fits in one segment */
-    if (ctx->segment_sec <= 0 || audio_n_samples <= target_samples + margin_samples) {
-        char *text = transcribe_segment(ctx, audio_samples, audio_n_samples, tokenizer, NULL, 0, NULL);
+    /* No splitting if segment is 0 or audio fits in one segment */
+    if (effective_segment_sec <= 0 || audio_n_samples <= target_samples + margin_samples) {
+        char *text = transcribe_segment(ctx, audio_samples, audio_n_samples, tokenizer, NULL, 0, NULL, NULL, 0.0f, NULL);
         qwen_tokenizer_free(tokenizer);
         free(compacted_samples);
         if (!text && ctx->last_run_cancelled) return qwen_alloc_empty_text();
@@ -1194,7 +1417,12 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
     if (qwen_verbose >= 2)
         fprintf(stderr, "Splitting into %d segments\n", n_splits);
 
-    /* Transcribe each segment and concatenate */
+    /* Transcribe each segment and concatenate.
+     * Uses whisper.cpp-style temperature fallback: try greedy first,
+     * if quality is bad (low entropy / repeat break), retry at increasing
+     * temperatures which add randomness to break repetition loops.
+     * Past-text conditioning is only used at temperature < 0.5 (whisper's
+     * HISTORY_CONDITIONING_TEMP_CUTOFF). */
     size_t result_cap = 4096;
     size_t result_len = 0;
     char *result = (char *)malloc(result_cap);
@@ -1202,9 +1430,14 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
     int min_samples = QWEN_SAMPLE_RATE / 2; /* 0.5s minimum, like official */
     int do_boundary_cleanup = (ctx->past_text_conditioning != 0);
     int use_past_conditioning = ctx->past_text_conditioning;
-    int conditioning_collapses = 0;
     qwen_token_cb saved_cb = ctx->token_cb;
     void *saved_cb_userdata = ctx->token_cb_userdata;
+
+    /* Temperature schedule: greedy → 0.2 → 0.4 → 0.6 → 0.8 */
+    static const float TEMP_SCHEDULE[] = {0.0f, 0.2f, 0.4f, 0.6f, 0.8f};
+    #define N_TEMP_SCHEDULE 5
+    #define TEMP_ENTROPY_THOLD      2.4f   /* whisper default */
+    #define TEMP_CONDITIONING_CUTOFF 0.5f  /* whisper HISTORY_CONDITIONING_TEMP_CUTOFF */
 
     for (int s = 0; s < n_splits; s++) {
         if (qwen_should_cancel(ctx)) break;
@@ -1234,64 +1467,100 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
             seg_samples = min_samples;
         }
 
+        /* Tokenize past text for conditioning (reused across temperature attempts) */
         int *past_tokens = NULL;
         int n_past_tokens = 0;
         if (use_past_conditioning && result_len > 0) {
             past_tokens = qwen_tokenizer_encode(tokenizer, result, &n_past_tokens);
             if (!past_tokens) n_past_tokens = 0;
+            #define BATCH_MAX_PAST_COND_TOKENS 128
+            if (n_past_tokens > BATCH_MAX_PAST_COND_TOKENS) {
+                int skip = n_past_tokens - BATCH_MAX_PAST_COND_TOKENS;
+                memmove(past_tokens, past_tokens + skip,
+                        (size_t)BATCH_MAX_PAST_COND_TOKENS * sizeof(int));
+                n_past_tokens = BATCH_MAX_PAST_COND_TOKENS;
+            }
         }
 
-        segment_emit_state_t emit_state = {0};
-        if (do_boundary_cleanup) {
-            /* Cleanup mode buffers segment output and emits finalized text only. */
-            ctx->token_cb = NULL;
-            ctx->token_cb_userdata = NULL;
-        } else if (saved_cb) {
-            /* Fast segmented mode: emit each generated token immediately.
-             * Add one separating space before the first token of the segment
-             * only when needed and only if the first piece does not already
-             * begin with whitespace/punctuation. */
-            emit_state.downstream_cb = saved_cb;
-            emit_state.downstream_userdata = saved_cb_userdata;
-            emit_state.maybe_prepend_space =
-                (result_len > 0 && !isspace((unsigned char)result[result_len - 1]));
-            emit_state.saw_first_piece = 0;
-            ctx->token_cb = segment_emit_cb;
-            ctx->token_cb_userdata = &emit_state;
-        }
+        /* Disable token callback during temperature loop — we may retry,
+         * so only emit the final accepted text afterward. */
+        ctx->token_cb = NULL;
+        ctx->token_cb_userdata = NULL;
 
+        /* ---- Temperature fallback loop ---- */
+        char *seg_text = NULL;
         int seg_text_tokens = 0;
-        char *seg_text = transcribe_segment(ctx, seg_ptr, seg_samples, tokenizer,
-                                            past_tokens, n_past_tokens,
-                                            &seg_text_tokens);
-        if (!ctx->last_run_cancelled &&
-            do_boundary_cleanup &&
-            use_past_conditioning && n_past_tokens > 0 &&
-            should_retry_unconditioned_segment(result, seg_text,
-                                               core_end - core_start,
-                                               seg_text_tokens)) {
-            conditioning_collapses++;
-            if (qwen_verbose >= 2) {
-                fprintf(stderr,
-                        "Segment mode: retrying segment %d/%d without past-text conditioning "
-                        "(core=%.1fs, tokens=%d)\n",
-                        s + 1, n_splits,
-                        (float)(core_end - core_start) / QWEN_SAMPLE_RATE,
-                        seg_text_tokens);
+
+        for (int t_idx = 0; t_idx < N_TEMP_SCHEDULE; t_idx++) {
+            float temp = TEMP_SCHEDULE[t_idx];
+
+            /* Past-text conditioning only at low temperature (whisper-style) */
+            int *attempt_past = NULL;
+            int n_attempt_past = 0;
+            if (temp < TEMP_CONDITIONING_CUTOFF && n_past_tokens > 0) {
+                attempt_past = past_tokens;
+                n_attempt_past = n_past_tokens;
             }
-            /* Guardrail: if conditioned decode collapses or drifts,
-             * retry this segment without past-text conditioning. */
-            free(seg_text);
-            seg_text = transcribe_segment(ctx, seg_ptr, seg_samples, tokenizer, NULL, 0,
-                                          &seg_text_tokens);
-            if (conditioning_collapses >= 2) {
-                use_past_conditioning = 0;
-                if (qwen_verbose >= 2) {
-                    fprintf(stderr, "Segment mode: disabling past text conditioning after %d collapses\n",
-                            conditioning_collapses);
-                }
+
+            int seg_repeat_break = 0;
+            float seg_entropy = 99.0f;
+            char *attempt_text = transcribe_segment(ctx, seg_ptr, seg_samples, tokenizer,
+                                                    attempt_past, n_attempt_past,
+                                                    &seg_text_tokens, &seg_repeat_break,
+                                                    temp, &seg_entropy);
+            if (ctx->last_run_cancelled) {
+                free(attempt_text);
+                break;
             }
+
+            /* Quality checks (whisper.cpp-style) */
+            int quality_ok = 1;
+
+            /* (a) Explicit pattern-based repeat detection triggered */
+            if (seg_repeat_break) {
+                quality_ok = 0;
+            }
+
+            /* (b) Token entropy too low → degenerate repetition
+             *     Only check when enough tokens to be meaningful (>32). */
+            if (quality_ok && seg_text_tokens > 32 && seg_entropy < TEMP_ENTROPY_THOLD) {
+                quality_ok = 0;
+            }
+
+            /* (c) Output is a duplicate of accumulated text */
+            if (quality_ok && attempt_text && attempt_text[0] != '\0' &&
+                result_len > 0 &&
+                should_retry_unconditioned_segment(result, attempt_text,
+                                                   core_end - core_start,
+                                                   seg_text_tokens)) {
+                quality_ok = 0;
+            }
+
+            if (quality_ok) {
+                seg_text = attempt_text;
+                if (qwen_verbose >= 2 && t_idx > 0)
+                    fprintf(stderr, "  Segment %d/%d: accepted at temperature %.1f (entropy=%.2f)\n",
+                            s + 1, n_splits, temp, seg_entropy);
+                break;
+            }
+
+            /* Last temperature: accept whatever we got */
+            if (t_idx == N_TEMP_SCHEDULE - 1) {
+                seg_text = attempt_text;
+                if (qwen_verbose >= 1)
+                    fprintf(stderr, "  Segment %d/%d: all temperatures exhausted, using temp=%.1f "
+                            "(repeat=%d, entropy=%.2f)\n",
+                            s + 1, n_splits, temp, seg_repeat_break, seg_entropy);
+                break;
+            }
+
+            if (qwen_verbose >= 2)
+                fprintf(stderr, "  Segment %d/%d: temp=%.1f failed (repeat=%d, entropy=%.2f, tokens=%d), retrying\n",
+                        s + 1, n_splits, temp, seg_repeat_break, seg_entropy, seg_text_tokens);
+            free(attempt_text);
         }
+
+        /* Restore callback */
         ctx->token_cb = saved_cb;
         ctx->token_cb_userdata = saved_cb_userdata;
 
@@ -1327,12 +1596,12 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
         }
         if (need_space) {
             result[result_len++] = ' ';
-            if (do_boundary_cleanup && saved_cb) saved_cb(" ", saved_cb_userdata);
+            if (saved_cb) saved_cb(" ", saved_cb_userdata);
         }
         memcpy(result + result_len, seg_text + cut_pos, add_len);
         result_len += add_len;
         result[result_len] = '\0';
-        if (do_boundary_cleanup && saved_cb) saved_cb(seg_text + cut_pos, saved_cb_userdata);
+        if (saved_cb) saved_cb(seg_text + cut_pos, saved_cb_userdata);
         free(seg_text);
         if (ctx->last_run_cancelled) break;
     }
@@ -1378,13 +1647,19 @@ static int stream_tail_repeat_blocks(const int *tokens, int n_tokens, int max_pe
     if (max_period > 0 && period_cap > max_period) period_cap = max_period;
 
     for (int p = 1; p <= period_cap; p++) {
-        int reps = 1;
-        while ((reps + 1) * p <= n_tokens) {
-            const int *a = tokens + n_tokens - (reps + 1) * p;
-            const int *b = tokens + n_tokens - reps * p;
-            if (memcmp(a, b, (size_t)p * sizeof(int)) != 0) break;
-            reps++;
+        /* Count consecutive token-level matches from the tail backward:
+         * tokens[n-1-i] == tokens[n-1-i-p] for i = 0, 1, 2, ...
+         * This detects periodic repeats regardless of tail alignment
+         * (the original block-aligned check missed repeats whose period
+         * didn't divide evenly into the tail length). */
+        int matching = 0;
+        for (int i = 0; i < n_tokens - p; i++) {
+            if (tokens[n_tokens - 1 - i] == tokens[n_tokens - 1 - i - p])
+                matching++;
+            else
+                break;
         }
+        int reps = matching / p + 1;
         if (reps > best_reps) {
             best_reps = reps;
             best_period = p;
@@ -1792,6 +2067,11 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     if (max_new_tokens > QWEN_STREAM_MAX_NEW_TOKENS_LIMIT) {
         max_new_tokens = QWEN_STREAM_MAX_NEW_TOKENS_LIMIT;
     }
+    float base_temperature = ctx->decode_temperature;  /* user-specified, or 0 */
+    ctx->decode_temperature = base_temperature;  /* start at user setting; escalate on recovery */
+    ctx->decode_repetition_penalty = 1.1f;  /* mild always-on base; escalate on recovery */
+    ctx->rep_pen_ring_pos = 0;
+    ctx->rep_pen_ring_count = 0;
 
     const float *audio_samples = samples;
     int64_t audio_n_samples = n_samples;
@@ -1889,8 +2169,12 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     #define QWEN_STREAM_OVERLAP_MIN_TOKENS 4
     #define QWEN_STREAM_DUP_SUPPRESS_MAX_TOKENS 96
     #define QWEN_STREAM_DUP_SUPPRESS_LOOKBACK_TOKENS 256
-    #define QWEN_STREAM_DEGEN_MAX_PERIOD 6
-    #define QWEN_STREAM_DEGEN_MIN_REPEATS 4
+    #define QWEN_STREAM_RECOVERY_DUP_MIN_TOKENS 10
+    #define QWEN_STREAM_DEGEN_MAX_PERIOD 64
+    #define QWEN_STREAM_DEGEN_MIN_REPEATS 2
+    #define QWEN_STREAM_RECOVERY_COOLDOWN 3
+    #define QWEN_STREAM_RECOVERY_DUP_ROUNDS 4
+    #define QWEN_STREAM_CROSS_CHUNK_DUP_MIN 12
     #define QWEN_STREAM_STALE_CHUNKS 4
     #define QWEN_STREAM_RESET_INTERVAL_CHUNKS 45
     #define QWEN_STREAM_RESET_CARRY_TOKENS 24
@@ -1947,7 +2231,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             return NULL;
         }
         char *text = transcribe_segment(ctx, audio_samples, (int)audio_n_samples,
-                                        tokenizer, NULL, 0, NULL);
+                                        tokenizer, NULL, 0, NULL, NULL, 0.0f, NULL);
         qwen_tokenizer_free(tokenizer);
         free(compacted_samples);
         return text;
@@ -1966,8 +2250,10 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     int n_emitted_text_tokens = 0;
     int emitted_text_cap = 8192;
     int stagnant_chunks = 0;
-    int post_reset_dup_check = 0;
+    int post_reset_dup_check = 0;  /* >0 = dup-suppress for N more chunks */
     int last_periodic_reset_chunk = 0;
+    int consecutive_recovery_resets = 0;  /* temperature escalation */
+    int recovery_cooldown = 0;  /* chunks to skip before next recovery */
     /* Stability promotion: track consecutive rounds where the unfixed
      * tail tokens are identical.  When the tail hasn't changed for
      * TAIL_STABLE_PROMOTE rounds, reduce effective rollback to 0 so
@@ -2696,6 +2982,14 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
 
             chunk_tokens[n_chunk_tokens++] = token;
 
+            /* Record in repetition penalty ring buffer so the decoder
+             * can penalize this token when predicting the next one. */
+            ctx->rep_pen_ring[ctx->rep_pen_ring_pos] = token;
+            ctx->rep_pen_ring_pos = (ctx->rep_pen_ring_pos + 1)
+                                    & (QWEN_REP_PEN_RING_SIZE - 1);
+            if (ctx->rep_pen_ring_count < QWEN_REP_PEN_RING_SIZE)
+                ctx->rep_pen_ring_count++;
+
             tok_embed_bf16_to_f32(tmp_embed, ctx->decoder.tok_embeddings_bf16, token, dim);
             token = qwen_decoder_forward(ctx, tmp_embed);
         }
@@ -2854,11 +3148,27 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         int *candidate_tokens = raw_tokens + text_start;
         int did_recovery_reset = 0;
         int did_periodic_reset = 0;
+        int had_tail_repeats = 0;
         {
             int tail_period = 0;
             int tail_reps = stream_tail_repeat_blocks(candidate_tokens, candidate_len,
                                                       QWEN_STREAM_DEGEN_MAX_PERIOD,
                                                       &tail_period);
+
+            /* Always truncate repeated tail from candidate, keeping only
+             * one copy of the repeating pattern.  This prevents repeated
+             * text from being emitted even during recovery cooldown. */
+            if (tail_period > 0 && tail_reps >= 2) {
+                had_tail_repeats = 1;
+                int truncated = candidate_len - (tail_reps - 1) * tail_period;
+                if (truncated < 0) truncated = 0;
+                if (qwen_verbose >= 1)
+                    fprintf(stderr, "  Stream: truncating repeated tail "
+                            "(period=%d, reps=%d): %d -> %d tokens\n",
+                            tail_period, tail_reps, candidate_len, truncated);
+                candidate_len = truncated;
+            }
+
             int candidate_advance = candidate_len - n_stable_text_tokens;
             if (!is_final && n_generated >= max_new_tokens && candidate_advance <= 1) {
                 stagnant_chunks++;
@@ -2866,14 +3176,18 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 stagnant_chunks = 0;
             }
             int recovery_reset = 0;
-            if (tail_period > 0 && tail_reps >= QWEN_STREAM_DEGEN_MIN_REPEATS) {
-                recovery_reset = 1;
-            }
-            if (stagnant_chunks >= QWEN_STREAM_STALE_CHUNKS) {
-                recovery_reset = 1;
-            }
-            if (dropped_repeat_tokens >= 8) {
-                recovery_reset = 1;
+            if (recovery_cooldown > 0) {
+                recovery_cooldown--;
+            } else {
+                if (tail_period > 0 && tail_reps >= QWEN_STREAM_DEGEN_MIN_REPEATS) {
+                    recovery_reset = 1;
+                }
+                if (stagnant_chunks >= QWEN_STREAM_STALE_CHUNKS) {
+                    recovery_reset = 1;
+                }
+                if (dropped_repeat_tokens >= 8) {
+                    recovery_reset = 1;
+                }
             }
 
             if (recovery_reset) {
@@ -2902,8 +3216,9 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 stagnant_chunks = 0;
                 tail_stable_rounds = 0;
                 prev_tail_len = 0;
-                post_reset_dup_check = 1;
+                post_reset_dup_check = QWEN_STREAM_RECOVERY_DUP_ROUNDS;
                 last_periodic_reset_chunk = chunk_idx;
+                recovery_cooldown = QWEN_STREAM_RECOVERY_COOLDOWN;
                 did_recovery_reset = 1;
                 if (qwen_monitor) {
                     fprintf(stderr, "!");
@@ -2952,17 +3267,55 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                             break;
                         }
                     }
-                    if (revised_committed_prefix || post_reset_dup_check) {
+                    if (revised_committed_prefix || post_reset_dup_check > 0) {
+                        int dup_min = (post_reset_dup_check > 0)
+                            ? QWEN_STREAM_RECOVERY_DUP_MIN_TOKENS
+                            : QWEN_STREAM_OVERLAP_MIN_TOKENS;
                         emit_start = qwen_stream_skip_recent_duplicate_prefix(
                             emitted_text_tokens,
                             n_emitted_text_tokens,
                             candidate_tokens,
                             emit_start,
                             candidate_len,
-                            QWEN_STREAM_OVERLAP_MIN_TOKENS,
+                            dup_min,
                             QWEN_STREAM_DUP_SUPPRESS_MAX_TOKENS,
                             QWEN_STREAM_DUP_SUPPRESS_LOOKBACK_TOKENS);
-                        post_reset_dup_check = 0;
+                        if (post_reset_dup_check > 0)
+                            post_reset_dup_check--;
+                    }
+
+                    /* Always-on cross-chunk duplicate suppression: prevent
+                     * emitting token spans that already appear in recent
+                     * emitted history, even outside recovery mode.  Uses a
+                     * higher min_match (12 tokens) to avoid false positives
+                     * on naturally repeated short phrases. */
+                    if (emit_start < candidate_len &&
+                        n_emitted_text_tokens >= QWEN_STREAM_CROSS_CHUNK_DUP_MIN) {
+                        int pre_dup = emit_start;
+                        emit_start = qwen_stream_skip_recent_duplicate_prefix(
+                            emitted_text_tokens,
+                            n_emitted_text_tokens,
+                            candidate_tokens,
+                            emit_start,
+                            candidate_len,
+                            QWEN_STREAM_CROSS_CHUNK_DUP_MIN,
+                            QWEN_STREAM_DUP_SUPPRESS_MAX_TOKENS,
+                            QWEN_STREAM_DUP_SUPPRESS_LOOKBACK_TOKENS);
+                        if (emit_start > pre_dup) {
+                            /* Tokens were suppressed as cross-chunk dups;
+                             * apply temperature to help break the loop. */
+                            float dup_temp = base_temperature > 0.6f
+                                           ? base_temperature : 0.6f;
+                            if (ctx->decode_temperature < dup_temp)
+                                ctx->decode_temperature = dup_temp;
+                            if (qwen_verbose >= 2) {
+                                fprintf(stderr,
+                                    "stream: cross-chunk dup suppressed %d tokens, "
+                                    "temp -> %.2f\n",
+                                    emit_start - pre_dup,
+                                    ctx->decode_temperature);
+                            }
+                        }
                     }
                 }
 
@@ -3000,7 +3353,8 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 }
 
                 int periodic_reset =
-                    (!is_final &&
+                    (!did_recovery_reset &&
+                     !is_final &&
                      ctx->past_text_conditioning &&
                      chunk_idx >= unfixed_chunks &&
                      (chunk_idx - last_periodic_reset_chunk >= QWEN_STREAM_RESET_INTERVAL_CHUNKS));
@@ -3041,6 +3395,49 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             }
             fprintf(stderr, "  Commit: candidate=%d tokens, emitted_total=%d\n",
                     candidate_len, n_stable_text_tokens);
+        }
+
+        /* Temperature escalation: if recovery resets keep firing, raise
+         * decode temperature to introduce diversity and break out of the
+         * degenerate loop.  Cool down gradually when chunks succeed.
+         * Also enables repetition penalty (CTRL-paper style) alongside
+         * temperature to directly suppress degenerate token cycles. */
+        if (did_recovery_reset || (had_tail_repeats && recovery_cooldown > 0)) {
+            /* Count as escalation both when recovery fires and when tail
+             * repeats are detected during cooldown (recovery suppressed). */
+            consecutive_recovery_resets++;
+            /* Cap to prevent runaway counter.  At the max schedule entry
+             * the model is already sampling aggressively; incrementing
+             * further provides no benefit and prevents cool-down. */
+            static const float stream_temp_schedule[] = {0.2f, 0.4f, 0.6f, 0.8f};
+            static const int schedule_len = (int)(sizeof(stream_temp_schedule)/sizeof(stream_temp_schedule[0]));
+            if (consecutive_recovery_resets > schedule_len)
+                consecutive_recovery_resets = schedule_len;
+            int idx = consecutive_recovery_resets - 1;
+            if (idx < 0) idx = 0;
+            if (idx >= schedule_len) idx = schedule_len - 1;
+            float sched_temp = stream_temp_schedule[idx];
+            if (sched_temp < base_temperature) sched_temp = base_temperature;
+            ctx->decode_temperature = sched_temp;
+            /* Escalate repetition penalty at level 2+.  With frequency-
+             * scaled application in the decoder, 1.3 base translates to
+             * 1.3^N effective penalty for tokens appearing N times in the
+             * ring buffer (capped at N=10 → 13.8x). */
+            if (consecutive_recovery_resets >= 2)
+                ctx->decode_repetition_penalty = 1.3f;
+            if (qwen_verbose >= 1)
+                fprintf(stderr, "  Stream: temperature escalation -> %.1f "
+                        "(consecutive_resets=%d, rep_pen=%.1f)\n",
+                        ctx->decode_temperature, consecutive_recovery_resets,
+                        ctx->decode_repetition_penalty);
+        } else if (!did_periodic_reset && recovery_cooldown <= 0 &&
+                   consecutive_recovery_resets > 0 && !had_tail_repeats) {
+            /* Truly clean chunk: no tail repeats, no recovery, no cooldown. */
+            consecutive_recovery_resets--;
+            if (consecutive_recovery_resets == 0) {
+                ctx->decode_temperature = base_temperature;
+                ctx->decode_repetition_penalty = 1.1f;  /* back to base */
+            }
         }
 
         /* Update decoded cursor so the caller can compute true decode lag. */

@@ -293,6 +293,23 @@ typedef struct {
     double perf_encode_ms;         /* mel + encoder time in milliseconds */
     double perf_decode_ms;         /* decoder prefill + decode time in milliseconds */
 
+    /* Temperature sampling for decoder (used by batch fallback).
+     * When decode_temperature > 0, decoder_forward uses top-k sampling
+     * instead of greedy argmax to break repetition loops. */
+    float decode_temperature;      /* 0 = greedy (default) */
+    float *dec_logits_buf;         /* lazily allocated [vocab_size] */
+    unsigned int sample_rng_state; /* LCG state for sampling */
+
+    /* Repetition penalty for decoder.  Standard CTRL-paper approach:
+     * logit > 0 → logit /= penalty;  logit < 0 → logit *= penalty.
+     * Applied to tokens recently generated (stored in ring buffer).
+     * Value of 1.0 = disabled (default), >1.0 = penalize repeats. */
+    float decode_repetition_penalty; /* 1.0 = none (default) */
+    #define QWEN_REP_PEN_RING_SIZE 256
+    int rep_pen_ring[QWEN_REP_PEN_RING_SIZE]; /* ring buffer of recent token IDs */
+    int rep_pen_ring_pos;            /* next write position in ring */
+    int rep_pen_ring_count;          /* valid entries (up to RING_SIZE) */
+
     /* INT8 decoder acceleration (optional, via oneDNN) */
     int decoder_int8;              /* 0=disabled (default), 1=enabled */
     void *int8_dec_layers;         /* qwen_int8_dec_layer_t[] or NULL */

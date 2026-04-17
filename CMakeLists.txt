@@ -20,6 +20,7 @@ add_library(qasr_core STATIC
     src/core/audio_types.cc
     src/core/timestamp.cc
     src/core/state_machine.cc
+    src/core/inference_arena.cc
     src/storage/safetensors_loader.cc
     src/model/tokenizer.cc
     src/audio/frontend.cc
@@ -32,6 +33,7 @@ add_library(qasr_core STATIC
     src/runtime/task.cc
     src/runtime/engine.cc
     src/runtime/model_bridge.cc
+    src/runtime/cpu_backend.cc
     src/runtime/session_manager.cc
     src/runtime/task_queue.cc
     src/runtime/realtime_session.cc
@@ -239,6 +241,8 @@ if(QASR_ENABLE_TESTS)
         tests/http_server_test.cc
         tests/realfile_audio_test.cc
         tests/silence_gap_test.cc
+        tests/inference_arena_test.cc
+        tests/inference_backend_test.cc
     )
 
     if(QASR_ENABLE_CPU_BACKEND)

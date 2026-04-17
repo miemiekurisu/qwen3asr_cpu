@@ -52,10 +52,15 @@ private:
 /// Thread-safe: NOT thread-safe; owned per session.
 class EncoderCache {
 public:
+    /// @param max_entries  Maximum number of cached windows (0 = unlimited).
+    explicit EncoderCache(std::size_t max_entries = 0) noexcept
+        : max_entries_(max_entries) {}
+
     void Store(std::int32_t window_index, std::vector<float> data, std::int32_t seq_len);
     bool Has(std::int32_t window_index) const;
     void Evict(std::int32_t older_than);
     std::size_t size() const noexcept { return entries_.size(); }
+    std::size_t max_entries() const noexcept { return max_entries_; }
 
 private:
     struct Entry {
@@ -64,6 +69,7 @@ private:
         std::int32_t seq_len;
     };
     std::vector<Entry> entries_;
+    std::size_t max_entries_ = 0;
 };
 
 /// Run a single-round partial decode, producing candidate text.
