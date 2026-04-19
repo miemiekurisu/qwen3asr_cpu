@@ -165,6 +165,16 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
     dec->norm = load_f32(ms, "thinker.model.norm.weight");
     if (!dec->norm) return -1;
 
+    /* Separate lm_head (ForcedAligner: tie_word_embeddings=false) */
+    dec->lm_head_bf16 = NULL;
+    if (!cfg->tie_word_embeddings) {
+        dec->lm_head_bf16 = load_bf16_direct(ms, "thinker.lm_head.weight");
+        if (!dec->lm_head_bf16) {
+            fprintf(stderr, "decoder: failed to load thinker.lm_head.weight\n");
+            return -1;
+        }
+    }
+
     return 0;
 }
 

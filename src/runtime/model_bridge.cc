@@ -371,4 +371,210 @@ AsrRunResult RunAsr(const AsrRunOptions & options) {
 #endif
 }
 
+AsrRunResult RunAsrSegmented(const AsrRunOptions & options) {
+    AsrRunResult result;
+    result.status = ValidateAsrRunOptions(options);
+    if (!result.status.ok()) {
+        return result;
+    }
+
+#ifndef QASR_CPU_BACKEND_ENABLED
+    result.status = Status(StatusCode::kUnimplemented, "cpu backend is unavailable on this platform");
+    return result;
+#else
+    qwen_verbose = options.verbosity;
+    qwen_monitor = 0;
+
+    const int n_threads = options.threads > 0 ? options.threads : qwen_get_num_cpus();
+    qwen_set_threads(n_threads);
+
+    qwen_ctx_t * ctx = qwen_load(options.model_dir.c_str());
+    if (ctx == nullptr) {
+        result.status = Status(StatusCode::kInternal, "qwen_load failed");
+        return result;
+    }
+
+    if (options.decoder_int8) {
+        if (qwen_set_decoder_int8(ctx, 1) != 0) {
+            std::fprintf(stderr, "warning: decoder INT8 init failed, falling back to BF16\n");
+        }
+    }
+    if (options.encoder_int8) {
+        if (qwen_set_encoder_int8(ctx, 1) != 0) {
+            std::fprintf(stderr, "warning: encoder INT8 init failed, falling back to F32\n");
+        }
+    }
+
+    ctx->stream_max_new_tokens = static_cast<int>(options.stream_max_new_tokens);
+    if (options.temperature >= 0.0f) {
+        ctx->decode_temperature = options.temperature;
+    }
+    if (!options.prompt.empty() && qwen_set_prompt(ctx, options.prompt.c_str()) != 0) {
+        qwen_free(ctx);
+        result.status = Status(StatusCode::kInvalidArgument, "failed to set prompt");
+        return result;
+    }
+    if (!options.language.empty() && qwen_set_force_language(ctx, options.language.c_str()) != 0) {
+        qwen_free(ctx);
+        result.status = Status(StatusCode::kInvalidArgument, "unsupported language: " + options.language);
+        return result;
+    }
+
+    /* Load audio */
+    int n_samples = 0;
+    float * samples = qwen_load_wav(options.audio_path.c_str(), &n_samples);
+    if (samples == nullptr) {
+        qwen_free(ctx);
+        result.status = Status(StatusCode::kInternal, "failed to load audio input");
+        return result;
+    }
+
+    qwen_segment_result_t * seg_result = qwen_transcribe_audio_segmented(ctx, samples, n_samples);
+    std::free(samples);
+
+    if (seg_result == nullptr) {
+        qwen_free(ctx);
+        result.status = Status(StatusCode::kInternal, "segmented transcription failed");
+        return result;
+    }
+
+    /* Convert C segments → C++ TimedSegment */
+    std::string full_text;
+    for (int i = 0; i < seg_result->n_segments; ++i) {
+        const qwen_timed_segment_t & seg = seg_result->segments[i];
+        TimedSegment ts;
+        ts.text = seg.text ? seg.text : "";
+        ts.range.begin_ms = static_cast<std::int64_t>(seg.start_sec * 1000.0f);
+        ts.range.end_ms = static_cast<std::int64_t>(seg.end_sec * 1000.0f);
+        result.segments.push_back(std::move(ts));
+        if (!full_text.empty()) full_text += ' ';
+        full_text += result.segments.back().text;
+    }
+    result.text = std::move(full_text);
+
+    result.total_ms = ctx->perf_total_ms;
+    result.text_tokens = ctx->perf_text_tokens;
+    result.audio_ms = ctx->perf_audio_ms;
+    result.encode_ms = ctx->perf_encode_ms;
+    result.decode_ms = ctx->perf_decode_ms;
+
+    qwen_segment_result_free(seg_result);
+    qwen_free(ctx);
+    result.status = OkStatus();
+    return result;
+#endif
+}
+
+/* ── Streaming (incremental) segmented transcription ────────────────── */
+
+namespace {
+
+struct SegmentCbCtx {
+    SegmentCallback * callback;
+    AsrRunResult * result;
+};
+
+void segment_cb_trampoline(int index, const char * text,
+                           float start_sec, float end_sec, void * userdata) {
+    auto * ctx = static_cast<SegmentCbCtx *>(userdata);
+    TimedSegment ts;
+    ts.text = text ? text : "";
+    ts.range.begin_ms = static_cast<std::int64_t>(start_sec * 1000.0f);
+    ts.range.end_ms = static_cast<std::int64_t>(end_sec * 1000.0f);
+    ctx->result->segments.push_back(ts);
+    if (ctx->callback && *ctx->callback) {
+        (*ctx->callback)(index, ts);
+    }
+}
+
+}  // namespace
+
+AsrRunResult RunAsrSegmentedStreaming(const AsrRunOptions & options,
+                                     SegmentCallback on_segment) {
+    AsrRunResult result;
+    result.status = ValidateAsrRunOptions(options);
+    if (!result.status.ok()) return result;
+
+#ifndef QASR_CPU_BACKEND_ENABLED
+    result.status = Status(StatusCode::kUnimplemented, "cpu backend is unavailable on this platform");
+    return result;
+#else
+    qwen_verbose = options.verbosity;
+    qwen_monitor = 0;
+
+    const int n_threads = options.threads > 0 ? options.threads : qwen_get_num_cpus();
+    qwen_set_threads(n_threads);
+
+    qwen_ctx_t * ctx = qwen_load(options.model_dir.c_str());
+    if (!ctx) {
+        result.status = Status(StatusCode::kInternal, "qwen_load failed");
+        return result;
+    }
+
+    if (options.decoder_int8) {
+        if (qwen_set_decoder_int8(ctx, 1) != 0)
+            std::fprintf(stderr, "warning: decoder INT8 init failed, falling back to BF16\n");
+    }
+    if (options.encoder_int8) {
+        if (qwen_set_encoder_int8(ctx, 1) != 0)
+            std::fprintf(stderr, "warning: encoder INT8 init failed, falling back to F32\n");
+    }
+
+    ctx->stream_max_new_tokens = static_cast<int>(options.stream_max_new_tokens);
+    if (options.temperature >= 0.0f) ctx->decode_temperature = options.temperature;
+    if (!options.prompt.empty() && qwen_set_prompt(ctx, options.prompt.c_str()) != 0) {
+        qwen_free(ctx);
+        result.status = Status(StatusCode::kInvalidArgument, "failed to set prompt");
+        return result;
+    }
+    if (!options.language.empty() && qwen_set_force_language(ctx, options.language.c_str()) != 0) {
+        qwen_free(ctx);
+        result.status = Status(StatusCode::kInvalidArgument, "unsupported language: " + options.language);
+        return result;
+    }
+
+    /* Install per-segment callback */
+    SegmentCbCtx cb_ctx{&on_segment, &result};
+    qwen_set_segment_callback(ctx, segment_cb_trampoline, &cb_ctx);
+
+    /* Load audio */
+    int n_samples = 0;
+    float * samples = qwen_load_wav(options.audio_path.c_str(), &n_samples);
+    if (!samples) {
+        qwen_free(ctx);
+        result.status = Status(StatusCode::kInternal, "failed to load audio input");
+        return result;
+    }
+
+    qwen_segment_result_t * seg_result = qwen_transcribe_audio_segmented(ctx, samples, n_samples);
+    std::free(samples);
+
+    if (!seg_result) {
+        qwen_free(ctx);
+        result.status = Status(StatusCode::kInternal, "segmented transcription failed");
+        return result;
+    }
+
+    /* Build full text from already-populated result.segments */
+    std::string full_text;
+    for (const auto & seg : result.segments) {
+        if (!full_text.empty()) full_text += ' ';
+        full_text += seg.text;
+    }
+    result.text = std::move(full_text);
+
+    result.total_ms = ctx->perf_total_ms;
+    result.text_tokens = ctx->perf_text_tokens;
+    result.audio_ms = ctx->perf_audio_ms;
+    result.encode_ms = ctx->perf_encode_ms;
+    result.decode_ms = ctx->perf_decode_ms;
+
+    qwen_set_segment_callback(ctx, nullptr, nullptr);
+    qwen_segment_result_free(seg_result);
+    qwen_free(ctx);
+    result.status = OkStatus();
+    return result;
+#endif
+}
+
 }  // namespace qasr

@@ -70,3 +70,46 @@ QASR_TEST(BuildCliUsageMentionsRequiredFlags) {
     QASR_EXPECT(usage.find("--emit-segments") != std::string::npos);
     QASR_EXPECT(usage.find("max 128") != std::string::npos);
 }
+
+QASR_TEST(ParseCliArgumentsAcceptsAlignFlags) {
+    const fs::path dir = MakeCliFixtureDirectory();
+    const std::string model_dir = dir.string();
+    const std::string audio_path = (dir / "sample.wav").string();
+    const char * argv[] = {
+        "qasr_cli",
+        "--model-dir", model_dir.c_str(),
+        "--audio", audio_path.c_str(),
+        "--align",
+        "--aligner-model-dir", "/some/aligner/path",
+    };
+
+    qasr::CliOptions options;
+    const qasr::Status status = qasr::ParseCliArguments(
+        static_cast<int>(sizeof(argv) / sizeof(argv[0])), argv, &options);
+    QASR_EXPECT(status.ok());
+    QASR_EXPECT(options.align);
+    QASR_EXPECT_EQ(options.aligner_model_dir, std::string("/some/aligner/path"));
+}
+
+QASR_TEST(ParseCliArgumentsAlignRequiresModelDir) {
+    const fs::path dir = MakeCliFixtureDirectory();
+    const std::string model_dir = dir.string();
+    const std::string audio_path = (dir / "sample.wav").string();
+    const char * argv[] = {
+        "qasr_cli",
+        "--model-dir", model_dir.c_str(),
+        "--audio", audio_path.c_str(),
+        "--align",
+    };
+
+    qasr::CliOptions options;
+    const qasr::Status status = qasr::ParseCliArguments(
+        static_cast<int>(sizeof(argv) / sizeof(argv[0])), argv, &options);
+    QASR_EXPECT_EQ(status.code(), qasr::StatusCode::kInvalidArgument);
+}
+
+QASR_TEST(BuildCliUsageMentionsAlignFlags) {
+    const std::string usage = qasr::BuildCliUsage("qasr_cli");
+    QASR_EXPECT(usage.find("--align") != std::string::npos);
+    QASR_EXPECT(usage.find("--aligner-model-dir") != std::string::npos);
+}
