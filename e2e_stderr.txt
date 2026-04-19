@@ -1,0 +1,17 @@
+NOT_FOUND: audio_path does not exist: e:\Downloads\output.mp3
+build\windows-openblas\qasr_cli.exe --model-dir <dir> --audio <wav> [options]
+  --threads <n>
+  --stream
+  --stream-max-new-tokens <n>  (default 32, max 128)
+  --emit-segments
+  --segment-max-codepoints <n>
+  --prompt <text>
+  --language <lang>
+  --temperature <float>  (default: auto, 0=greedy, >0=sampling)
+  --verbosity <n>
+  --emit-tokens
+  --decoder-int8
+  --encoder-int8
+  --output-format <fmt>  (text|srt|vtt|json, default: text)
+  --output <path>        (output file, default: stdout)
+  -h, --help

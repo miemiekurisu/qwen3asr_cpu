@@ -47,6 +47,7 @@
 #define QWEN_TOKEN_AUDIO_END    151670
 #define QWEN_TOKEN_AUDIO_PAD    151676
 #define QWEN_TOKEN_ASR_TEXT     151704
+#define QWEN_TOKEN_TIMESTAMP    151705
 
 /* Conv2D stem constants */
 #define QWEN_CONV_HIDDEN      480
@@ -76,9 +77,15 @@ typedef struct {
     int dec_kv_heads;          /* 8 */
     int dec_head_dim;          /* 128 */
     int dec_intermediate;      /* 6144 or 3072 */
-    int vocab_size;            /* 151936 */
+    int vocab_size;            /* 151936 (ASR) or 152064 (Aligner) */
     float dec_rms_norm_eps;    /* 1e-6 */
     float dec_rope_theta;      /* 1e6 */
+
+    /* ForcedAligner-specific (zero for ASR models) */
+    int classify_num;          /* 5000 (Aligner) or 0 (ASR) */
+    int timestamp_token_id;    /* 151705 (Aligner) or 0 (ASR) */
+    float timestamp_segment_time; /* 80.0 ms (Aligner) or 0 (ASR) */
+    int tie_word_embeddings;   /* 1 (ASR) or 0 (Aligner) */
 } qwen_config_t;
 
 /* ========================================================================
@@ -178,8 +185,11 @@ typedef struct {
 } qwen_dec_layer_t;
 
 typedef struct {
-    /* Token embeddings (tied with lm_head) */
+    /* Token embeddings (tied with lm_head for ASR) */
     uint16_t *tok_embeddings_bf16; /* [vocab_size, hidden] */
+
+    /* Separate lm_head (Aligner only; NULL when tied) */
+    uint16_t *lm_head_bf16;    /* [classify_num, hidden] or NULL */
 
     /* Transformer layers */
     qwen_dec_layer_t layers[QWEN_MAX_DEC_LAYERS];
@@ -199,6 +209,12 @@ typedef void (*qwen_token_cb)(const char *piece, void *userdata);
 /* Called to decide whether the current transcription should stop early.
  * Return non-zero to cancel the active run. */
 typedef int (*qwen_cancel_cb)(void *userdata);
+
+/* Called after each segment is transcribed in segmented mode.
+ * Receives the segment index (0-based), text, start/end in seconds. */
+typedef void (*qwen_segment_cb)(int index, const char *text,
+                                float start_sec, float end_sec,
+                                void *userdata);
 
 /* ========================================================================
  * Main Context
@@ -263,6 +279,10 @@ typedef struct {
     qwen_cancel_cb cancel_cb;
     void *cancel_cb_userdata;
     int last_run_cancelled;
+
+    /* Per-segment callback (optional, for incremental subtitle output) */
+    qwen_segment_cb segment_cb;
+    void *segment_cb_userdata;
 
     /* Segmentation settings */
     float segment_sec;             /* 0 = no splitting, default full-audio decode */
@@ -383,6 +403,10 @@ void qwen_set_token_callback(qwen_ctx_t *ctx, qwen_token_cb cb, void *userdata);
  * Set cb=NULL to disable. */
 void qwen_set_cancel_callback(qwen_ctx_t *ctx, qwen_cancel_cb cb, void *userdata);
 
+/* Set a callback invoked after each segment finishes in segmented transcription.
+ * Set cb=NULL to disable. */
+void qwen_set_segment_callback(qwen_ctx_t *ctx, qwen_segment_cb cb, void *userdata);
+
 /* Returns non-zero if the most recent transcription exited due to cancellation. */
 int qwen_was_cancelled(const qwen_ctx_t *ctx);
 
@@ -396,6 +420,35 @@ int qwen_set_force_language(qwen_ctx_t *ctx, const char *language);
 
 /* Comma-separated supported language names for --language. */
 const char *qwen_supported_languages_csv(void);
+
+/* ========================================================================
+ * Segmented Transcription (with per-segment timestamps)
+ * ======================================================================== */
+
+/* A single timed segment returned by segmented transcription. */
+typedef struct {
+    char  *text;        /* malloc'd UTF-8 text for this segment (caller frees) */
+    float  start_sec;   /* segment start in seconds from audio begin */
+    float  end_sec;     /* segment end in seconds from audio begin */
+} qwen_timed_segment_t;
+
+/* Result of segmented transcription: array of timed segments.
+ * Caller must free via qwen_segment_result_free(). */
+typedef struct {
+    qwen_timed_segment_t *segments;   /* array, length = n_segments */
+    int                    n_segments;
+} qwen_segment_result_t;
+
+/* Transcribe raw audio and return per-segment timestamps.
+ * Pre: ctx must be a loaded context, samples mono float32 16kHz.
+ * Post: caller owns result, must free via qwen_segment_result_free().
+ * Returns NULL on fatal error. */
+qwen_segment_result_t *qwen_transcribe_audio_segmented(qwen_ctx_t *ctx,
+                                                        const float *samples,
+                                                        int n_samples);
+
+/* Free a segment result and all its text strings. */
+void qwen_segment_result_free(qwen_segment_result_t *result);
 
 /* Transcribe a WAV file, returns allocated string (caller must free) */
 char *qwen_transcribe(qwen_ctx_t *ctx, const char *wav_path);
@@ -439,5 +492,38 @@ extern int qwen_verbose;
 /* Monitor mode: show inline Unicode symbols on stderr for streaming diagnostics.
  * Symbols: ▶ encoder  · prefill  ▪ decode  ▸ slow decode  ⟳ window eviction */
 extern int qwen_monitor;
+
+/* ========================================================================
+ * Forced Alignment (NAR classifier mode)
+ * ======================================================================== */
+
+/* Result of forced alignment for a single word/character. */
+typedef struct {
+    char *text;       /* malloc'd UTF-8 word text (caller frees) */
+    float start_sec;  /* word start time in seconds */
+    float end_sec;    /* word end time in seconds */
+} qwen_aligned_word_t;
+
+/* Result of forced alignment for an audio+text pair.
+ * Caller must free via qwen_align_result_free(). */
+typedef struct {
+    qwen_aligned_word_t *words;  /* array, length = n_words */
+    int n_words;
+} qwen_align_result_t;
+
+/* Run forced alignment: given audio samples and transcript text, produce
+ * word-level timestamps using a loaded ForcedAligner model.
+ * Pre: ctx loaded from a ForcedAligner model dir (classify_num > 0).
+ *      samples: mono float32 16kHz. text: UTF-8 transcript.
+ *      language: "chinese", "english", etc.
+ * Post: caller owns result, must free via qwen_align_result_free().
+ * Returns NULL on error. */
+qwen_align_result_t *qwen_forced_align(qwen_ctx_t *ctx,
+                                       const float *samples, int n_samples,
+                                       const char *text,
+                                       const char *language);
+
+/* Free an alignment result and all its text strings. */
+void qwen_align_result_free(qwen_align_result_t *result);
 
 #endif /* QWEN_ASR_H */

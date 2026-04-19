@@ -10,6 +10,79 @@
 
 A high-performance C/C++ inference server for **Qwen3-ASR**, optimized for CPU-only real-time streaming speech recognition. Supports both **0.6B** and **1.7B** models. Features an OpenAI-compatible REST API, WebSocket streaming, and a built-in web UI — no GPU required.
 
+### Usage
+
+> **Windows note:** The executables depend on OpenBLAS at runtime. Either add the OpenBLAS `bin/` directory to your `PATH`, or copy `libopenblas.dll` into the same folder as the executables.
+>
+> ```powershell
+> # Option A: add to PATH (current session)
+> $env:PATH = "C:\path\to\OpenBLAS\bin;$env:PATH"
+>
+> # Option B: copy DLL next to the binary
+> copy C:\path\to\OpenBLAS\bin\libopenblas.dll <qasr_cli.exe dir>
+> ```
+
+#### CLI — Batch Transcription
+
+`--audio` accepts any format (WAV, MP3, M4A, FLAC, …). Non-WAV files are automatically converted via ffmpeg.
+
+```bash
+# Transcribe an audio file to plain text
+qasr_cli --model-dir <asr-model-dir> --audio <input-audio>
+
+# Output as SRT subtitles (requires both ASR model + ForcedAligner model)
+qasr_cli --model-dir <asr-model-dir> --audio <input-audio> \
+  --output-format srt --align --aligner-model-dir <aligner-model-dir>
+
+# Write to a specific output file
+qasr_cli --model-dir <asr-model-dir> --audio <input-audio> \
+  --output-format srt --align --aligner-model-dir <aligner-model-dir> \
+  --output output.srt
+
+# Use INT8 decoder for faster decoding
+qasr_cli --model-dir <asr-model-dir> --audio <input-audio> \
+  --output-format srt --align --aligner-model-dir <aligner-model-dir> \
+  --decoder-int8 --threads 16
+```
+
+#### Server — Web UI & API
+
+```bash
+# Start the server (opens web UI at http://localhost:8080)
+qasr_server --model-dir <asr-model-dir> --port 8080 --threads 8
+
+# With INT8 acceleration
+qasr_server --model-dir <asr-model-dir> --port 8080 --decoder-int8 --threads 16
+
+# Specify the built-in web UI directory (auto-detected if ui/ exists next to the binary)
+qasr_server --model-dir <asr-model-dir> --port 8080 --ui-dir <ui-dir>
+```
+
+The web UI supports real-time microphone streaming and file upload transcription in the browser.
+
+#### Subtitle Generation with ForcedAligner
+
+For word-level subtitle timestamps, use `--align` with a ForcedAligner model alongside the ASR model.
+
+**Download both models:**
+
+| Model | Link |
+|-------|------|
+| Qwen3-ASR-0.6B (or 1.7B) | [HuggingFace](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) / [ModelScope](https://modelscope.cn/models/Qwen/Qwen3-ASR-0.6B) |
+| Qwen3-ForcedAligner-0.6B | [HuggingFace](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) / [ModelScope](https://modelscope.cn/models/Qwen/Qwen3-ForcedAligner-0.6B) |
+
+```bash
+qasr_cli \
+  --model-dir <asr-model-dir> \
+  --audio movie.mp3 \
+  --output-format srt \
+  --align \
+  --aligner-model-dir <aligner-model-dir> \
+  --output movie.srt
+```
+
+> **Tip:** Use `--output-format vtt` for WebVTT, or `--output-format json` for structured JSON with timestamps.
+
 ### Features
 
 - **Real-time Streaming ASR**: Chunk-based incremental decoding with stable/partial text output via WebSocket
@@ -121,25 +194,9 @@ docker build -t qasr .
 docker run -p 8080:8080 -v /path/to/Qwen3-ASR-0.6B:/models/qwen3-asr qasr
 ```
 
-### Quick Start
+### API Endpoints
 
-#### 1. Server Mode (Recommended)
-
-Start the server with the model directory:
-
-```bash
-./qasr_server --model-dir /path/to/Qwen3-ASR-0.6B --host 0.0.0.0 --port 8080 --threads 8
-```
-
-With INT8 decoder acceleration:
-
-```bash
-./qasr_server --model-dir /path/to/Qwen3-ASR-0.6B --decoder-int8 --threads 16
-```
-
-Then open `http://localhost:8080` in your browser for the web UI.
-
-#### 2. OpenAI-compatible Transcription API
+#### OpenAI-compatible Transcription API
 
 ```bash
 curl -X POST http://localhost:8080/v1/audio/transcriptions \
@@ -148,39 +205,13 @@ curl -X POST http://localhost:8080/v1/audio/transcriptions \
   -F response_format=json
 ```
 
-#### 3. Real-time WebSocket Streaming
+#### Real-time WebSocket Streaming
 
 Connect to `ws://localhost:8080/v1/realtime` and send base64-encoded PCM16LE audio chunks. The server returns incremental transcription events:
 
 ```json
 {"type": "response.audio_transcript.delta", "delta": "你好"}
 {"type": "response.audio_transcript.done", "transcript": "你好世界"}
-```
-
-#### 4. CLI Mode
-
-```bash
-# Basic transcription
-./qasr_cli --model-dir /path/to/Qwen3-ASR-0.6B -f audio.wav
-
-# Streaming mode with INT8
-./qasr_cli --model-dir /path/to/Qwen3-ASR-0.6B -f audio.wav --stream --decoder-int8
-
-# Verbose output with timing
-./qasr_cli --model-dir /path/to/Qwen3-ASR-0.6B -f audio.wav --verbosity 3
-```
-
-### Audio Requirements
-
-- **Format**: WAV (PCM)
-- **Sample rate**: 16 kHz
-- **Channels**: Mono
-- **Bit depth**: 16-bit
-
-Convert with ffmpeg:
-
-```bash
-ffmpeg -i input.mp3 -ar 16000 -ac 1 -c:a pcm_s16le output.wav
 ```
 
 ### Project Structure
@@ -243,6 +274,79 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 ## 中文
 
 高性能 C/C++ 实现的 **Qwen3-ASR** 推理服务器，专为纯 CPU 实时流式语音识别优化。支持 **0.6B** 和 **1.7B** 两种模型。内置 OpenAI 兼容 REST API、WebSocket 流式接口和 Web UI — 无需 GPU。
+
+### 使用方法
+
+> **Windows 提示：** 可执行文件运行时依赖 OpenBLAS。请将 OpenBLAS `bin/` 目录添加到 `PATH`，或将 `libopenblas.dll` 复制到可执行文件同目录下。
+>
+> ```powershell
+> # 方式 A：添加到 PATH（当前会话）
+> $env:PATH = "C:\path\to\OpenBLAS\bin;$env:PATH"
+>
+> # 方式 B：复制 DLL 到程序目录
+> copy C:\path\to\OpenBLAS\bin\libopenblas.dll <qasr_cli.exe 所在目录>
+> ```
+
+#### CLI — 批量转写
+
+`--audio` 接受任意格式（WAV、MP3、M4A、FLAC……），非 WAV 文件会自动通过 ffmpeg 转换。
+
+```bash
+# 转写音频为纯文本
+qasr_cli --model-dir <asr-model-dir> --audio <input-audio>
+
+# 输出 SRT 字幕（需要 ASR 模型 + ForcedAligner 模型）
+qasr_cli --model-dir <asr-model-dir> --audio <input-audio> \
+  --output-format srt --align --aligner-model-dir <aligner-model-dir>
+
+# 写入指定输出文件
+qasr_cli --model-dir <asr-model-dir> --audio <input-audio> \
+  --output-format srt --align --aligner-model-dir <aligner-model-dir> \
+  --output output.srt
+
+# 使用 INT8 解码器加速
+qasr_cli --model-dir <asr-model-dir> --audio <input-audio> \
+  --output-format srt --align --aligner-model-dir <aligner-model-dir> \
+  --decoder-int8 --threads 16
+```
+
+#### 服务器 — Web UI 与 API
+
+```bash
+# 启动服务器（Web UI 地址 http://localhost:8080）
+qasr_server --model-dir <asr-model-dir> --port 8080 --threads 8
+
+# 启用 INT8 加速
+qasr_server --model-dir <asr-model-dir> --port 8080 --decoder-int8 --threads 16
+
+# 指定内置 Web UI 目录（如果 ui/ 在程序同目录下会自动检测）
+qasr_server --model-dir <asr-model-dir> --port 8080 --ui-dir <ui-dir>
+```
+
+Web UI 支持浏览器内实时麦克风流式识别和文件上传转写。
+
+#### 使用 ForcedAligner 生成字幕
+
+如需词级字幕时间戳，请配合 ForcedAligner 模型使用 `--align` 选项。
+
+**下载两个模型：**
+
+| 模型 | 链接 |
+|------|------|
+| Qwen3-ASR-0.6B (或 1.7B) | [HuggingFace](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) / [ModelScope](https://modelscope.cn/models/Qwen/Qwen3-ASR-0.6B) |
+| Qwen3-ForcedAligner-0.6B | [HuggingFace](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) / [ModelScope](https://modelscope.cn/models/Qwen/Qwen3-ForcedAligner-0.6B) |
+
+```bash
+qasr_cli \
+  --model-dir <asr-model-dir> \
+  --audio movie.mp3 \
+  --output-format srt \
+  --align \
+  --aligner-model-dir <aligner-model-dir> \
+  --output movie.srt
+```
+
+> **提示：** 使用 `--output-format vtt` 输出 WebVTT 格式，或 `--output-format json` 输出带时间戳的结构化 JSON。
 
 ### 特性
 

@@ -53,6 +53,11 @@ void qwen_set_cancel_callback(qwen_ctx_t *ctx, qwen_cancel_cb cb, void *userdata
     ctx->cancel_cb_userdata = userdata;
 }
 
+void qwen_set_segment_callback(qwen_ctx_t *ctx, qwen_segment_cb cb, void *userdata) {
+    ctx->segment_cb = cb;
+    ctx->segment_cb_userdata = userdata;
+}
+
 int qwen_was_cancelled(const qwen_ctx_t *ctx) {
     return ctx && ctx->last_run_cancelled;
 }
@@ -180,19 +185,42 @@ extern int qwen_decoder_prepare_runtime(qwen_ctx_t *ctx);
 static int detect_config(qwen_ctx_t *ctx) {
     qwen_config_t *cfg = &ctx->config;
 
-    /* Try to detect from number of shards:
-     * 1.7B has 2 shards, 0.6B has 1 shard
-     * But we can also check a specific weight shape. */
-
-    /* Check if thinker.audio_tower.layers.17 exists (0.6B has 18 layers, 1.7B has 24) */
     multi_safetensors_t *ms = (multi_safetensors_t *)ctx->safetensors;
 
-    /* Check for layer 18 (0-indexed) in encoder - if it exists, it's 1.7B */
-    const safetensor_t *test = multi_safetensors_find(ms,
+    /* Distinguish ASR vs ForcedAligner: Both models may have lm_head tensor,
+     * but Aligner has a small lm_head [classify_num, hidden] (shape[0]=5000)
+     * whereas ASR has [vocab_size, hidden] (shape[0]=151936). */
+    const safetensor_t *lm_head_test = multi_safetensors_find(ms,
+        "thinker.lm_head.weight", NULL);
+    int is_aligner = lm_head_test && lm_head_test->ndim >= 2
+                     && lm_head_test->shape[0] < 50000; /* Aligner classify_num=5000 */
+
+    /* Check for encoder layer 18 (0-indexed): 24-layer models have it, 18-layer don't */
+    const safetensor_t *enc18_test = multi_safetensors_find(ms,
         "thinker.audio_tower.layers.18.self_attn.q_proj.weight", NULL);
 
-    if (test) {
-        /* 1.7B model */
+    if (is_aligner) {
+        /* ForcedAligner-0.6B: 24-layer encoder (same as 1.7B), smaller decoder */
+        cfg->enc_d_model = 1024;
+        cfg->enc_layers = 24;
+        cfg->enc_heads = 16;
+        cfg->enc_head_dim = 64;
+        cfg->enc_ffn_dim = 4096;
+        cfg->enc_output_dim = 1024;
+        cfg->dec_hidden = 1024;
+        cfg->dec_layers = 28;
+        cfg->dec_heads = 16;
+        cfg->dec_kv_heads = 8;
+        cfg->dec_head_dim = 128;
+        cfg->dec_intermediate = 3072;
+        cfg->classify_num = 5000;
+        cfg->timestamp_token_id = QWEN_TOKEN_TIMESTAMP;
+        cfg->timestamp_segment_time = 80.0f;
+        cfg->tie_word_embeddings = 0;
+        cfg->vocab_size = 152064;
+        if (qwen_verbose >= 1) fprintf(stderr, "Detected: Qwen3-ForcedAligner-0.6B\n");
+    } else if (enc18_test) {
+        /* ASR-1.7B */
         cfg->enc_d_model = 1024;
         cfg->enc_layers = 24;
         cfg->enc_heads = 16;
@@ -205,9 +233,14 @@ static int detect_config(qwen_ctx_t *ctx) {
         cfg->dec_kv_heads = 8;
         cfg->dec_head_dim = 128;
         cfg->dec_intermediate = 6144;
+        cfg->classify_num = 0;
+        cfg->timestamp_token_id = 0;
+        cfg->timestamp_segment_time = 0.0f;
+        cfg->tie_word_embeddings = 1;
+        cfg->vocab_size = QWEN_VOCAB_SIZE;
         if (qwen_verbose >= 1) fprintf(stderr, "Detected: Qwen3-ASR-1.7B\n");
     } else {
-        /* 0.6B model */
+        /* ASR-0.6B */
         cfg->enc_d_model = 896;
         cfg->enc_layers = 18;
         cfg->enc_heads = 14;
@@ -220,6 +253,11 @@ static int detect_config(qwen_ctx_t *ctx) {
         cfg->dec_kv_heads = 8;
         cfg->dec_head_dim = 128;
         cfg->dec_intermediate = 3072;
+        cfg->classify_num = 0;
+        cfg->timestamp_token_id = 0;
+        cfg->timestamp_segment_time = 0.0f;
+        cfg->tie_word_embeddings = 1;
+        cfg->vocab_size = QWEN_VOCAB_SIZE;
         if (qwen_verbose >= 1) fprintf(stderr, "Detected: Qwen3-ASR-0.6B\n");
     }
 
@@ -837,6 +875,77 @@ static int prepare_prompt_tokens(qwen_ctx_t *ctx, qwen_tokenizer_t *tokenizer) {
 /* ---- Segment-based transcription ---- */
 
 #define ENERGY_WINDOW_MS    100
+
+/*
+ * VAD-trim: find actual speech boundaries within a segment by scanning
+ * for the first/last window whose energy exceeds the silence threshold.
+ * Returns trimmed sample indices via out_start / out_end.
+ * If no speech is found, returns the original boundaries untouched.
+ */
+static void vad_trim_segment(const float *samples, int seg_start, int seg_end,
+                              int *out_start, int *out_end) {
+    const int win = (ENERGY_WINDOW_MS * QWEN_SAMPLE_RATE) / 1000; /* 1600 samples = 100ms */
+    const int step = win / 2;                                       /* 50ms hop */
+    const int seg_len = seg_end - seg_start;
+
+    *out_start = seg_start;
+    *out_end   = seg_end;
+    if (seg_len < win) return;
+
+    /* Pass 1: compute mean energy across all windows to derive threshold */
+    double total_energy = 0;
+    int n_windows = 0;
+    for (int p = 0; p + win <= seg_len; p += step) {
+        double e = 0;
+        for (int j = 0; j < win; j++) {
+            float s = samples[seg_start + p + j];
+            e += (double)s * s;
+        }
+        total_energy += e / win;
+        n_windows++;
+    }
+    if (n_windows == 0) return;
+    double mean_energy = total_energy / n_windows;
+    /* Silence threshold: 10% of mean energy, with a floor */
+    double thr = mean_energy * 0.10;
+    if (thr < 1e-8) thr = 1e-8;
+
+    /* Pass 2: scan forward for first window above threshold */
+    int first_speech = seg_start;
+    for (int p = 0; p + win <= seg_len; p += step) {
+        double e = 0;
+        for (int j = 0; j < win; j++) {
+            float s = samples[seg_start + p + j];
+            e += (double)s * s;
+        }
+        e /= win;
+        if (e >= thr) {
+            first_speech = seg_start + p;
+            break;
+        }
+    }
+
+    /* Pass 3: scan backward for last window above threshold */
+    int last_speech = seg_end;
+    for (int p = seg_len - win; p >= 0; p -= step) {
+        double e = 0;
+        for (int j = 0; j < win; j++) {
+            float s = samples[seg_start + p + j];
+            e += (double)s * s;
+        }
+        e /= win;
+        if (e >= thr) {
+            last_speech = seg_start + p + win;
+            break;
+        }
+    }
+
+    /* Sanity: trimmed range must be at least 0.1s */
+    if (last_speech - first_speech >= QWEN_SAMPLE_RATE / 10) {
+        *out_start = first_speech;
+        *out_end   = last_speech;
+    }
+}
 
 /*
  * Find the best split point near target_sample by looking for the
@@ -1610,6 +1719,234 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
     ctx->token_cb_userdata = saved_cb_userdata;
     qwen_tokenizer_free(tokenizer);
     free(compacted_samples);
+    return result;
+}
+
+/* ========================================================================
+ * Segmented transcription with per-segment timestamps
+ * ======================================================================== */
+
+void qwen_segment_result_free(qwen_segment_result_t *result) {
+    if (!result) return;
+    for (int i = 0; i < result->n_segments; i++) {
+        free(result->segments[i].text);
+    }
+    free(result->segments);
+    free(result);
+}
+
+qwen_segment_result_t *qwen_transcribe_audio_segmented(qwen_ctx_t *ctx,
+                                                        const float *samples,
+                                                        int n_samples) {
+    ctx->last_run_cancelled = 0;
+    ctx->perf_total_ms = 0;
+    ctx->perf_text_tokens = 0;
+    ctx->perf_audio_ms = 1000.0 * (double)n_samples / (double)QWEN_SAMPLE_RATE;
+    ctx->perf_encode_ms = 0;
+    ctx->perf_decode_ms = 0;
+    reset_runtime_perf_stats(ctx);
+
+    if (qwen_should_cancel(ctx)) return NULL;
+
+    const float *audio_samples = samples;
+    int audio_n_samples = n_samples;
+    float *compacted_samples = NULL;
+    if (ctx->skip_silence) {
+        compacted_samples = compact_silence(samples, n_samples, &audio_n_samples);
+        if (compacted_samples) audio_samples = compacted_samples;
+    }
+
+    /* Load tokenizer */
+    char vocab_path[1024];
+    snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", ctx->model_dir);
+    qwen_tokenizer_t *tokenizer = qwen_tokenizer_load(vocab_path);
+    if (!tokenizer) {
+        free(compacted_samples);
+        return NULL;
+    }
+    if (prepare_prompt_tokens(ctx, tokenizer) != 0) {
+        qwen_tokenizer_free(tokenizer);
+        free(compacted_samples);
+        return NULL;
+    }
+
+    /* Determine segment boundaries — use 10s for finer subtitle timestamps */
+    float effective_segment_sec = ctx->segment_sec;
+    if (effective_segment_sec <= 0) {
+        effective_segment_sec = 10.0f; /* finer segments for subtitle timestamps */
+    }
+    float search = ctx->search_sec;
+    if (effective_segment_sec > 0 && search > effective_segment_sec / 2.0f)
+        search = effective_segment_sec / 2.0f;
+    int target_samples = (int)(effective_segment_sec * QWEN_SAMPLE_RATE);
+    int margin_samples = (int)(search * QWEN_SAMPLE_RATE);
+
+    /* Build split points */
+    int splits[128];
+    int n_splits = 0;
+    splits[n_splits++] = 0;
+
+    if (audio_n_samples > target_samples + margin_samples) {
+        int pos = 0;
+        while (pos + target_samples + margin_samples < audio_n_samples) {
+            int split = find_split_point(audio_samples, audio_n_samples,
+                                         pos + target_samples, search);
+            splits[n_splits++] = split;
+            pos = split;
+            if (n_splits >= 127) break;
+        }
+    }
+    splits[n_splits] = audio_n_samples; /* end sentinel */
+
+    /* Allocate result */
+    qwen_segment_result_t *result = (qwen_segment_result_t *)calloc(1, sizeof(qwen_segment_result_t));
+    result->segments = (qwen_timed_segment_t *)calloc((size_t)n_splits, sizeof(qwen_timed_segment_t));
+    result->n_segments = 0;
+
+    int min_samples = QWEN_SAMPLE_RATE / 2;
+    qwen_token_cb saved_cb = ctx->token_cb;
+    void *saved_cb_userdata = ctx->token_cb_userdata;
+
+    /* Accumulated text for past-text conditioning */
+    size_t accum_cap = 4096, accum_len = 0;
+    char *accum = (char *)malloc(accum_cap);
+    accum[0] = '\0';
+    int use_past_conditioning = ctx->past_text_conditioning;
+    int do_boundary_cleanup = (ctx->past_text_conditioning != 0);
+
+    static const float TEMP_SCHEDULE[] = {0.0f, 0.2f, 0.4f, 0.6f, 0.8f};
+    #define SEG_N_TEMP 5
+    #define SEG_ENTROPY_THOLD 2.4f
+    #define SEG_COND_CUTOFF 0.5f
+
+    for (int s = 0; s < n_splits; s++) {
+        if (qwen_should_cancel(ctx)) break;
+
+        int core_start = splits[s];
+        int core_end = splits[s + 1];
+        int seg_samples = core_end - core_start;
+
+        float *seg_buf = NULL;
+        const float *seg_ptr = audio_samples + core_start;
+        if (seg_samples < min_samples) {
+            seg_buf = (float *)calloc(min_samples, sizeof(float));
+            memcpy(seg_buf, seg_ptr, (size_t)seg_samples * sizeof(float));
+            seg_ptr = seg_buf;
+            seg_samples = min_samples;
+        }
+
+        /* Past-text conditioning */
+        int *past_tokens = NULL;
+        int n_past_tokens = 0;
+        if (use_past_conditioning && accum_len > 0) {
+            past_tokens = qwen_tokenizer_encode(tokenizer, accum, &n_past_tokens);
+            if (!past_tokens) n_past_tokens = 0;
+            if (n_past_tokens > 128) {
+                int skip = n_past_tokens - 128;
+                memmove(past_tokens, past_tokens + skip, 128 * sizeof(int));
+                n_past_tokens = 128;
+            }
+        }
+
+        ctx->token_cb = NULL;
+        ctx->token_cb_userdata = NULL;
+
+        /* Temperature fallback loop */
+        char *seg_text = NULL;
+        int seg_text_tokens = 0;
+
+        for (int t_idx = 0; t_idx < SEG_N_TEMP; t_idx++) {
+            float temp = TEMP_SCHEDULE[t_idx];
+            int *attempt_past = NULL;
+            int n_attempt_past = 0;
+            if (temp < SEG_COND_CUTOFF && n_past_tokens > 0) {
+                attempt_past = past_tokens;
+                n_attempt_past = n_past_tokens;
+            }
+
+            int seg_repeat_break = 0;
+            float seg_entropy = 99.0f;
+            char *attempt_text = transcribe_segment(ctx, seg_ptr, seg_samples, tokenizer,
+                                                    attempt_past, n_attempt_past,
+                                                    &seg_text_tokens, &seg_repeat_break,
+                                                    temp, &seg_entropy);
+            if (ctx->last_run_cancelled) { free(attempt_text); break; }
+
+            int quality_ok = 1;
+            if (seg_repeat_break) quality_ok = 0;
+            if (quality_ok && seg_text_tokens > 32 && seg_entropy < SEG_ENTROPY_THOLD) quality_ok = 0;
+            if (quality_ok && attempt_text && attempt_text[0] != '\0' && accum_len > 0 &&
+                should_retry_unconditioned_segment(accum, attempt_text,
+                                                   core_end - core_start, seg_text_tokens))
+                quality_ok = 0;
+
+            if (quality_ok || t_idx == SEG_N_TEMP - 1) {
+                seg_text = attempt_text;
+                break;
+            }
+            free(attempt_text);
+        }
+
+        ctx->token_cb = saved_cb;
+        ctx->token_cb_userdata = saved_cb_userdata;
+        free(past_tokens);
+        free(seg_buf);
+
+        if (!seg_text || seg_text[0] == '\0') {
+            free(seg_text);
+            if (ctx->last_run_cancelled) break;
+            continue;
+        }
+
+        int cut_pos = 0;
+        if (do_boundary_cleanup) {
+            while (seg_text[cut_pos] != '\0' && isspace((unsigned char)seg_text[cut_pos])) cut_pos++;
+        }
+        if (seg_text[cut_pos] == '\0') { free(seg_text); continue; }
+
+        /* Store timed segment — VAD-trim timestamps to actual speech */
+        int vad_start, vad_end;
+        vad_trim_segment(audio_samples, core_start, core_end, &vad_start, &vad_end);
+
+        int idx = result->n_segments;
+        result->segments[idx].text = strdup(seg_text + cut_pos);
+        result->segments[idx].start_sec = (float)vad_start / (float)QWEN_SAMPLE_RATE;
+        result->segments[idx].end_sec   = (float)vad_end / (float)QWEN_SAMPLE_RATE;
+        result->n_segments++;
+
+        /* Invoke per-segment callback for incremental output */
+        if (ctx->segment_cb) {
+            ctx->segment_cb(idx, result->segments[idx].text,
+                            result->segments[idx].start_sec,
+                            result->segments[idx].end_sec,
+                            ctx->segment_cb_userdata);
+        }
+
+        /* Update accumulated text */
+        size_t add_len = strlen(seg_text + cut_pos);
+        size_t need = accum_len + add_len + 2;
+        if (need > accum_cap) {
+            while (need > accum_cap) accum_cap *= 2;
+            accum = (char *)realloc(accum, accum_cap);
+        }
+        if (accum_len > 0) accum[accum_len++] = ' ';
+        memcpy(accum + accum_len, seg_text + cut_pos, add_len);
+        accum_len += add_len;
+        accum[accum_len] = '\0';
+
+        free(seg_text);
+        if (ctx->last_run_cancelled) break;
+    }
+
+    #undef SEG_N_TEMP
+    #undef SEG_ENTROPY_THOLD
+    #undef SEG_COND_CUTOFF
+
+    ctx->token_cb = saved_cb;
+    ctx->token_cb_userdata = saved_cb_userdata;
+    qwen_tokenizer_free(tokenizer);
+    free(compacted_samples);
+    free(accum);
     return result;
 }
 

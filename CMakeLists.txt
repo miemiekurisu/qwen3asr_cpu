@@ -41,6 +41,10 @@ add_library(qasr_core STATIC
     src/protocol/vllm.cc
     src/base/json.cc
     src/base/http_server.cc
+    src/audio/audio_convert.cc
+    src/subtitle/subtitle_writer.cc
+    src/inference/aligner_types.cc
+    src/inference/aligner_client.cc
 )
 
 target_include_directories(qasr_core
@@ -86,6 +90,7 @@ if(QASR_ENABLE_CPU_BACKEND)
         src/backend/qwen_cpu/qwen_asr_onednn.c
         src/backend/qwen_cpu/qwen_asr_safetensors.c
         src/backend/qwen_cpu/qwen_asr_tokenizer.c
+        src/backend/qwen_cpu/qwen_asr_aligner.c
     )
 
     # NEON kernels only on ARM
@@ -172,6 +177,8 @@ target_include_directories(qasr_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 if(MSVC)
     target_compile_options(qasr_cli PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(qasr_cli PRIVATE /DELAYLOAD:libopenblas.dll)
+    target_link_libraries(qasr_cli PRIVATE delayimp)
 else()
     target_compile_options(qasr_cli PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 endif()
@@ -193,6 +200,8 @@ if(QASR_ENABLE_CPU_BACKEND OR WIN32)
 
     if(MSVC)
         target_compile_options(qasr_server PRIVATE /W4 /permissive- /utf-8)
+        target_link_options(qasr_server PRIVATE /DELAYLOAD:libopenblas.dll)
+        target_link_libraries(qasr_server PRIVATE delayimp)
     else()
         target_compile_options(qasr_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
@@ -243,6 +252,10 @@ if(QASR_ENABLE_TESTS)
         tests/silence_gap_test.cc
         tests/inference_arena_test.cc
         tests/inference_backend_test.cc
+        tests/subtitle_writer_test.cc
+        tests/audio_convert_test.cc
+        tests/aligner_types_test.cc
+        tests/aligner_client_test.cc
     )
 
     if(QASR_ENABLE_CPU_BACKEND)
