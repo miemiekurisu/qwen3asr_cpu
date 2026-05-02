@@ -8,6 +8,7 @@
  */
 
 #include "tests/test_registry.h"
+#include "tests/test_paths.h"
 
 extern "C" {
 #include "src/backend/qwen_cpu/qwen_asr_onednn.h"
@@ -64,7 +65,7 @@ void FillBf16Random(std::vector<std::uint16_t> *bf16,
 }
 
 fs::path MakeInt8FixtureDirectory() {
-    const fs::path dir = fs::temp_directory_path() / "qasr_int8_fixture";
+    const fs::path dir = qasr_test::FreshTempDir(__FILE__, "qasr_int8_fixture");
     fs::create_directories(dir / "ui");
     std::ofstream(dir / "config.json") << "{}";
     std::ofstream(dir / "vocab.json") << "{}";

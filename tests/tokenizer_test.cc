@@ -1,4 +1,5 @@
 #include "tests/test_registry.h"
+#include "tests/test_paths.h"
 #include "qasr/model/tokenizer.h"
 
 // --- Normal ---
@@ -56,36 +57,50 @@ QASR_TEST(TokenizerDecodeSingleNullOutput) {
 
 QASR_TEST(TokenizerLoadMissingVocab) {
     qasr::Tokenizer tok;
-    qasr::Status s = qasr::Tokenizer::Load("/tmp/qasr_no_vocab.json", "/tmp/qasr_no_merges.txt", &tok);
+    qasr::Status s = qasr::Tokenizer::Load(
+        qasr_test::MissingTempPath(__FILE__, "qasr_no_vocab.json").string(),
+        qasr_test::MissingTempPath(__FILE__, "qasr_no_merges.txt").string(),
+        &tok);
     QASR_EXPECT(!s.ok());
 }
 
 QASR_TEST(TokenizerLoadNullOut) {
-    qasr::Status s = qasr::Tokenizer::Load("/tmp/a.json", "/tmp/b.txt", nullptr);
+    qasr::Status s = qasr::Tokenizer::Load(
+        qasr_test::MissingTempPath(__FILE__, "a.json").string(),
+        qasr_test::MissingTempPath(__FILE__, "b.txt").string(),
+        nullptr);
     QASR_EXPECT(!s.ok());
 }
 
 // --- LoadVocabJson / LoadMergesTxt ---
 
 QASR_TEST(LoadVocabJsonNullOutput) {
-    qasr::Status s = qasr::LoadVocabJson("/tmp/fake.json", nullptr);
+    qasr::Status s = qasr::LoadVocabJson(
+        qasr_test::MissingTempPath(__FILE__, "fake.json").string(),
+        nullptr);
     QASR_EXPECT(!s.ok());
 }
 
 QASR_TEST(LoadVocabJsonMissingFile) {
     std::vector<std::string> result;
-    qasr::Status s = qasr::LoadVocabJson("/tmp/qasr_nonexistent.json", &result);
+    qasr::Status s = qasr::LoadVocabJson(
+        qasr_test::MissingTempPath(__FILE__, "qasr_nonexistent.json").string(),
+        &result);
     QASR_EXPECT(!s.ok());
 }
 
 QASR_TEST(LoadMergesTxtNullOutput) {
-    qasr::Status s = qasr::LoadMergesTxt("/tmp/fake.txt", nullptr);
+    qasr::Status s = qasr::LoadMergesTxt(
+        qasr_test::MissingTempPath(__FILE__, "fake.txt").string(),
+        nullptr);
     QASR_EXPECT(!s.ok());
 }
 
 QASR_TEST(LoadMergesTxtMissingFile) {
     std::vector<std::pair<std::string, std::string>> result;
-    qasr::Status s = qasr::LoadMergesTxt("/tmp/qasr_nonexistent.txt", &result);
+    qasr::Status s = qasr::LoadMergesTxt(
+        qasr_test::MissingTempPath(__FILE__, "qasr_nonexistent.txt").string(),
+        &result);
     QASR_EXPECT(!s.ok());
 }
 

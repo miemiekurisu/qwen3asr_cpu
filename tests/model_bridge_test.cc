@@ -1,4 +1,5 @@
 #include "tests/test_registry.h"
+#include "tests/test_paths.h"
 
 #include <array>
 #include <filesystem>
@@ -15,9 +16,7 @@ namespace fs = std::filesystem;
 namespace {
 
 fs::path MakeTestDirectory(const std::string & name) {
-    const fs::path dir = fs::temp_directory_path() / name;
-    fs::create_directories(dir);
-    return dir;
+    return qasr_test::FreshTempDir(__FILE__, name);
 }
 
 void WriteFile(const fs::path & path, const std::string & body) {
@@ -91,8 +90,8 @@ QASR_TEST(ValidateAsrRunOptionsRejectsBrokenValues) {
 
 QASR_TEST(RunAsrRejectsMissingModelDir) {
     qasr::AsrRunOptions options;
-    options.model_dir = "/tmp/does-not-exist-qwen3asr-cpu";
-    options.audio_path = "/tmp/does-not-exist.wav";
+    options.model_dir = qasr_test::MissingTempPath(__FILE__, "does-not-exist-qwen3asr-cpu").string();
+    options.audio_path = qasr_test::MissingTempPath(__FILE__, "does-not-exist.wav").string();
     options.stream_max_new_tokens = 1;
     options.segment_max_codepoints = 32;
     options.threads = 1;
