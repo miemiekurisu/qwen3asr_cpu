@@ -42,6 +42,15 @@ struct ServerConfig {
     float temperature = -1.0f;
     bool decoder_int8 = false;
     bool encoder_int8 = false;
+    /* Realtime/host-capture sessions are cloned via qwen_clone_shared() and
+     * INT8 must be re-applied on the clone. Decoder INT8 noticeably degrades
+     * the autoregressive Qwen3 LM (language consistency, code-switch leakage,
+     * hallucinations on low-confidence audio), so by default the realtime
+     * clone keeps the decoder on BF16 even when --decoder-int8 is set for
+     * batch transcription. Set this flag to opt back in. Encoder INT8 is
+     * always propagated to the realtime clone since its quality impact is
+     * minimal. */
+    bool realtime_decoder_int8 = false;
 };
 
 Status ParseBooleanText(std::string_view field_name, std::string_view text, bool * value);

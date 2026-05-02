@@ -293,6 +293,12 @@ typedef struct {
     int stream_rollback;           /* tokens to roll back per chunk (default 5) */
     int stream_unfixed_chunks;     /* cold-start chunks without prefix (default 2) */
     int stream_max_new_tokens;     /* max generated tokens per streaming step (default 32) */
+    int stream_idle_flush_ms;      /* live mode: wake the decode loop every N ms while
+                                    * waiting for a full chunk so a buffered tail can be
+                                    * decoded promptly when the speaker pauses. 0 disables
+                                    * (legacy infinite wait, only EOF flushes the tail). */
+    float stream_idle_flush_min_sec; /* minimum buffered audio (seconds) before an idle
+                                    * timeout will trigger a partial-chunk decode. */
     int past_text_conditioning;    /* 1=enable past text conditioning in -S/--stream (default: off).
                                     * In segmented mode, this also enables boundary cleanup/post-processing. */
     int skip_silence;              /* 1=drop long silent spans before transcription */

@@ -251,7 +251,8 @@ std::string BuildCliUsage(std::string_view program_name) {
     usage += "  --language <lang>              强制语言 (如 Chinese, English)\n";
     usage += "  --prompt <text>                提示文本 (引导识别风格)\n";
     usage += "  --temperature <float>          采样温度 (默认: auto, 0=贪心, >0=采样)\n";
-    usage += "  --decoder-int8                 解码器 INT8 量化 (减少内存，可能影响精度)\n";
+    usage += "  --decoder-int8                 解码器 INT8 量化 (省显存; 会显著降低识别质量:\n";
+    usage += "                                   语言一致性下降 / 中英混杂泄漏 / 低置信度时易幻觉; 仅在内存受限时启用)\n";
     usage += "  --encoder-int8                 编码器 INT8 量化\n\n";
     usage += "高级选项 / Advanced:\n";
     usage += "  --stream                       流式分段推理\n";
