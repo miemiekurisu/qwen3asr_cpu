@@ -1,4 +1,5 @@
 #include "tests/test_registry.h"
+#include "tests/test_paths.h"
 
 #include <filesystem>
 #include <fstream>
@@ -10,8 +11,7 @@ namespace fs = std::filesystem;
 namespace {
 
 fs::path MakeCliFixtureDirectory() {
-    const fs::path dir = fs::temp_directory_path() / "qasr_cli_fixture";
-    fs::create_directories(dir);
+    const fs::path dir = qasr_test::FreshTempDir(__FILE__, "qasr_cli_fixture");
     std::ofstream(dir / "config.json") << "{}";
     std::ofstream(dir / "vocab.json") << "{}";
     std::ofstream(dir / "merges.txt") << "";

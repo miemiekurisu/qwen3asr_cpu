@@ -10,6 +10,7 @@ Qwen3-ASR-*/
 *.aiff
 *.mp3
 *.dSYM/
+Qwen3-ForcedAligner*/
 
 # Internal design docs — not for public release
 docs/
@@ -22,6 +23,7 @@ test_err*.txt
 test_res*.txt
 test_stderr*.txt
 test_output*.txt
+tests/tmp/
 
 # Test audio files (large, download separately)
 testfile/*.mp3

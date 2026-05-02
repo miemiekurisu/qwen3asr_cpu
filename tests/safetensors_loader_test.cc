@@ -1,4 +1,5 @@
 #include "tests/test_registry.h"
+#include "tests/test_paths.h"
 #include "qasr/storage/safetensors_loader.h"
 
 #include <cstdio>
@@ -9,7 +10,7 @@
 namespace {
 
 std::string CreateTempFile(const std::string & name, const void * data, std::size_t size) {
-    const std::string path = (std::filesystem::temp_directory_path() / ("qasr_test_" + name)).string();
+    const std::string path = qasr_test::TempPath(__FILE__, "qasr_test_" + name).string();
     std::ofstream out(path, std::ios::binary);
     out.write(static_cast<const char *>(data), static_cast<std::streamsize>(size));
     return path;
@@ -58,7 +59,7 @@ QASR_TEST(TensorElementCountMultiDim) {
 
 QASR_TEST(MappedFileOpenNonexistent) {
     qasr::MappedFile file;
-    const std::string nonexistent = (std::filesystem::temp_directory_path() / "qasr_does_not_exist_12345").string();
+    const std::string nonexistent = qasr_test::MissingTempPath(__FILE__, "qasr_does_not_exist_12345").string();
     qasr::Status s = qasr::MappedFile::Open(nonexistent, &file);
     QASR_EXPECT(!s.ok());
     QASR_EXPECT(!file.is_open());
@@ -102,7 +103,8 @@ QASR_TEST(MappedFileMoveSemantics) {
 // --- Error: null output ---
 
 QASR_TEST(MappedFileOpenNullOut) {
-    qasr::Status s = qasr::MappedFile::Open("/tmp/test", nullptr);
+    const std::string path = qasr_test::MissingTempPath(__FILE__, "test").string();
+    qasr::Status s = qasr::MappedFile::Open(path, nullptr);
     QASR_EXPECT(!s.ok());
 }
 
@@ -110,7 +112,8 @@ QASR_TEST(MappedFileOpenNullOut) {
 
 QASR_TEST(ShardRegistryOpenNonexistentDir) {
     qasr::ShardRegistry reg;
-    qasr::Status s = qasr::ShardRegistry::Open("/tmp/qasr_nonexistent_dir_12345", &reg);
+    const std::string dir = qasr_test::MissingTempPath(__FILE__, "qasr_nonexistent_dir_12345").string();
+    qasr::Status s = qasr::ShardRegistry::Open(dir, &reg);
     QASR_EXPECT(!s.ok());
 }
 
@@ -132,6 +135,7 @@ QASR_TEST(LoadTensorViewNullOut) {
 // --- ValidateShardChecksums ---
 
 QASR_TEST(ValidateShardChecksumsNonexistentDir) {
-    qasr::Status s = qasr::ValidateShardChecksums("/tmp/qasr_missing_dir_12345");
+    const std::string dir = qasr_test::MissingTempPath(__FILE__, "qasr_missing_dir_12345").string();
+    qasr::Status s = qasr::ValidateShardChecksums(dir);
     QASR_EXPECT(!s.ok());
 }

@@ -1,4 +1,5 @@
 #include "tests/test_registry.h"
+#include "tests/test_paths.h"
 #include "qasr/audio/frontend.h"
 
 #include <cmath>
@@ -38,7 +39,7 @@ std::vector<uint8_t> MakeMinimalWav(const std::vector<int16_t> & pcm, int32_t sa
 }
 
 std::string WriteTempWav(const std::string & name, const std::vector<uint8_t> & wav) {
-    const std::string path = "/tmp/qasr_test_" + name;
+    const std::string path = qasr_test::TempPath(__FILE__, "qasr_test_" + name).string();
     std::ofstream out(path, std::ios::binary);
     out.write(reinterpret_cast<const char *>(wav.data()), static_cast<std::streamsize>(wav.size()));
     return path;
@@ -93,7 +94,10 @@ QASR_TEST(ParseWavBufferTooSmall) {
 QASR_TEST(ReadWavNonexistent) {
     std::vector<float> samples;
     int32_t rate = 0;
-    qasr::Status s = qasr::ReadWav("/tmp/qasr_fake_wav_12345.wav", &samples, &rate);
+    qasr::Status s = qasr::ReadWav(
+        qasr_test::MissingTempPath(__FILE__, "qasr_fake_wav_12345.wav").string(),
+        &samples,
+        &rate);
     QASR_EXPECT(!s.ok());
 }
 

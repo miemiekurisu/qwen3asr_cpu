@@ -1,4 +1,5 @@
 #include "tests/test_registry.h"
+#include "tests/test_paths.h"
 
 #include <filesystem>
 #include <fstream>
@@ -10,7 +11,7 @@ namespace fs = std::filesystem;
 namespace {
 
 fs::path MakeServerFixture() {
-    const fs::path dir = fs::temp_directory_path() / "qasr_server_fixture";
+    const fs::path dir = qasr_test::FreshTempDir(__FILE__, "qasr_server_fixture");
     fs::create_directories(dir / "ui");
     std::ofstream(dir / "ui" / "index.html") << "ok";
     std::ofstream(dir / "ui" / "app.js") << "ok";
@@ -101,7 +102,7 @@ QASR_TEST(ValidateTimestampGranularitiesRejectsWordMode) {
 
 QASR_TEST(ResolveServedModelIdNormalizesModelScopeName) {
     QASR_EXPECT_EQ(
-        qasr::ResolveServedModelId("/tmp/Qwen3-ASR-1___7B"),
+        qasr::ResolveServedModelId(qasr_test::TempPath(__FILE__, "Qwen3-ASR-1___7B").string()),
         std::string("Qwen/Qwen3-ASR-1.7B"));
 }
 

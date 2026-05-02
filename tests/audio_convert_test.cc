@@ -1,4 +1,5 @@
 #include "tests/test_registry.h"
+#include "tests/test_paths.h"
 
 #include <cstring>
 #include <filesystem>
@@ -37,7 +38,7 @@ std::vector<uint8_t> MakeTestWav(const std::vector<int16_t> & pcm, int32_t sampl
 }
 
 std::string WriteTempFile(const std::string & name, const std::vector<uint8_t> & data) {
-    const fs::path temp = fs::temp_directory_path() / ("qasr_test_" + name);
+    const fs::path temp = qasr_test::TempPath(__FILE__, "qasr_test_" + name);
     std::ofstream out(temp, std::ios::binary);
     out.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
     return temp.string();
