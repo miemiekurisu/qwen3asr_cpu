@@ -11,9 +11,9 @@ namespace qasr {
 
 struct RealtimePolicyConfig {
     int sample_rate_hz = 16000;
-    int min_decode_interval_ms = 500;
-    int max_unstable_ms = 12000;
-    int max_decode_window_ms = 32000;
+    int min_decode_interval_ms = 1500;
+    int max_unstable_ms = 6000;
+    int max_decode_window_ms = 12000;
 };
 
 struct RealtimeTextState {

@@ -729,10 +729,22 @@ async function flushRealtimeChunk(force) {
   if (!force && realtimeState.pending.length === 0) {
     return;
   }
-  const buffer = new Int16Array(realtimeState.pending);
+  // realtimeState.pending is a list of Int16Array chunks. Concatenate into a
+  // single Int16Array via direct typed-array copies (no per-sample boxing).
+  const chunks = realtimeState.pending;
   realtimeState.pending = [];
-  if (buffer.length === 0) {
+  let total = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    total += chunks[i].length;
+  }
+  if (total === 0) {
     return;
+  }
+  const buffer = new Int16Array(total);
+  let offset = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    buffer.set(chunks[i], offset);
+    offset += chunks[i].length;
   }
 
   realtimeState.sending = true;
@@ -826,7 +838,9 @@ async function startRealtimeCapture() {
       const channel = event.inputBuffer.getChannelData(0);
       const downsampled = downsampleTo16k(channel, realtimeState.sampleRate);
       const pcm = floatToPcm16(downsampled);
-      realtimeState.pending.push(...pcm);
+      // Push the typed-array chunk as-is. Spreading (push(...pcm)) would box
+      // every Int16 sample into a JS Number, churning the GC at audio rate.
+      realtimeState.pending.push(pcm);
     };
 
     source.connect(processor);

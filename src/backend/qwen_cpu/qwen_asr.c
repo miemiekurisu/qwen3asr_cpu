@@ -36,11 +36,23 @@ int qwen_monitor = 0;
 #define LA_UNLOCK(la)      LeaveCriticalSection(&(la)->mutex)
 #define LA_SIGNAL(la)      WakeConditionVariable(&(la)->cond)
 #define LA_WAIT(la)        SleepConditionVariableCS(&(la)->cond, &(la)->mutex, INFINITE)
+/* Returns 0 on signal, 1 on timeout. ms must be > 0. */
+#define LA_WAIT_MS(la, ms) (SleepConditionVariableCS(&(la)->cond, &(la)->mutex, (DWORD)(ms)) ? 0 : 1)
 #else
 #define LA_LOCK(la)        pthread_mutex_lock(&(la)->mutex)
 #define LA_UNLOCK(la)      pthread_mutex_unlock(&(la)->mutex)
 #define LA_SIGNAL(la)      pthread_cond_signal(&(la)->cond)
 #define LA_WAIT(la)        pthread_cond_wait(&(la)->cond, &(la)->mutex)
+static inline int la_wait_ms_impl(pthread_cond_t *cond, pthread_mutex_t *mutex, int ms) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec  += ms / 1000;
+    ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
+    int rc = pthread_cond_timedwait(cond, mutex, &ts);
+    return rc == 0 ? 0 : 1;
+}
+#define LA_WAIT_MS(la, ms) la_wait_ms_impl(&(la)->cond, &(la)->mutex, (ms))
 #endif
 
 void qwen_set_token_callback(qwen_ctx_t *ctx, qwen_token_cb cb, void *userdata) {
@@ -332,6 +344,12 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
     ctx->stream_rollback = 5;
     ctx->stream_unfixed_chunks = 2;
     ctx->stream_max_new_tokens = 32;
+    ctx->stream_idle_flush_ms = 600;       /* live mode: wake every 600 ms while waiting
+                                            * for the next full chunk; if at least
+                                            * stream_idle_flush_min_sec of audio is
+                                            * already buffered, decode the partial tail
+                                            * instead of blocking until 2 s arrives. */
+    ctx->stream_idle_flush_min_sec = 0.5f;
     ctx->past_text_conditioning = 0;
     ctx->skip_silence = 0;
 
@@ -360,6 +378,8 @@ qwen_ctx_t *qwen_clone_shared(const qwen_ctx_t *src) {
     ctx->stream_rollback = src->stream_rollback;
     ctx->stream_unfixed_chunks = src->stream_unfixed_chunks;
     ctx->stream_max_new_tokens = src->stream_max_new_tokens;
+    ctx->stream_idle_flush_ms = src->stream_idle_flush_ms;
+    ctx->stream_idle_flush_min_sec = src->stream_idle_flush_min_sec;
     ctx->past_text_conditioning = src->past_text_conditioning;
     ctx->skip_silence = src->skip_silence;
 
@@ -2661,12 +2681,52 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     }
 
     while (audio_cursor < audio_n_samples || (live && !live_eof)) {
-        /* Live mode: wait until we have enough data for the next chunk. */
+        /* Live mode: wait until we have enough data for the next chunk.
+         *
+         * Tail-flush behavior: when stream_idle_flush_ms > 0, periodically wake
+         * the wait. If at least stream_idle_flush_min_sec of fresh audio is
+         * already buffered AND no new audio arrived during the last interval
+         * (i.e. the speaker is paused), break out and decode the partial tail
+         * instead of blocking until a full chunk arrives. Without this, the
+         * tail of the last sentence (up to chunk_samples worth of speech)
+         * stays buffered until the user clicks Stop / EOF is signaled. */
+        int short_chunk = 0;        /* set when this round decodes a partial tail */
+        int64_t short_chunk_end = 0; /* absolute sample index for the partial-tail end */
         if (live) {
             int64_t want = audio_cursor + chunk_samples;
             LA_LOCK(live);
-            while (live->sample_offset + live->n_samples < want && !live->eof)
-                LA_WAIT(live);
+            const int idle_ms = ctx->stream_idle_flush_ms;
+            int64_t idle_min = (int64_t)((double)ctx->stream_idle_flush_min_sec * (double)QWEN_SAMPLE_RATE);
+            if (idle_min < 0) idle_min = 0;
+            for (;;) {
+                if (live->sample_offset + live->n_samples >= want) break;
+                if (live->eof) break;
+                if (idle_ms <= 0) {
+                    LA_WAIT(live);
+                    continue;
+                }
+                /* Snapshot buffered count, then timed-wait. If we time out
+                 * with no new audio AND have enough buffered to be useful,
+                 * fall through to decode the partial tail. */
+                int64_t buffered_before = live->sample_offset + live->n_samples;
+                int timed_out = LA_WAIT_MS(live, idle_ms);
+                int64_t buffered_after = live->sample_offset + live->n_samples;
+                if (timed_out && buffered_after == buffered_before) {
+                    int64_t available = buffered_after - audio_cursor;
+                    if (available >= idle_min) {
+                        short_chunk = 1;
+                        short_chunk_end = buffered_after;
+                        if (qwen_verbose >= 2) {
+                            fprintf(stderr,
+                                    "Streaming (live): idle tail-flush, decoding %.2f s "
+                                    "(want %.2f s for full chunk)\n",
+                                    (double)available / (double)QWEN_SAMPLE_RATE,
+                                    (double)chunk_samples / (double)QWEN_SAMPLE_RATE);
+                        }
+                        break;
+                    }
+                }
+            }
 
             int64_t live_start = live->sample_offset;
             int64_t live_count = live->n_samples;
@@ -2728,7 +2788,14 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         }
 
         double chunk_t0 = get_time_ms();
-        audio_cursor += chunk_samples;
+        if (live && short_chunk) {
+            /* Decode only as far as actually buffered; do NOT claim the full
+             * chunk_samples or the next iteration would skip un-arrived audio
+             * once the speaker resumes. */
+            audio_cursor = short_chunk_end;
+        } else {
+            audio_cursor += chunk_samples;
+        }
         if (audio_cursor > audio_n_samples) audio_cursor = audio_n_samples;
 
         int is_final = live ? (live_eof && audio_cursor >= audio_n_samples)

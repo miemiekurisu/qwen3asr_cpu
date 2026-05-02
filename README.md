@@ -130,6 +130,8 @@ qasr_cli --model-dir /path/to/Qwen3-ASR-0.6B --audio audio.wav \
   --threads 16
 ```
 
+> ⚠️ **`--decoder-int8` 会显著降低识别质量**：语言一致性下降、中英文混杂泄漏、低置信度音频上更易产生幻觉。仅在内存严重受限时启用；批量转写优先只开 `--encoder-int8`。实时（`/api/realtime`、`/v1/realtime`）会话默认 **不会** 沿用 `--decoder-int8`，需显式 `--realtime-decoder-int8` 才会启用。
+
 流式分段推理：
 
 ```bash
@@ -172,6 +174,8 @@ qasr_server --model-dir /path/to/Qwen3-ASR-0.6B \
   --encoder-int8 \
   --threads 16
 ```
+
+> ⚠️ 同上：`--decoder-int8` 主要节省内存，但识别质量明显下降，且不会自动应用到实时会话。如确需实时也使用 INT8 解码器，请同时加 `--realtime-decoder-int8`。
 
 查看服务帮助：
 

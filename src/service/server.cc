@@ -1043,7 +1043,35 @@ public:
         if (ctx_ == nullptr) {
             return nullptr;
         }
-        return qwen_clone_shared(ctx_);
+        qwen_ctx_t * clone = qwen_clone_shared(ctx_);
+        if (clone == nullptr) {
+            return nullptr;
+        }
+        /* qwen_clone_shared() resets decoder_int8/encoder_int8 to 0 on the
+         * clone (INT8 resources are per-context, see qwen_asr.c). Without
+         * re-applying the configured INT8 flags here, every realtime/host
+         * capture session silently runs on the BF16/F32 path even when the
+         * server was started with INT8 enabled.
+         *
+         * Decoder INT8 is the autoregressive Qwen3 LM and INT8 quantization
+         * there has a measurable impact on language consistency (e.g. English
+         * fragments leaking into Chinese audio with onomatopoeia, repeated
+         * words, etc.). For realtime sessions we therefore default to BF16
+         * decoder regardless of --decoder-int8, and only opt in when the
+         * operator explicitly passes --realtime-decoder-int8. */
+        if (config_.decoder_int8 && config_.realtime_decoder_int8) {
+            if (qwen_set_decoder_int8(clone, 1) != 0) {
+                std::fprintf(stderr,
+                             "warning: realtime clone decoder INT8 init failed, falling back to BF16\n");
+            }
+        }
+        if (config_.encoder_int8) {
+            if (qwen_set_encoder_int8(clone, 1) != 0) {
+                std::fprintf(stderr,
+                             "warning: realtime clone encoder INT8 init failed, falling back to F32\n");
+            }
+        }
+        return clone;
     }
 
     int verbosity() const noexcept {
@@ -2059,6 +2087,10 @@ Status ParseServerArguments(int argc, const char * const argv[], ServerConfig * 
             config->encoder_int8 = true;
             continue;
         }
+        if (arg == "--realtime-decoder-int8") {
+            config->realtime_decoder_int8 = true;
+            continue;
+        }
         if (arg == "--temperature") {
             const char * value = nullptr;
             Status status = RequireValue(argc, argv, index, "--temperature", &value);
@@ -2096,8 +2128,11 @@ std::string BuildServerUsage(std::string_view program_name) {
     usage += "  --threads <n>\n";
     usage += "  --verbosity <n>\n";
     usage += "  --temperature <float>  (default: auto, 0=greedy, >0=sampling)\n";
-    usage += "  --decoder-int8\n";
+    usage += "  --decoder-int8           (decoder INT8: saves memory but DEGRADES quality:\n";
+    usage += "                            language consistency drops, code-switch leakage,\n";
+    usage += "                            hallucinations on low-confidence audio; use only when memory-bound)\n";
     usage += "  --encoder-int8\n";
+    usage += "  --realtime-decoder-int8  (apply --decoder-int8 to realtime sessions; default off for language consistency)\n";
     usage += "  -h, --help\n";
     return usage;
 }
