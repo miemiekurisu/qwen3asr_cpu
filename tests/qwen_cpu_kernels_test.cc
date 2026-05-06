@@ -10,6 +10,7 @@ extern "C" {
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -239,6 +240,18 @@ void FreePreparedDecoderContext(qwen_ctx_t *ctx) {
 }
 
 }  // namespace
+
+QASR_TEST(RuntimeKernelBackendMatchesCompiledArchitecture) {
+    const std::string_view backend = qwen_get_runtime_kernel_backend_name();
+
+#if defined(__aarch64__) || defined(__arm64__) || defined(__ARM_NEON)
+    QASR_EXPECT_EQ(backend, std::string_view("neon"));
+#elif defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    QASR_EXPECT(backend == std::string_view("avx2") || backend == std::string_view("generic"));
+#else
+    QASR_EXPECT_EQ(backend, std::string_view("generic"));
+#endif
+}
 
 QASR_TEST(QwenLinearQkvF32MatchesSeparateNormalShape) {
     const int seq_len = 4;

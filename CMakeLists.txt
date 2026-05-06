@@ -127,7 +127,7 @@ if(QASR_ENABLE_CPU_BACKEND)
     endif()
 
     if(APPLE)
-        target_compile_definitions(qasr_cpu_c PRIVATE USE_BLAS ACCELERATE_NEW_LAPACK)
+        target_compile_definitions(qasr_cpu_c PRIVATE USE_BLAS)
     else()
         target_compile_definitions(qasr_cpu_c PRIVATE USE_BLAS USE_OPENBLAS)
     endif()

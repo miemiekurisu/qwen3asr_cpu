@@ -14,7 +14,9 @@ Qwen3-ASR 的 CPU 推理服务与命令行工具，使用 C/C++17 实现。项�
 build.bat
 ```
 
-默认行为是 clean + configure + compile。按需追加：
+它会转发到 `tools\build_windows_openblas.ps1`，自动导入 MSVC 构建环境、查找 OpenBLAS，然后执行 clean + configure + compile。脚本不会自动下载 OpenBLAS；如果没有从 `OPENBLAS_DIR`、已有 build cache 或常见依赖目录中找到它，请显式传 `--openblas-dir`。
+
+按需追加：
 
 ```bat
 build.bat --test
@@ -31,6 +33,15 @@ $env:PATH = "D:\dev\OpenBLAS\bin;$env:PATH"
 
 ### Linux
 
+Unix 环境的一键入口是 `tools/clean_build.sh`。在 Linux 上不传 preset 时，它会自动选择 `linux-openblas`：
+
+```bash
+sudo apt-get install build-essential cmake ninja-build libopenblas-dev ffmpeg
+tools/clean_build.sh
+```
+
+手动等价流程：
+
 ```bash
 sudo apt-get install build-essential cmake ninja-build libopenblas-dev ffmpeg
 cmake --preset linux-openblas
@@ -39,6 +50,15 @@ ctest --test-dir build/linux-openblas --output-on-failure
 ```
 
 ### macOS
+
+macOS 也可以直接使用 `tools/clean_build.sh`。它会自动选择 `macos-accelerate`；如果 preset 配置的 `Ninja` 不可用，脚本会自动回退到 `Unix Makefiles`。
+
+```bash
+brew install cmake ninja ffmpeg
+tools/clean_build.sh
+```
+
+手动等价流程：
 
 ```bash
 cmake --preset macos-accelerate

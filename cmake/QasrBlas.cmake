@@ -1,7 +1,7 @@
 function(qasr_configure_blas target_name)
     if(APPLE)
         find_library(QASR_ACCELERATE_FRAMEWORK Accelerate REQUIRED)
-        target_compile_definitions(${target_name} PUBLIC QASR_BLAS_ACCELERATE=1)
+        target_compile_definitions(${target_name} PUBLIC QASR_BLAS_ACCELERATE=1 ACCELERATE_NEW_LAPACK)
         target_link_libraries(${target_name} PUBLIC ${QASR_ACCELERATE_FRAMEWORK})
         return()
     endif()
