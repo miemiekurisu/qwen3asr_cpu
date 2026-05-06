@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <string_view>
 #include <vector>
 
 #if defined(QASR_BLAS_ACCELERATE)
@@ -35,6 +36,15 @@ QASR_TEST(ValidateBlasPolicyEnforcesPlatformRule) {
     QASR_EXPECT_EQ(qasr::ValidateBlasPolicy("macos", qasr::BlasBackend::kOpenBlas).code(), qasr::StatusCode::kFailedPrecondition);
     QASR_EXPECT_EQ(qasr::ValidateBlasPolicy("linux", qasr::BlasBackend::kAccelerate).code(), qasr::StatusCode::kFailedPrecondition);
     QASR_EXPECT_EQ(qasr::ValidateBlasPolicy("", qasr::BlasBackend::kUnknown).code(), qasr::StatusCode::kInvalidArgument);
+}
+
+QASR_TEST(CheckBlasAvailableIsNoopOffWindows) {
+#if defined(_WIN32)
+    const qasr::Status status = qasr::CheckBlasAvailable();
+    QASR_EXPECT(status.ok() || status.code() == qasr::StatusCode::kFailedPrecondition);
+#else
+    QASR_EXPECT(qasr::CheckBlasAvailable().ok());
+#endif
 }
 
 // ---------------------------------------------------------------------------
