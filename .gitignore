@@ -29,3 +29,5 @@ tests/tmp/
 testfile/*.mp3
 testfile/*.wav
 !testfile/README.md
+
+.codegraph/
