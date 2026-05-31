@@ -36,6 +36,7 @@ add_library(qasr_core STATIC
     src/runtime/cpu_backend.cc
     src/runtime/session_manager.cc
     src/runtime/task_queue.cc
+    src/runtime/job_pool.cc
     src/runtime/realtime_session.cc
     src/protocol/openai.cc
     src/protocol/vllm.cc
@@ -245,6 +246,7 @@ if(QASR_ENABLE_TESTS)
         tests/streaming_policy_test.cc
         tests/session_manager_test.cc
         tests/task_queue_test.cc
+        tests/job_pool_test.cc
         tests/realtime_session_test.cc
         tests/json_test.cc
         tests/http_server_test.cc
