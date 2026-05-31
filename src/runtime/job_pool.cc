@@ -1,5 +1,8 @@
 #include "qasr/runtime/job_pool.h"
 
+#include <atomic>
+#include <chrono>
+
 namespace qasr {
 
 JobPool::JobPool(std::int32_t num_threads, std::int32_t queue_capacity)
@@ -27,12 +30,13 @@ void JobPool::Shutdown() {
   if (shutdown_.exchange(true)) {
     return;  // Already shut down
   }
-  queue_.Shutdown();
+  // Don't call queue_.Shutdown() yet — let workers drain the queue
   for (auto & w : workers_) {
     if (w.joinable()) {
       w.join();
     }
   }
+  queue_.Shutdown();
 }
 
 std::int32_t JobPool::queue_size() const {
@@ -41,10 +45,20 @@ std::int32_t JobPool::queue_size() const {
 
 void JobPool::WorkerLoop() {
   TaskItem item;
-  while (queue_.TryDequeue(&item)) {
-    if (item.work) {
-      item.work();
+  while (true) {
+    if (queue_.TryDequeue(&item)) {
+      if (item.work) {
+        active_tasks_.fetch_add(1);
+        item.work();
+        active_tasks_.fetch_sub(1);
+      }
+      continue;
     }
+    // Queue empty — only exit if shutdown and no in-flight tasks
+    if (shutdown_.load() && active_tasks_.load() == 0) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
   }
 }
 

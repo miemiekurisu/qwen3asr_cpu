@@ -37,6 +37,8 @@ class JobPool {
  private:
   void WorkerLoop();
 
+  std::atomic<int> active_tasks_{0};
+
   const std::int32_t num_threads_;
   TaskQueue queue_;
   std::vector<std::thread> workers_;
