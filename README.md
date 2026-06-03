@@ -33,14 +33,27 @@ $env:PATH = "D:\dev\OpenBLAS\bin;$env:PATH"
 
 ### Linux
 
-Unix 环境的一键入口是 `tools/clean_build.sh`。在 Linux 上不传 preset 时，它会自动选择 `linux-openblas`：
+一键入口是 `tools/build_linux.sh`，**仅支持 Debian 系**（Debian/Ubuntu/Kali/Linux Mint/Pop!_OS/elementary/Raspbian/Zorin/MX/deepin/Parrot）。脚本会按顺序：
+
+1. 校验系统与编译工具链（g++ ≥ 10 / cmake ≥ 3.21 / ninja / pkg-config / ffmpeg / git / curl），缺失会提示安装命令并退出。
+2. 检查 OpenBLAS：先看 `${QASR_DEPS_DIR:-/opt/qasr-deps}` 与系统 pkg-config；没有则尝试 `apt-get install -y libopenblas-dev`；再没有则从 GitHub 拉 `${QASR_OPENBLAS_TAG:-v0.3.30}` 源码编译到 `${QASR_DEPS_DIR}`；都失败会打印手动步骤并退出。
+3. 探测 `Qwen3-ASR-0.6B` 模型（`$QASR_MODEL_DIR` → `--model-dir` → `~/.cache/huggingface/.../snapshots/*/model.safetensors` → `./models/<repo>`），缺失会提示三种下载方式。
+4. 探测 `testfile/*.wav`（缺失提示 `tools/aishell_fetch.py`）。
+5. 默认 `clean` 删除 `build/`，然后 `cmake -S/-B/-G Ninja` + `cmake --build` + `ctest`。
 
 ```bash
-sudo apt-get install build-essential cmake ninja-build libopenblas-dev ffmpeg
-tools/clean_build.sh
+tools/build_linux.sh                       # 默认 clean + build + test
+tools/build_linux.sh --incremental         # 增量编译（不删 build/）
+tools/build_linux.sh --clean-only          # 只清不编
+tools/build_linux.sh --asan                # 用 linux-openblas-asan preset
+tools/build_linux.sh --no-test -j 4        # 跳过 ctest, 4 并发
+tools/build_linux.sh --model-dir /data/Qwen3-ASR-0.6B
+tools/build_linux.sh --no-dep --no-apt     # 离线：禁止自动装包/下载
 ```
 
-手动等价流程：
+常用环境变量：`QASR_DEPS_DIR`（默认 `/opt/qasr-deps`）、`QASR_BUILD_DIR`（默认 `build/linux-openblas`）、`QASR_MODEL_DIR`、`QASR_OPENBLAS_TAG`（默认 `v0.3.30`）、`QASR_HF_CACHE`（默认 `~/.cache/huggingface`）、`QASR_JOBS`（默认 `nproc`）、`QASR_APT_MIRROR`。`tools/build_linux.sh --help` 看完整选项。
+
+手动等价流程（脚本不可用时）：
 
 ```bash
 sudo apt-get install build-essential cmake ninja-build libopenblas-dev ffmpeg
@@ -49,18 +62,27 @@ cmake --build build/linux-openblas -j"$(nproc)"
 ctest --test-dir build/linux-openblas --output-on-failure
 ```
 
+#### 启动 server (一键)
+
+编译完可以用 `tools/run_linux_server.sh` 一键起后台 server（HTTP + 可选 HTTPS + 状态查询），避免手动管 PID / log / 反代：
+
+```bash
+export QASR_MODEL_DIR=$HOME/.cache/huggingface/models--Qwen--Qwen3-ASR-0.6B/snapshots/<rev>
+
+tools/run_linux_server.sh --detach                  # 后台 HTTP (API/curl 用)
+tools/run_linux_server.sh --detach --https          # 后台 HTTP + HTTPS (浏览器用, 推荐, 浏览器需要 https 才能拿 mic 权限)
+tools/run_linux_server.sh --status                  # /api/health 检查
+tools/run_linux_server.sh --stop                    # 停 --detach 起的 server / proxy
+```
+
+HTTPS 反代每次启动 `mktemp -d` 生成自签 cert（退出时自动清，仓库卫生 + 临时安全）；想跨重启复用 cert 设 `QASR_TLS_CERT_DIR=/path/to/cert` 即可。常用环境变量：`QASR_HOST=0.0.0.0`、`QASR_PORT=19991`、`QASR_HTTPS_PORT=19992`、`QASR_THREADS=0`(0=自动)、`QASR_VERBOSITY=0`(0=silent)、`QASR_VAD_MODEL=`。完整参数 `tools/run_linux_server.sh --help`。
+
 ### macOS
 
-macOS 也可以直接使用 `tools/clean_build.sh`。它会自动选择 `macos-accelerate`；如果 preset 配置的 `Ninja` 不可用，脚本会自动回退到 `Unix Makefiles`。
+macOS 没有提供一键脚本，请按下面的手动流程编译：
 
 ```bash
 brew install cmake ninja ffmpeg
-tools/clean_build.sh
-```
-
-手动等价流程：
-
-```bash
 cmake --preset macos-accelerate
 cmake --build build/macos-accelerate -j"$(sysctl -n hw.ncpu)"
 ctest --test-dir build/macos-accelerate --output-on-failure

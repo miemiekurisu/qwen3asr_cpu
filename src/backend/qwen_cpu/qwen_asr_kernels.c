@@ -115,6 +115,74 @@ static __thread int tl_bg_thread = 0;
 void qwen_set_bg_thread_mode(int enable) { tl_bg_thread = enable; }
 int  qwen_is_bg_thread(void)             { return tl_bg_thread; }
 
+/* Concurrent calls to parallel_for() share the global pool, but the pool
+ * state (fn/arg/n_done/generation) is a single struct, so two callers
+ * racing on the pool corrupt each other's work — workers can pick up a
+ * second caller's fn/arg before the first caller's fn has finished, and
+ * the first caller's n_done gets reset by the second caller.  Serialize
+ * the dispatcher so only one parallel_for is in flight at a time.  This
+ * is correctness over latency: the per-call work is small relative to
+ * session setup, and HTTP workers typically run one inference at a time
+ * per session. */
+typedef struct {
+#ifdef _WIN32
+    CRITICAL_SECTION mutex;
+    CONDITION_VARIABLE cond;
+#else
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+#endif
+    int in_use;
+    int initialized;
+} parallel_dispatch_t;
+
+static parallel_dispatch_t g_parallel_dispatch = {
+#ifdef _WIN32
+    .mutex = { 0 },
+    .cond = { 0 },
+#else
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .cond = PTHREAD_COND_INITIALIZER,
+#endif
+    .in_use = 0,
+    .initialized = 0
+};
+
+static void parallel_dispatch_lock(void) {
+#ifdef _WIN32
+    if (!g_parallel_dispatch.initialized) {
+        InitializeCriticalSection(&g_parallel_dispatch.mutex);
+        InitializeConditionVariable(&g_parallel_dispatch.cond);
+        g_parallel_dispatch.initialized = 1;
+    }
+    EnterCriticalSection(&g_parallel_dispatch.mutex);
+    while (g_parallel_dispatch.in_use)
+        SleepConditionVariableCS(&g_parallel_dispatch.cond, &g_parallel_dispatch.mutex, INFINITE);
+    g_parallel_dispatch.in_use = 1;
+    LeaveCriticalSection(&g_parallel_dispatch.mutex);
+#else
+    pthread_mutex_lock(&g_parallel_dispatch.mutex);
+    while (g_parallel_dispatch.in_use)
+        pthread_cond_wait(&g_parallel_dispatch.cond, &g_parallel_dispatch.mutex);
+    g_parallel_dispatch.in_use = 1;
+    pthread_mutex_unlock(&g_parallel_dispatch.mutex);
+#endif
+}
+
+static void parallel_dispatch_unlock(void) {
+#ifdef _WIN32
+    EnterCriticalSection(&g_parallel_dispatch.mutex);
+    g_parallel_dispatch.in_use = 0;
+    WakeAllConditionVariable(&g_parallel_dispatch.cond);
+    LeaveCriticalSection(&g_parallel_dispatch.mutex);
+#else
+    pthread_mutex_lock(&g_parallel_dispatch.mutex);
+    g_parallel_dispatch.in_use = 0;
+    pthread_cond_broadcast(&g_parallel_dispatch.cond);
+    pthread_mutex_unlock(&g_parallel_dispatch.mutex);
+#endif
+}
+
 #ifdef _WIN32
 
 static struct {
@@ -238,6 +306,11 @@ static void parallel_for(parallel_fn_t fn, void *arg) {
 
     tp_init_once();
 
+    /* Serialize concurrent callers so the shared tp.fn/arg/n_done/
+     * generation state is not corrupted by two threads entering the
+     * pool at the same time.  See parallel_dispatch_lock() comment. */
+    parallel_dispatch_lock();
+
     EnterCriticalSection(&tp.mutex);
     tp.fn = fn;
     tp.arg = arg;
@@ -252,6 +325,8 @@ static void parallel_for(parallel_fn_t fn, void *arg) {
     while (tp.n_done < tp.n_threads - 1)
         SleepConditionVariableCS(&tp.cond_done, &tp.mutex, INFINITE);
     LeaveCriticalSection(&tp.mutex);
+
+    parallel_dispatch_unlock();
 }
 
 #else /* POSIX */
@@ -369,6 +444,11 @@ static void parallel_for(parallel_fn_t fn, void *arg) {
         return;
     }
 
+    /* Serialize concurrent callers so the shared tp.fn/arg/n_done/
+     * generation state is not corrupted by two threads entering the
+     * pool at the same time.  See parallel_dispatch_lock() comment. */
+    parallel_dispatch_lock();
+
     pthread_mutex_lock(&tp.mutex);
     tp.fn = fn;
     tp.arg = arg;
@@ -383,6 +463,8 @@ static void parallel_for(parallel_fn_t fn, void *arg) {
     while (tp.n_done < tp.n_threads - 1)
         pthread_cond_wait(&tp.cond_done, &tp.mutex);
     pthread_mutex_unlock(&tp.mutex);
+
+    parallel_dispatch_unlock();
 }
 
 #endif /* _WIN32 */
@@ -1092,8 +1174,126 @@ static void argmax_worker(int tid, int n_threads, void *arg) {
                       &t->best_idx[tid], &t->best_val[tid]);
 }
 
+/* Pure C, no SIMD — portable to Atom/ARM/etc.
+ * Builds suffix_max[r] = max over rows r..N-1 of max(|bf16_to_f32(W[row][k])|).
+ * out_dim floats. Returns NULL on alloc failure. */
+float *qwen_compute_suffix_max_bf16(const uint16_t *W_bf16,
+                                     int n_rows, int in_dim) {
+    if (!W_bf16 || n_rows <= 0 || in_dim <= 0) return NULL;
+    float *suffix = (float *)malloc((size_t)n_rows * sizeof(float));
+    if (!suffix) return NULL;
+
+    /* Per-row max abs; one-time init cost ~3us/row * 151936 = ~450ms single-thread.
+     * Could be parallelised with parallel_for but it's a one-shot init. */
+    for (int r = n_rows - 1; r >= 0; r--) {
+        const uint16_t *row = W_bf16 + (size_t)r * in_dim;
+        float row_max = 0.0f;
+        for (int k = 0; k < in_dim; k++) {
+            uint32_t f32_bits = ((uint32_t)row[k]) << 16;
+            float v;
+            memcpy(&v, &f32_bits, sizeof(float));
+            float av = v < 0 ? -v : v;
+            if (av > row_max) row_max = av;
+        }
+        if (r == n_rows - 1) {
+            suffix[r] = row_max;
+        } else {
+            float prev = suffix[r + 1];
+            suffix[r] = row_max > prev ? row_max : prev;
+        }
+    }
+    return suffix;
+}
+
+/* L1 norm of x: sum_k |x[k]|. Pure C, AVX2 fast-path when available. */
+float qwen_l1_norm_f32(const float *x, int n) {
+#if defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        acc = _mm256_add_ps(acc, _mm256_abs_ps(v));
+    }
+    float buf[8] __attribute__((aligned(32)));
+    _mm256_storeu_ps(buf, acc);
+    float s = buf[0]+buf[1]+buf[2]+buf[3]+buf[4]+buf[5]+buf[6]+buf[7];
+    for (; i < n; i++) {
+        s += x[i] < 0 ? -x[i] : x[i];
+    }
+    return s;
+#else
+    float s = 0.0f;
+    for (int i = 0; i < n; i++) s += x[i] < 0 ? -x[i] : x[i];
+    return s;
+#endif
+}
+
+typedef struct {
+    const float *x;
+    const uint16_t *W_bf16;
+    int in_dim;
+    int out_dim;
+    const float *suffix_max;  /* [out_dim+1] or NULL: suffix_max[r+1] = upper bound for row r+1..N-1 */
+    float L1_x;               /* sum_k |x[k]|, 0 disables */
+    int best_idx[QWEN_MAX_THREADS];
+    float best_val[QWEN_MAX_THREADS];
+} argmax_et_task_t;
+
+/* Per-thread argmax with optional intra-thread early termination.
+ * Uses the same SIMD bf16 matvec as the original argmax_bf16_range_*.
+ * Per-row early term: at row r, if local_max >= L1_x * suffix_max[r+1],
+ * no future row in the global remaining set can exceed local_max, so
+ * this thread is done.
+ *
+ * Math correctness:
+ *   For any future row s, |dot(x, W[s])| <= sum_k |x[k]| * |W[s][k]|
+ *                                 <= L1_x * max_k |W[s][k]|
+ *                                 <= L1_x * suffix_max[s]
+ *                                 <= L1_x * suffix_max[r+1]   (non-increasing)
+ * So when local_max >= L1_x * suffix_max[r+1], the global argmax is
+ * already in our processed set.
+ *
+ * Conservative note: suffix_max is global (all rows), so the bound
+ * includes rows in OTHER threads' chunks. Each thread assumes the
+ * WORST case. The cross-thread reduction at the end picks the true
+ * argmax. */
+static void argmax_et_worker(int tid, int n_threads, void *arg) {
+    argmax_et_task_t *t = (argmax_et_task_t *)arg;
+    int chunk = (t->out_dim + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > t->out_dim) end = t->out_dim;
+    if (start >= end) {
+        t->best_val[tid] = -1e30f;
+        t->best_idx[tid] = start;
+        return;
+    }
+
+    int best = start;
+    float best_val = -1e30f;
+    int early_termination = (t->suffix_max != NULL && t->L1_x > 0.0f);
+
+    /* Use the same AVX2/generic matvec kernel as the un-optimised path,
+     * but feed it one row at a time so we can break out per row. */
+    for (int o = start; o < end; o++) {
+        int local_best_idx;
+        float local_best_val;
+        argmax_bf16_range(t->x, t->W_bf16, t->in_dim, o, o + 1,
+                          &local_best_idx, &local_best_val);
+        if (local_best_val > best_val) { best_val = local_best_val; best = o; }
+
+        if (early_termination && o + 1 < t->out_dim) {
+            float ub = t->L1_x * t->suffix_max[o + 1];
+            if (best_val >= ub) break;  /* provably optimal within my chunk */
+        }
+    }
+    t->best_idx[tid] = best;
+    t->best_val[tid] = best_val;
+}
+
 int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
-                             int in_dim, int out_dim) {
+                             int in_dim, int out_dim,
+                             const float *suffix_max, float L1_x) {
     if (tp.n_threads <= 1) {
         int best;
         float best_val;
@@ -1101,13 +1301,34 @@ int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
         return best;
     }
 
-    argmax_task_t task;
+    /* If early-termination data unavailable, fall back to the original worker
+     * (no functional change from pre-existing behavior). */
+    if (!suffix_max || L1_x <= 0.0f) {
+        argmax_task_t task;
+        task.x = x;
+        task.W_bf16 = W_bf16;
+        task.in_dim = in_dim;
+        task.out_dim = out_dim;
+        parallel_for(argmax_worker, &task);
+        int best = task.best_idx[0];
+        float best_val = task.best_val[0];
+        for (int i = 1; i < tp.n_threads; i++) {
+            if (task.best_val[i] > best_val) {
+                best_val = task.best_val[i];
+                best = task.best_idx[i];
+            }
+        }
+        return best;
+    }
+
+    argmax_et_task_t task;
     task.x = x;
     task.W_bf16 = W_bf16;
     task.in_dim = in_dim;
     task.out_dim = out_dim;
-    parallel_for(argmax_worker, &task);
-
+    task.suffix_max = suffix_max;
+    task.L1_x = L1_x;
+    parallel_for(argmax_et_worker, &task);
     int best = task.best_idx[0];
     float best_val = task.best_val[0];
     for (int i = 1; i < tp.n_threads; i++) {
