@@ -42,6 +42,8 @@ add_library(qasr_core STATIC
     src/protocol/vllm.cc
     src/base/json.cc
     src/base/http_server.cc
+    src/base/utf8.cc
+    src/base/process_spawn.cc
     src/audio/audio_convert.cc
     src/subtitle/subtitle_writer.cc
     src/inference/aligner_types.cc
@@ -81,6 +83,8 @@ if(QASR_ENABLE_CPU_BACKEND)
     set(QASR_CPU_SOURCES
         src/backend/qwen_cpu/qwen_asr.c
         src/backend/qwen_cpu/qwen_asr_stream.h
+        src/backend/qwen_cpu/qwen_asr_alloc.c
+        src/backend/qwen_cpu/qwen_asr_alloc.h
         src/backend/qwen_cpu/qwen_asr_audio.c
         src/backend/qwen_cpu/qwen_asr_decoder.c
         src/backend/qwen_cpu/qwen_asr_encoder.c
@@ -92,6 +96,9 @@ if(QASR_ENABLE_CPU_BACKEND)
         src/backend/qwen_cpu/qwen_asr_safetensors.c
         src/backend/qwen_cpu/qwen_asr_tokenizer.c
         src/backend/qwen_cpu/qwen_asr_aligner.c
+        src/backend/qwen_cpu/qwen_asr_utf8.c
+        src/backend/qwen_cpu/qwen_silero_vad.c
+        src/backend/qwen_cpu/qwen_silero_vad.h
     )
 
     # NEON kernels only on ARM
@@ -117,6 +124,41 @@ if(QASR_ENABLE_CPU_BACKEND)
     target_include_directories(qasr_cpu_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/qwen_cpu)
     target_compile_features(qasr_cpu_c PUBLIC c_std_11)
 
+    # Optional Silero VAD support via ONNX runtime.  Disabled by default
+    # so the build is hermetic; enable with -DQASR_ENABLE_SILERO_VAD=ON
+    # and ensure onnxruntime is on the search path (or set
+    # QASR_ONNXRUNTIME_ROOT to its install dir).  When disabled, the
+    # VAD code compiles to a no-op stub and legacy timeout-based
+    # silence detection is used instead.
+    option(QASR_ENABLE_SILERO_VAD "Enable Silero VAD (ONNX runtime) for streaming endpoint detection" OFF)
+    set(QASR_SILERO_VAD_AVAILABLE 0)
+    if(QASR_ENABLE_SILERO_VAD)
+        if(QASR_ONNXRUNTIME_ROOT)
+            find_path(QASR_ONNXRUNTIME_INCLUDE_DIR
+                NAMES onnxruntime_c_api.h
+                PATHS ${QASR_ONNXRUNTIME_ROOT} ${QASR_ONNXRUNTIME_ROOT}/include
+                NO_DEFAULT_PATH)
+            find_library(QASR_ONNXRUNTIME_LIBRARY
+                NAMES onnxruntime
+                PATHS ${QASR_ONNXRUNTIME_ROOT} ${QASR_ONNXRUNTIME_ROOT}/lib ${QASR_ONNXRUNTIME_ROOT}/lib64
+                NO_DEFAULT_PATH)
+        else()
+            find_path(QASR_ONNXRUNTIME_INCLUDE_DIR
+                NAMES onnxruntime_c_api.h)
+            find_library(QASR_ONNXRUNTIME_LIBRARY
+                NAMES onnxruntime)
+        endif()
+        if(QASR_ONNXRUNTIME_INCLUDE_DIR AND QASR_ONNXRUNTIME_LIBRARY)
+            target_include_directories(qasr_cpu_c PRIVATE ${QASR_ONNXRUNTIME_INCLUDE_DIR})
+            target_link_libraries(qasr_cpu_c PRIVATE ${QASR_ONNXRUNTIME_LIBRARY})
+            target_compile_definitions(qasr_cpu_c PRIVATE QWEN_HAS_ONNXRUNTIME=1)
+            set(QASR_SILERO_VAD_AVAILABLE 1)
+            message(STATUS "Silero VAD: ONNX runtime found at ${QASR_ONNXRUNTIME_INCLUDE_DIR}")
+        else()
+            message(WARNING "Silero VAD requested but ONNX runtime not found; building stub")
+        endif()
+    endif()
+
     if(MSVC)
         # /O2 conflicts with /RTC1 and /Od that CMake adds in Debug mode.
         # Strip them for this perf-critical C library (the only C target).
@@ -130,7 +172,12 @@ if(QASR_ENABLE_CPU_BACKEND)
     if(APPLE)
         target_compile_definitions(qasr_cpu_c PRIVATE USE_BLAS)
     else()
-        target_compile_definitions(qasr_cpu_c PRIVATE USE_BLAS USE_OPENBLAS)
+        target_compile_definitions(qasr_cpu_c PRIVATE USE_BLAS)
+        # Backend-specific thread-control hooks: kernels.c and perf.c
+        # call openblas_{get,set}_num_threads under this guard.
+        if(QASR_BLAS_SELECTED STREQUAL "openblas")
+            target_compile_definitions(qasr_cpu_c PRIVATE USE_OPENBLAS)
+        endif()
     endif()
 
     qasr_configure_onednn(qasr_cpu_c)
@@ -189,6 +236,25 @@ if(QASR_ENABLE_ASAN AND NOT MSVC)
     target_link_options(qasr_cli PRIVATE -fsanitize=address,undefined)
 endif()
 
+# qasr_blas_bench — real-time-stream BLAS benchmark
+# Compares OpenBLAS / BLIS / MKL throughput on the project's actual hot path
+# (qwen_transcribe_stream_live over a real long audio file).  See app/README.
+add_executable(qasr_blas_bench
+    app/qasr_blas_bench.cc
+)
+target_link_libraries(qasr_blas_bench PRIVATE qasr_core)
+target_include_directories(qasr_blas_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+qasr_configure_blas_bench_tag(qasr_blas_bench)
+if(MSVC)
+    target_compile_options(qasr_blas_bench PRIVATE /W4 /permissive- /utf-8)
+else()
+    target_compile_options(qasr_blas_bench PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+if(QASR_ENABLE_ASAN AND NOT MSVC)
+    target_compile_options(qasr_blas_bench PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(qasr_blas_bench PRIVATE -fsanitize=address,undefined)
+endif()
+
 if(QASR_ENABLE_CPU_BACKEND OR WIN32)
     add_executable(qasr_server
         app/qasr_server.cc
@@ -232,13 +298,20 @@ if(QASR_ENABLE_TESTS)
         tests/task_test.cc
         tests/engine_test.cc
         tests/model_bridge_test.cc
+        tests/extract_indexed_safetensors_test.cc
         tests/cli_options_test.cc
         tests/server_test.cc
+        tests/silero_vad_test.cc
+        tests/utf8_truncate_test.cc
         tests/realtime_test.cc
         tests/openai_test.cc
         tests/vllm_test.cc
         tests/state_machine_test.cc
         tests/safetensors_loader_test.cc
+        tests/safetensors_safety_test.cc
+        tests/utf8_test.cc
+        tests/qasr_alloc_test.cc
+        tests/qasr_safety_microbench.cc
         tests/tokenizer_test.cc
         tests/audio_frontend_test.cc
         tests/encoder_test.cc
@@ -256,8 +329,10 @@ if(QASR_ENABLE_TESTS)
         tests/inference_backend_test.cc
         tests/subtitle_writer_test.cc
         tests/audio_convert_test.cc
+        tests/ffmpeg_argv_test.cc
         tests/aligner_types_test.cc
         tests/aligner_client_test.cc
+        tests/chunk_callback_test.cc
     )
 
     if(QASR_ENABLE_CPU_BACKEND)
@@ -267,7 +342,7 @@ if(QASR_ENABLE_TESTS)
 
     add_executable(qasr_unit_tests ${QASR_UNIT_TEST_SOURCES})
 
-    target_link_libraries(qasr_unit_tests PRIVATE qasr_core)
+    target_link_libraries(qasr_unit_tests PRIVATE qasr_core qasr_cpu_c)
     target_include_directories(qasr_unit_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
     )

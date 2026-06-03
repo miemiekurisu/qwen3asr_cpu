@@ -4,6 +4,11 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <vector>
+
+namespace {
+constexpr std::chrono::milliseconds kIdleTimeout{5000};
+}  // namespace
 
 // --- Normal ---
 
@@ -21,8 +26,8 @@ QASR_TEST(JobPoolSubmitAndExecute) {
     pool.Submit("job-1", [&counter]() { counter.fetch_add(1); });
     pool.Submit("job-2", [&counter]() { counter.fetch_add(1); });
 
-    // Wait for jobs to complete
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // Wait deterministically for both jobs to complete (no sleep_for).
+    QASR_EXPECT(pool.WaitForIdle(kIdleTimeout));
     pool.Shutdown();
 
     QASR_EQ(counter.load(), 2);
@@ -47,14 +52,14 @@ QASR_TEST(JobPoolFIFOExecution) {
         QASR_EQ(v, lastOrder.fetch_add(1) + 1);
     });
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    QASR_EXPECT(pool.WaitForIdle(kIdleTimeout));
     pool.Shutdown();
 }
 
 QASR_TEST(JobPoolQueueSize) {
     qasr::JobPool pool(1, 10);
 
-    // Submit a blocking job to keep the worker busy
+    // Submit a blocking job to keep the worker busy.
     std::atomic<bool> release{false};
     pool.Submit("blocking", [&release]() {
         while (!release.load()) {
@@ -62,6 +67,10 @@ QASR_TEST(JobPoolQueueSize) {
         }
     });
 
+    // Allow the worker time to dequeue "blocking".  This is the only
+    // spot in the test suite that uses a small sleep_for, because we
+    // need to observe the "worker has picked up the job" transition
+    // and there is no public signal for that.
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     QASR_EQ(pool.queue_size(), 0);  // Worker picked it up
 
@@ -69,7 +78,6 @@ QASR_TEST(JobPoolQueueSize) {
     pool.Submit("queued-1", []() {});
     pool.Submit("queued-2", []() {});
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     QASR_GE(pool.queue_size(), 1);
 
     release.store(true);
@@ -89,6 +97,7 @@ QASR_TEST(JobPoolBackpressure) {
         }
     });
 
+    // Allow the worker time to start the blocking job.
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     // Fill the queue
@@ -118,7 +127,9 @@ QASR_TEST(JobPoolShutdown) {
 }
 
 QASR_TEST(JobPoolDrainOnShutdown) {
-    qasr::JobPool pool(2, 10);
+    // Capacity is large enough to hold all 20 jobs so backpressure does
+    // not silently drop any of them.
+    qasr::JobPool pool(2, 64);
     std::atomic<int> counter{0};
 
     // Submit many jobs
@@ -148,7 +159,7 @@ QASR_TEST(JobPoolDestructorShutdown) {
         pool.Submit("destructor-test", [&counter]() {
             counter.fetch_add(1);
         });
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        QASR_EXPECT(pool.WaitForIdle(kIdleTimeout));
         // Destructor should shutdown gracefully
     }
     QASR_EQ(counter.load(), 1);
@@ -166,7 +177,7 @@ QASR_TEST(JobPoolSingleThread) {
         });
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    QASR_EXPECT(pool.WaitForIdle(kIdleTimeout));
     pool.Shutdown();
     QASR_EQ(counter.load(), 5);
 }
@@ -181,7 +192,7 @@ QASR_TEST(JobPoolManyThreads) {
         });
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    QASR_EXPECT(pool.WaitForIdle(kIdleTimeout));
     pool.Shutdown();
     QASR_EQ(counter.load(), 64);
 }
@@ -189,7 +200,7 @@ QASR_TEST(JobPoolManyThreads) {
 QASR_TEST(JobPoolEmptyWork) {
     qasr::JobPool pool(2, 10);
     pool.Submit("empty", nullptr);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    QASR_EXPECT(pool.WaitForIdle(kIdleTimeout));
     pool.Shutdown();
 }
 
@@ -217,8 +228,32 @@ QASR_TEST(JobPoolConcurrentSubmit) {
         t.join();
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // Deterministic wait: drain everything that was accepted.
+    QASR_EXPECT(pool.WaitForIdle(kIdleTimeout));
     pool.Shutdown();
 
     QASR_EQ(counter.load(), successCount.load());
+}
+
+// --- New: WaitForIdle semantics ---
+
+QASR_TEST(JobPoolWaitForIdleImmediateWhenEmpty) {
+    qasr::JobPool pool(2, 4);
+    // No work submitted; should report idle within a short bounded wait.
+    QASR_EXPECT(pool.WaitForIdle(std::chrono::milliseconds(50)));
+    pool.Shutdown();
+}
+
+QASR_TEST(JobPoolWaitForIdleReturnsAfterWorkCompletes) {
+    // Capacity is large enough to hold all 8 jobs.
+    qasr::JobPool pool(2, 16);
+    std::atomic<int> counter{0};
+    for (int i = 0; i < 8; ++i) {
+        pool.Submit("wait-" + std::to_string(i), [&counter]() {
+            counter.fetch_add(1);
+        });
+    }
+    QASR_EXPECT(pool.WaitForIdle(kIdleTimeout));
+    QASR_EQ(counter.load(), 8);
+    pool.Shutdown();
 }

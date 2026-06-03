@@ -10,7 +10,18 @@ Qwen3-ASR-*/
 *.aiff
 *.mp3
 *.dSYM/
-Qwen3-ForcedAligner*/
+Qwen3-ForcedAligner-*/
+
+# Silero VAD ONNX (downloaded by build/run scripts)
+*.onnx
+models/silero_vad/
+
+# Codegraph auto-generated index
+.codegraph/
+
+# Python bytecode
+__pycache__/
+*.pyc
 
 # Internal design docs — not for public release
 docs/

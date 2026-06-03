@@ -2,6 +2,7 @@
 #include "qasr/service/realtime.h"
 
 #include <atomic>
+#include <cmath>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
@@ -43,8 +44,10 @@
 extern "C" {
 #include "qwen_asr.h"
 #include "qwen_asr_kernels.h"
+#include "qwen_silero_vad.h"
 }
 #include "qasr/base/http_server.h"
+#include "qasr/base/process_spawn.h"
 #endif
 
 #include "qasr/runtime/model_bridge.h"
@@ -438,35 +441,6 @@ int StatusToHttpCode(const Status & status) {
     }
 }
 
-std::string ShellEscape(std::string_view value) {
-    std::string escaped;
-    escaped.reserve(value.size() + 8);
-#ifdef _WIN32
-    escaped.push_back('"');
-    for (const char ch : value) {
-        if (ch == '"') {
-            escaped += "\\\"";
-        } else if (ch == '\\') {
-            escaped += "\\\\";
-        } else {
-            escaped.push_back(ch);
-        }
-    }
-    escaped.push_back('"');
-#else
-    escaped.push_back('\'');
-    for (const char ch : value) {
-        if (ch == '\'') {
-            escaped += "'\"'\"'";
-        } else {
-            escaped.push_back(ch);
-        }
-    }
-    escaped.push_back('\'');
-#endif
-    return escaped;
-}
-
 bool HasWavExtension(const fs::path & path) {
     std::string extension = path.extension().string();
     for (char & ch : extension) {
@@ -489,12 +463,20 @@ std::string NormalizeAudioLocator(std::string_view locator) {
 }
 
 bool CommandExists(const char * name) {
+    // Use the shared spawn helper instead of `system()` / `where` so
+    // we never invoke a shell and so the executable name cannot be
+    // interpreted as shell syntax if it ever contains unexpected
+    // metacharacters.  The probe runs `command -v <name>` /
+    // `where.exe <name>` directly with that name as a single argv
+    // element.
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
 #ifdef _WIN32
-    const std::string command = "where " + std::string(name) + " >NUL 2>&1";
+    return qasr::SpawnAndWait({"where", name}) == 0;
 #else
-    const std::string command = "command -v " + std::string(name) + " >/dev/null 2>&1";
+    return qasr::SpawnAndWait({"command", "-v", name}) == 0;
 #endif
-    return std::system(command.c_str()) == 0;
 }
 
 bool FfmpegAvailable() {
@@ -526,15 +508,21 @@ Status NormalizeAudioToWav16kMono(std::string_view locator, const fs::path & out
         return Status(StatusCode::kFailedPrecondition, "ffmpeg is required for non-wav audio normalization");
     }
 
-    const std::string command =
-        "ffmpeg -loglevel error -nostdin -y -i " + ShellEscape(locator) +
-        " -ar 16000 -ac 1 -f wav " + ShellEscape(output_path.string()) +
-#ifdef _WIN32
-        " >NUL 2>&1";
-#else
-        " >/dev/null 2>&1";
-#endif
-    if (std::system(command.c_str()) != 0) {
+    // Build the ffmpeg argv directly; do NOT pass through a shell,
+    // so the locator and output paths are preserved verbatim even
+    // if they contain shell metacharacters.
+    const std::vector<std::string> args = {
+        "ffmpeg",
+        "-loglevel", "error",
+        "-nostdin",
+        "-y",
+        "-i", std::string(locator),
+        "-ar", "16000",
+        "-ac", "1",
+        "-f", "wav",
+        output_path.string(),
+    };
+    if (qasr::SpawnAndWait(args) != 0) {
         return Status(StatusCode::kInternal, "ffmpeg normalization failed");
     }
     return OkStatus();
@@ -876,6 +864,14 @@ void ForwardTokenPiece(const char * piece, void * userdata) {
     }
     auto * callback = static_cast<std::function<void(std::string_view)> *>(userdata);
     (*callback)(piece);
+}
+
+void ForwardStreamChunk(const qwen_stream_chunk_t * chunk, void * userdata) {
+    if (chunk == nullptr || userdata == nullptr) {
+        return;
+    }
+    auto * callback = static_cast<std::function<void(const qwen_stream_chunk_t *)> *>(userdata);
+    (*callback)(chunk);
 }
 
 int ForwardCancelRequest(void * userdata) {
@@ -1307,6 +1303,21 @@ struct RealtimeSession {
     std::string text;
     std::string stable_text;
     std::string partial_text;
+    /* VAD-segmented mode: committed sentences, append-only.  Each
+     * completed segment's text is pushed here.  The UI renders this
+     * as a running transcript; live_stable_text holds the in-flight
+     * segment text (or the most recent committed one after the
+     * segment is finalized).  This replaces the rolling-decoder
+     * partial/revision model with a sentence-bounded one. */
+    std::vector<std::string> segments_text;
+    double current_segment_audio_sec = 0.0;
+    /* Audio ingress diagnostic.  Set on every chunk POST, surfaced via
+     * /api/realtime/audio_diag so the UI can show "did the server
+     * actually receive my audio". */
+    float last_ingress_peak = 0.0f;
+    float last_ingress_rms = 0.0f;
+    float max_ingress_peak = 0.0f;
+    uint64_t ingress_chunks = 0;
     double last_inference_ms = 0.0;
     bool last_decode_ran = false;
     bool worker_done = false;
@@ -1327,6 +1338,8 @@ struct RealtimeSessionSnapshot {
     std::string text;
     std::string stable_text;
     std::string partial_text;
+    std::vector<std::string> segments_text;
+    double current_segment_audio_sec = 0.0;
     double last_inference_ms = 0.0;
     bool last_decode_ran = false;
     bool finalized = false;
@@ -1816,6 +1829,8 @@ RealtimeSessionSnapshot SnapshotRealtimeSession(const RealtimeSession & session)
     snapshot.text = session.text;
     snapshot.stable_text = session.stable_text;
     snapshot.partial_text = session.partial_text;
+    snapshot.segments_text = session.segments_text;
+    snapshot.current_segment_audio_sec = session.current_segment_audio_sec;
     snapshot.last_inference_ms = session.last_inference_ms;
     snapshot.last_decode_ran = session.last_decode_ran;
     snapshot.finalized = session.finalized;
@@ -1844,6 +1859,41 @@ void ApplyStableRealtimeCommit(
     session->text_state.last_decode_samples = total_samples;
     session->text_state.unstable_since_samples = total_samples;
     ApplyRealtimeUpdate(update, inference_ms, true, finalized, session);
+}
+
+/* Apply one per-chunk snapshot from the C engine.  The chunk carries:
+ *  - stable_piece: NEWLY committed text in this chunk (delta, append-only)
+ *  - tentative_piece: the still-tentative tail (replaces the previous one)
+ *  - is_final: true on the very last chunk
+ * The receiver is expected to track its own displayed state; we just merge
+ * the delta into session->stable_text and replace partial_text in place. */
+template <typename SessionLike>
+void ApplyChunkRealtimeCommit(
+    const qwen_stream_chunk_t * chunk,
+    std::size_t total_samples,
+    SessionLike * session) {
+    if (session == nullptr || chunk == nullptr) {
+        return;
+    }
+
+    RealtimeTextUpdate update;
+    /* Update stable_text first, then read it back so the display state
+     * sees the new cumulative value. */
+    session->stable_text.append(chunk->stable_piece);
+    session->partial_text = std::string(chunk->tentative_piece);
+    update.committed = chunk->stable_token_count > 0 || chunk->is_final;
+    update.stable_text = session->stable_text;
+    update.partial_text = session->partial_text;
+    update.text = session->stable_text;
+    session->text_state.stable_text = update.stable_text;
+    session->text_state.last_text = update.text;
+    session->text_state.last_decode_samples = total_samples;
+    session->text_state.unstable_since_samples = total_samples;
+    /* Accumulate the per-chunk decode_ms into the running total so the
+     * UI can show the wall-clock cost of incremental decoding.  Idle /
+     * silent-skip chunks contribute 0 ms which is correct. */
+    const double new_inference_ms = session->last_inference_ms + chunk->decode_ms;
+    ApplyRealtimeUpdate(update, new_inference_ms, true, chunk->is_final, session);
 }
 
 template <typename SessionLike>
@@ -1908,6 +1958,32 @@ Json BuildRealtimeJson(
     body["partial_text"] = session.partial_text;
     body["text"] = session.text;
     body["recent_segments"] = std::move(recent_segments);
+    /* VAD-segmented: the VAD-segmented worker populates a flat
+     * list of committed sentences on the session itself.  Mirror
+     * it into the JSON so the UI can render it as a transcript
+     * without depending on display_snapshot internals.  Older
+     * session types (HostCaptureSession) don't carry this field;
+     * for those we emit an empty array. */
+    Json segments_arr = Json::array();
+    const std::vector<std::string> * segments_ptr = nullptr;
+    if constexpr (std::is_same<SessionLike, RealtimeSessionSnapshot>::value) {
+        segments_ptr = &session.segments_text;
+    } else if constexpr (std::is_same<SessionLike, RealtimeSession>::value) {
+        segments_ptr = &session.segments_text;
+    }
+    if (segments_ptr) {
+        for (const std::string & s : *segments_ptr) {
+            segments_arr.push_back(s);
+        }
+    }
+    body["segments"] = std::move(segments_arr);
+    double current_sec = 0.0;
+    if constexpr (std::is_same<SessionLike, RealtimeSessionSnapshot>::value) {
+        current_sec = session.current_segment_audio_sec;
+    } else if constexpr (std::is_same<SessionLike, RealtimeSession>::value) {
+        current_sec = session.current_segment_audio_sec;
+    }
+    body["current_segment_audio_sec"] = current_sec;
     body["finalized_segment_count"] = session.display_snapshot.total_finalized_segments;
     body["live_stable_text"] = session.display_snapshot.live_stable_text;
     body["live_partial_text"] = session.display_snapshot.live_partial_text;
@@ -2079,6 +2155,14 @@ Status ParseServerArguments(int argc, const char * const argv[], ServerConfig * 
             ++index;
             continue;
         }
+        if (arg == "--quiet" || arg == "-q") {
+            /* Alias for --verbosity 0.  Production / supervised runs use
+             * this to silence the per-poll VAD / ingress fprintf spam
+             * while keeping fatal errors and the [ERROR]/[WARN] lines
+             * (those are unconditional stderr writes). */
+            config->verbosity = 0;
+            continue;
+        }
         if (arg == "--decoder-int8") {
             config->decoder_int8 = true;
             continue;
@@ -2126,7 +2210,9 @@ std::string BuildServerUsage(std::string_view program_name) {
     usage += "  --port <n>\n";
     usage += "  --ui-dir <dir>\n";
     usage += "  --threads <n>\n";
-    usage += "  --verbosity <n>\n";
+    usage += "  --verbosity <n>          0=silent (recommended for production),\n";
+    usage += "                           1=commit/summary, 2=per-poll, 3=raw\n";
+    usage += "  --quiet, -q              alias for --verbosity 0\n";
     usage += "  --temperature <float>  (default: auto, 0=greedy, >0=sampling)\n";
     usage += "  --decoder-int8           (decoder INT8: saves memory but DEGRADES quality:\n";
     usage += "                            language consistency drops, code-switch leakage,\n";
@@ -2229,6 +2315,384 @@ int RunServer(const ServerConfig & config) {
         return OkStatus();
     };
 
+    /* VAD-segmented decode loop.  Replaces the legacy
+     * qwen_transcribe_stream_live's rolling-decode path with a
+     * sentence-bounded one:
+     *
+     *   1. Maintain a per-session "current segment" audio buffer.
+     *   2. As the user speaks, copy new audio from the live buffer
+     *      into the segment buffer.  Run Silero VAD on the new audio
+     *      to track silence_run (number of consecutive silent frames,
+     *      1 frame = 32 ms = 512 samples at 16 kHz).
+     *   3. Commit the segment when EITHER:
+     *        (a) silence_run reaches 16 frames (≈ 500 ms) — the
+     *            speaker has paused between sentences, OR
+     *        (b) the segment audio reaches 40 s — safety cap for
+     *            continuous monologues so we never overflow the
+     *            encoder's 8s×5 = 40s context window.
+     *   4. Run qwen_transcribe_audio on the committed segment
+     *      (full offline decode, no rollback, no coalesce, no
+     *      partial).  Push the result to session->segments_text
+     *      and update the live_stable_text / recent_segments
+     *      display state.  Then reset for the next segment.
+     *
+     * This eliminates all rolling-decoder artifacts (mid-character
+     * cuts, model revisions, partial flickering, "1s pause not
+     * refreshing") because each segment is decoded exactly once
+     * with the full audio visible.  Cost is per-sentence latency
+     * = VAD silence + decode time ≈ 500ms + 700-1300ms = 1.2-1.8s,
+     * which the user has explicitly accepted. */
+    constexpr int kVadSegmentSilenceFrames = 10;          /* 10 × 50 ms poll = 500 ms */
+    constexpr int kVadSegmentMaxSamples = 40 * 16000;      /* 40 s safety cap */
+    constexpr int kVadSegmentPollMs = 50;                 /* poll live buffer every 50 ms */
+    constexpr float kVadSpeechProbThreshold = 0.35f;      /* match C-layer threshold */
+
+    auto RunVadSegmentedDecode = [&](qwen_ctx_t * live_ctx,
+                                     qwen_live_audio_t * live,
+                                     const std::shared_ptr<RealtimeSession> & session,
+                                     const std::string & forced_language) {
+        /* Set up Silero VAD (best effort: if it fails to load, the
+         * loop falls back to a pure 40 s timer, which is suboptimal
+         * but still gives stable output). */
+        qwen_silero_vad_t *vad = qwen_silero_vad_create(nullptr);
+        const bool vad_active = qwen_silero_vad_is_active(vad);
+        if (qwen_verbose >= 1) {
+            std::fprintf(stderr, "VAD-segmented: Silero VAD %s\n",
+                         vad_active ? "active" : "inactive (will use 40s timer only)");
+        }
+
+        /* Configure ctx for offline-style per-segment decode.  No
+         * streaming chunk cadence, no coalesce step, no partial. */
+        live_ctx->segment_sec = 0.0f;     /* never split inside a segment */
+        live_ctx->search_sec = 0.0f;
+        live_ctx->past_text_conditioning = 0;  /* each segment is independent */
+        live_ctx->stream_chunk_sec = 0.0f;
+        live_ctx->stream_max_new_tokens = 0;   /* no streaming cap */
+        if (qwen_set_force_language(live_ctx,
+                                    forced_language.empty() ? nullptr
+                                                            : forced_language.c_str()) != 0) {
+            std::lock_guard<std::mutex> lock(session->mu);
+            session->error = "unsupported language: " + forced_language;
+            qwen_silero_vad_destroy(vad);
+            return;
+        }
+
+        std::vector<float> segment_buffer;
+        segment_buffer.reserve(kVadSegmentMaxSamples * 2);
+        int64_t consumed_samples = 0;   /* total live-audio samples already pulled into segment_buffer */
+        int silence_run = 0;           /* number of consecutive silent VAD frames */
+        bool segment_active = false;   /* true between VAD speech-start and segment-end commit */
+        const int max_new_tokens = 64; /* per-segment cap; matches offline behavior */
+
+        auto commit_segment = [&](const char * reason) {
+            if (segment_buffer.empty()) {
+                silence_run = 0;
+                return;
+            }
+            const int n_samples = static_cast<int>(segment_buffer.size());
+            if (qwen_verbose >= 1) {
+                std::fprintf(stderr,
+                             "VAD-segmented: committing segment (%.2fs, reason=%s)\n",
+                             (double)n_samples / 16000.0, reason);
+            }
+            char * raw = qwen_transcribe_audio(live_ctx, segment_buffer.data(), n_samples);
+            if (raw != nullptr) {
+                std::string text(raw);
+                std::free(raw);
+                /* Trim trailing whitespace the model may emit. */
+                while (!text.empty() &&
+                       (text.back() == ' ' || text.back() == '\n' || text.back() == '\t')) {
+                    text.pop_back();
+                }
+                std::lock_guard<std::mutex> lock(session->mu);
+                if (!text.empty()) {
+                    session->segments_text.push_back(text);
+                    /* The current segment becomes the new live_stable
+                     * (the UI shows it in the "live" area until the
+                     * next segment starts).  Drain stable into recent
+                     * segments to mimic the Web Speech API pattern. */
+                    RealtimeTextUpdate update;
+                    update.committed = true;
+                    update.stable_text = text;
+                    update.partial_text.clear();
+                    update.text = text;
+                    session->stable_text = text;
+                    session->text_state.stable_text = text;
+                    session->text_state.last_text = text;
+                    session->text_state.last_decode_samples = session->total_samples;
+                    session->text_state.unstable_since_samples = session->total_samples;
+                    session->last_inference_ms = live_ctx->perf_total_ms;
+                    ApplyRealtimeUpdate(update, session->last_inference_ms,
+                                        true, false, session.get());
+                }
+            } else if (qwen_verbose >= 1) {
+                std::fprintf(stderr,
+                             "VAD-segmented: qwen_transcribe_audio returned null\n");
+            }
+            segment_buffer.clear();
+            silence_run = 0;
+            segment_active = false;
+            /* Reset the VAD's LSTM state on segment commit so a brief
+             * pre-segment noise burst doesn't bleed into the next
+             * segment's silence detection. */
+            if (vad_active) qwen_silero_vad_reset(vad);
+        };
+
+        /* Outer poll loop: drain new audio from the live buffer,
+         * run VAD, decide whether to commit.  50 ms poll is fine
+         * because we only need coarse sentence-end detection.
+         *
+         * CRITICAL: silence_run must also advance when *no* new
+         * audio arrives.  Otherwise, after a single burst of audio
+         * is fully drained, subsequent polls see take==0 and the
+         * VAD code never runs — silence_run stays 0 forever, and
+         * the segment never commits on a pause.  The fix: every
+         * poll, if the VAD is in "speech" state and we have not
+         * received new audio for >= 1 VAD frame, treat that as a
+         * single silent frame and increment silence_run.  This
+         * matches the C-level VAD fix in qwen_asr.c. */
+        int idle_polls = 0;  /* polls since last new audio */
+        while (true) {
+            /* Snapshot live state. */
+            int64_t live_n = 0;
+            int live_eof = 0;
+            {
+                LockLiveAudio(live);
+                live_n = live->n_samples;
+                live_eof = live->eof;
+                UnlockLiveAudio(live);
+            }
+
+            /* Drain any new audio into the segment buffer. */
+            if (live_n > consumed_samples) {
+                int64_t take = live_n - consumed_samples;
+                if (take > 0) {
+                    /* Diagnostic: peak in the source range BEFORE we
+                     * copy.  If src_peak > 0 but the destination peak
+                     * (computed below) is 0, the memcpy is broken. */
+                    float src_peak = 0.0f;
+                    LockLiveAudio(live);
+                    for (int64_t i = 0; i < take; ++i) {
+                        const float a = live->samples[consumed_samples + i];
+                        const float aa = a < 0 ? -a : a;
+                        if (aa > src_peak) src_peak = aa;
+                    }
+                    UnlockLiveAudio(live);
+
+                    /* Copy in chunks to avoid holding the lock for
+                     * the full memcpy; per call we cap at 32k samples
+                     * (≈ 2 s) to keep the lock window bounded.
+                     *
+                     * CRITICAL: resize() BEFORE memcpy().  std::vector
+                     * value-initializes new elements to 0 on grow, so
+                     * if we memcpy first and resize second, the resize
+                     * overwrites our data with zeros — exactly the
+                     * "src_peak=0.99 dst_post_copy=0.00" symptom. */
+                    constexpr int64_t kCopyChunk = 32000;
+                    int64_t copied = 0;
+                    const std::size_t buf_old_size = segment_buffer.size();
+                    while (copied < take) {
+                        int64_t want = take - copied;
+                        if (want > kCopyChunk) want = kCopyChunk;
+                        const std::size_t old_end = segment_buffer.size();
+                        segment_buffer.resize(old_end + static_cast<std::size_t>(want));
+                        LockLiveAudio(live);
+                        std::memcpy(segment_buffer.data() + old_end,
+                                    live->samples + (consumed_samples + copied),
+                                    static_cast<std::size_t>(want) * sizeof(float));
+                        UnlockLiveAudio(live);
+                        copied += want;
+                    }
+                    consumed_samples += take;
+
+                    /* Diagnostic 2: peak in the destination range,
+                     * computed IMMEDIATELY after the copy.  If this
+                     * is non-zero but the post-VAD peak (computed
+                     * later in this iteration) is 0, the segment
+                     * buffer is getting cleared between the copy
+                     * and the post-VAD peak check. */
+                    float dst_peak_post_copy = 0.0f;
+                    {
+                        const std::size_t dst_new = segment_buffer.size();
+                        for (std::size_t i = buf_old_size; i < dst_new; ++i) {
+                            const float a = segment_buffer[i];
+                            const float aa = a < 0 ? -a : a;
+                            if (aa > dst_peak_post_copy) dst_peak_post_copy = aa;
+                        }
+                    }
+
+                    if (qwen_verbose >= 2) {
+                        std::fprintf(stderr,
+                                     "VAD-segmented: src_peak=%.4f dst_post_copy=%.4f buf_old=%zu buf_new=%zu take=%lld\n",
+                                     (double)src_peak, (double)dst_peak_post_copy,
+                                     buf_old_size, segment_buffer.size(),
+                                     static_cast<long long>(take));
+                    }
+                    /* Compute peak amplitude of the new audio so
+                     * we can tell "VAD said silence because input
+                     * is silent" apart from "VAD said silence
+                     * because model is broken on real input".  This
+                     * is the first thing to check when VAD never
+                     * reports speech. */
+                    float peak = 0.0f;
+                    float sum_sq = 0.0f;
+                    const std::size_t new_tail = segment_buffer.size();
+                    const std::size_t new_tail_start = new_tail - static_cast<std::size_t>(take);
+                    for (std::size_t i = new_tail_start; i < new_tail; ++i) {
+                        float a = segment_buffer[i];
+                        if (a > peak) peak = a;
+                        if (a < -peak) peak = -a;
+                        sum_sq += a * a;
+                    }
+                    float rms = std::sqrt(sum_sq / static_cast<float>(take > 0 ? take : 1));
+
+                    /* Run VAD over the new samples (in 512-sample
+                     * frames, the silero_vad chunk size).  We process
+                     * the entire segment_buffer tail that we just
+                     * appended; the VAD maintains its own context
+                     * across calls.
+                     *
+                     * IMPORTANT: use int64_t for the math.  The
+                     * previous version used size_t and underflowed
+                     * on the first iteration (segment_buffer.size()
+                     * == 0, take > 0), which produced a huge
+                     * aligned_start that skipped the entire loop —
+                     * hence VAD never fired and silence_run was
+                     * always 0, so the only commit ever was at EOF. */
+                    if (vad_active) {
+                        const int frame = 512;
+                        int64_t tail_start = static_cast<int64_t>(segment_buffer.size()) - take;
+                        if (tail_start < 0) tail_start = 0;
+                        /* Align down to a 512-sample boundary so
+                         * we don't double-process samples the
+                         * prior iteration already saw. */
+                        int64_t aligned_start = (tail_start / frame) * frame;
+                        int64_t total = static_cast<int64_t>(segment_buffer.size());
+                        int frames_processed = 0;
+                        float last_prob = 0.0f;
+                        for (int64_t off = aligned_start + frame;
+                             off <= total; off += frame) {
+                            float prob = 0.0f;
+                            qwen_silero_vad_process(vad,
+                                                    segment_buffer.data() + (off - frame),
+                                                    frame, &prob);
+                            last_prob = prob;
+                            frames_processed++;
+                            if (prob >= kVadSpeechProbThreshold) {
+                                segment_active = true;
+                                silence_run = 0;
+                            } else {
+                                /* Only count silence if the segment is
+                                 * already active (a leading silent
+                                 * region shouldn't trigger a fake
+                                 * commit on an empty buffer). */
+                                if (segment_active) {
+                                    silence_run++;
+                                }
+                            }
+                        }
+                        /* Unconditional debug log every poll that
+                         * processes new audio.  We need this to
+                         * verify VAD is actually being called and
+                         * what prob it's returning.  Throttled to
+                         * once per ~10 frames to keep the log
+                         * readable. */
+                        static int debug_counter = 0;
+                        if (++debug_counter % 10 == 0) {
+                            std::fprintf(stderr,
+                                         "VAD-segmented: take=%lld frames=%d "
+                                         "active=%d silence_run=%d last_prob=%.3f "
+                                         "buf=%.2fs rms=%.4f peak=%.4f\n",
+                                         static_cast<long long>(take),
+                                         frames_processed,
+                                         segment_active ? 1 : 0,
+                                         silence_run,
+                                         last_prob,
+                                         static_cast<double>(segment_buffer.size()) / 16000.0,
+                                         rms, peak);
+                        }
+                    }
+                    idle_polls = 0;  /* reset: we got new audio */
+                } else {
+                    /* No new audio since last poll.  Track how long
+                     * we've been idle.  When the VAD has been in
+                     * "speech" state and the audio stream goes
+                     * silent (the speaker paused), this is the
+                     * case.  Treat each 50 ms poll after the audio
+                     * has gone quiet as one silent frame:
+                     * silence_run advances once per poll, so 16
+                     * polls (≈ 800 ms) trigger a commit.
+                     *
+                     * The poll granularity is 50 ms (kVadSegmentPollMs);
+                     * 16 polls = 800 ms, slightly looser than the
+                     * 512 ms of audio-based silence.  This is
+                     * intentional: the pause detection should be
+                     * generous on mic streams because a single
+                     * mid-word breath (200-300 ms) shouldn't
+                     * trigger a commit. */
+                    idle_polls++;
+                    if (vad_active && segment_active) {
+                        silence_run++;
+                    } else if (!vad_active && segment_active) {
+                        /* No VAD available: fall back to wall-clock
+                         * idle counting.  Convert idle_polls to
+                         * frame-equivalent silence (50 ms per poll,
+                         * 32 ms per frame → roughly 1.5 frames per
+                         * poll, but treat as 1 for the threshold to
+                         * avoid over-counting). */
+                        silence_run++;
+                    }
+                    if (qwen_verbose >= 2 && idle_polls % 5 == 0) {
+                        std::fprintf(stderr,
+                                     "VAD-segmented: idle_polls=%d silence_run=%d "
+                                     "active=%d buf=%.2fs\n",
+                                     idle_polls, silence_run,
+                                     segment_active ? 1 : 0,
+                                     static_cast<double>(segment_buffer.size()) / 16000.0);
+                    }
+                }
+            }
+
+            /* Update heartbeat (UI shows "Listening... X.Xs"). */
+            {
+                std::lock_guard<std::mutex> lock(session->mu);
+                session->current_segment_audio_sec =
+                    static_cast<double>(segment_buffer.size()) / 16000.0;
+            }
+
+            /* Decide whether to commit. */
+            bool should_commit = false;
+            const char * commit_reason = nullptr;
+            if (segment_active && silence_run >= kVadSegmentSilenceFrames) {
+                should_commit = true;
+                commit_reason = "vad_silence";
+            } else if (static_cast<int>(segment_buffer.size()) >= kVadSegmentMaxSamples) {
+                should_commit = true;
+                commit_reason = "40s_safety_cap";
+            }
+            if (should_commit) {
+                commit_segment(commit_reason);
+            }
+
+            /* Exit conditions: EOF and no in-flight segment to flush. */
+            if (live_eof) {
+                if (!segment_buffer.empty()) {
+                    commit_segment("eof");
+                }
+                break;
+            }
+
+            /* Sleep until next poll, with an early wake when new
+             * audio arrives.  We use a small fixed sleep (50 ms) —
+             * fine-grained early wake would only matter for the
+             * first 500 ms after the user stops talking, and the
+             * extra latency is acceptable. */
+            std::this_thread::sleep_for(std::chrono::milliseconds(kVadSegmentPollMs));
+        }
+
+        qwen_silero_vad_destroy(vad);
+    };
+
     auto StartRealtimeLiveWorker = [&](const std::shared_ptr<RealtimeSession> & session) -> Status {
         if (session == nullptr) {
             return Status(StatusCode::kInvalidArgument, "session must not be null");
@@ -2257,29 +2721,14 @@ int RunServer(const ServerConfig & config) {
             session,
             worker_ptr = worker.get(),
             live_ctx,
-            stream_chunk_sec,
-            stream_max_new_tokens,
             verbosity,
             temperature,
             forced_language,
-            &metrics]() {
+            &RunVadSegmentedDecode]() {
             qwen_verbose = verbosity;
-            live_ctx->segment_sec = 30.0f;
-            live_ctx->past_text_conditioning = 1;
-            live_ctx->stream_chunk_sec = stream_chunk_sec;
-            live_ctx->stream_max_new_tokens = stream_max_new_tokens;
             if (temperature >= 0.0f) {
                 live_ctx->decode_temperature = temperature;
             }
-
-            std::function<void(std::string_view)> token_callback = [&session](std::string_view piece) {
-                if (piece.empty()) {
-                    return;
-                }
-                std::lock_guard<std::mutex> lock(session->mu);
-                const std::string new_stable = session->stable_text + std::string(piece);
-                ApplyStableRealtimeCommit(session->total_samples, new_stable, session->last_inference_ms, false, session.get());
-            };
 
             if (qwen_set_prompt(live_ctx, nullptr) != 0) {
                 std::lock_guard<std::mutex> lock(session->mu);
@@ -2288,37 +2737,27 @@ int RunServer(const ServerConfig & config) {
                 qwen_free(live_ctx);
                 return;
             }
-            if (qwen_set_force_language(live_ctx, forced_language.empty() ? nullptr : forced_language.c_str()) != 0) {
-                std::lock_guard<std::mutex> lock(session->mu);
-                session->error = "unsupported realtime language: " + forced_language;
-                session->worker_done = true;
-                qwen_free(live_ctx);
-                return;
-            }
 
-            qwen_set_token_callback(live_ctx, ForwardTokenPiece, &token_callback);
-            char * raw = qwen_transcribe_stream_live(live_ctx, &worker_ptr->live);
-            const bool was_cancelled = qwen_was_cancelled(live_ctx) != 0;
-            qwen_set_token_callback(live_ctx, nullptr, nullptr);
+            /* VAD-segmented decode: replaces the legacy rolling
+             * qwen_transcribe_stream_live loop with a sentence-bounded
+             * one.  See RunVadSegmentedDecode above for details. */
+            RunVadSegmentedDecode(live_ctx, &worker_ptr->live, session, forced_language);
 
             {
                 std::lock_guard<std::mutex> lock(session->mu);
                 session->last_inference_ms = live_ctx->perf_total_ms;
-                if (raw != nullptr) {
-                    ApplyStableRealtimeCommit(session->total_samples, raw, live_ctx->perf_total_ms, true, session.get());
-                    session->finalized = true;
-                } else {
-                    if (session->error.empty()) {
-                        session->error = was_cancelled
-                            ? "live stream transcription cancelled"
-                            : "live stream transcription failed";
-                    }
-                    session->finalized = true;
+                if (session->error.empty()) {
+                    /* Mark the final segment as committed in display
+                     * state so the UI knows the last text is
+                     * finalized. */
+                    ApplyStableRealtimeCommit(session->total_samples,
+                                              session->stable_text,
+                                              session->last_inference_ms,
+                                              true, session.get());
                 }
+                session->finalized = true;
                 session->worker_done = true;
             }
-
-            std::free(raw);
             qwen_free(live_ctx);
         });
 
@@ -2369,19 +2808,18 @@ int RunServer(const ServerConfig & config) {
                 return;
             }
 
-            std::function<void(std::string_view)> token_callback = [&capture](std::string_view piece) {
-                if (piece.empty()) {
+            std::function<void(const qwen_stream_chunk_t *)> chunk_callback = [&capture](const qwen_stream_chunk_t * chunk) {
+                if (chunk == nullptr) {
                     return;
                 }
                 std::lock_guard<std::mutex> lock(capture->mu);
-                const std::string new_stable = capture->stable_text + std::string(piece);
-                ApplyStableRealtimeCommit(capture->total_samples, new_stable, capture->last_inference_ms, false, capture.get());
+                ApplyChunkRealtimeCommit(chunk, capture->total_samples, capture.get());
             };
 
-            qwen_set_token_callback(live_ctx, ForwardTokenPiece, &token_callback);
+            qwen_set_chunk_callback(live_ctx, ForwardStreamChunk, &chunk_callback);
             char * raw = qwen_transcribe_stream_live(live_ctx, &worker_ptr->live);
             const bool was_cancelled = qwen_was_cancelled(live_ctx) != 0;
-            qwen_set_token_callback(live_ctx, nullptr, nullptr);
+            qwen_set_chunk_callback(live_ctx, nullptr, nullptr);
 
             {
                 std::lock_guard<std::mutex> lock(capture->mu);
@@ -2464,7 +2902,26 @@ int RunServer(const ServerConfig & config) {
                                    const std::vector<float> & chunk,
                                    RealtimeSessionSnapshot * snapshot) -> Status {
         if (snapshot == nullptr) {
-            return Status(StatusCode::kInvalidArgument, "session snapshot output must not be null");
+            return Status(StatusCode::kInvalidArgument, "snapshot output must not be null");
+        }
+        /* Audio ingress diagnostic.  Throttled to once every 5 seconds
+         * per session so we don't spam the log on a 4 Hz send loop. */
+        {
+            static std::atomic<uint64_t> s_chunk_seq{0};
+            const uint64_t seq = s_chunk_seq.fetch_add(1);
+            if ((seq % 20U) == 0U && !chunk.empty()) {
+                float peak = 0.0f, sum_sq = 0.0f;
+                for (float a : chunk) {
+                    float aa = a < 0 ? -a : a;
+                    if (aa > peak) peak = aa;
+                    sum_sq += a * a;
+                }
+                const float rms = std::sqrt(sum_sq / static_cast<float>(chunk.size()));
+                std::fprintf(stderr,
+                             "[ingress] seq=%lu n=%zu peak=%.4f rms=%.4f session=%s\n",
+                             static_cast<unsigned long>(seq), chunk.size(), peak, rms,
+                             session_id.c_str());
+            }
         }
 
         std::shared_ptr<RealtimeSession> session;
@@ -2488,6 +2945,26 @@ int RunServer(const ServerConfig & config) {
         status = AppendManualLiveAudio(&worker->live, chunk.data(), chunk.size());
         if (!status.ok()) {
             return status;
+        }
+
+        /* Stash ingress peak/RMS on the session for the audio_diag
+         * endpoint to surface to the UI.  Computed in O(n) per chunk
+         * (a few microseconds for 1-3 KB chunks). */
+        {
+            float peak = 0.0f, sum_sq = 0.0f;
+            for (float a : chunk) {
+                float aa = a < 0 ? -a : a;
+                if (aa > peak) peak = aa;
+                sum_sq += a * a;
+            }
+            const float rms = std::sqrt(sum_sq / static_cast<float>(chunk.size()));
+            std::lock_guard<std::mutex> lock(session->mu);
+            session->last_ingress_peak = peak;
+            session->last_ingress_rms = rms;
+            if (peak > session->max_ingress_peak) {
+                session->max_ingress_peak = peak;
+            }
+            session->ingress_chunks += 1;
         }
 
         {
@@ -2570,6 +3047,14 @@ int RunServer(const ServerConfig & config) {
         }
         response.set_content(body, "application/javascript; charset=utf-8");
     });
+    server.Get("/live_monitor.js", [&](const HttpRequest &, HttpResponse & response) {
+        const std::string body = LoadTextFile(ui_dir / "live_monitor.js");
+        if (body.empty()) {
+            SetErrorResponse(response, Status(StatusCode::kInternal, "failed to load live_monitor.js"), 500);
+            return;
+        }
+        response.set_content(body, "application/javascript; charset=utf-8");
+    });
     server.Get("/style.css", [&](const HttpRequest &, HttpResponse & response) {
         const std::string body = LoadTextFile(ui_dir / "style.css");
         if (body.empty()) {
@@ -2584,6 +3069,21 @@ int RunServer(const ServerConfig & config) {
     });
     server.Get("/api/health", [&](const HttpRequest &, HttpResponse & response) {
         SetJsonResponse(response, Json::object({{"status", "ok"}}));
+    });
+    /* Debug endpoint: page JS POSTs DOM snapshots here, server keeps the
+     * latest in `debug_state` (a mutex-guarded std::string).  Curl
+     * /api/debug/get to read.  Used for live UI inspection during
+     * development only. */
+    static std::mutex debug_mu;
+    static std::string debug_state;
+    server.Post("/api/debug/state", [&](const HttpRequest & request, HttpResponse & response) {
+        std::lock_guard<std::mutex> lock(debug_mu);
+        debug_state = request.body;
+        SetJsonResponse(response, Json::object({{"ok", true}, {"len", request.body.size()}}));
+    });
+    server.Get("/api/debug/get", [&](const HttpRequest &, HttpResponse & response) {
+        std::lock_guard<std::mutex> lock(debug_mu);
+        response.set_content(debug_state, "application/json; charset=utf-8");
     });
     server.Get("/v1/models", [&](const HttpRequest &, HttpResponse & response) {
         Json payload;
@@ -3104,6 +3604,33 @@ int RunServer(const ServerConfig & config) {
         SetJsonResponse(response, BuildRealtimeJson(snapshot, false, true));
     });
 
+    /* Audio ingress diagnostic.  Surfaces last chunk's peak/RMS as
+     * recorded server-side.  The UI polls this every 100 ms to render
+     * an audio level meter that is impossible to miss, so we can
+     * distinguish "browser mic muted" from "transport broken" from
+     * "VAD model broken". */
+    server.Get("/api/realtime/audio_diag", [&](const HttpRequest & request, HttpResponse & response) {
+        const std::string session_id = request.get_param_value("session_id");
+        if (session_id.empty()) {
+            SetErrorResponse(response, Status(StatusCode::kInvalidArgument, "session_id is required"), 400);
+            return;
+        }
+        std::shared_ptr<RealtimeSession> session;
+        Status status = FindRealtimeSession(session_id, &session);
+        if (!status.ok()) {
+            SetErrorResponse(response, status, StatusToHttpCode(status));
+            return;
+        }
+        std::lock_guard<std::mutex> lock(session->mu);
+        Json body;
+        body["session_id"] = session_id;
+        body["peak"] = session->last_ingress_peak;
+        body["rms"] = session->last_ingress_rms;
+        body["max_peak"] = session->max_ingress_peak;
+        body["chunks"] = session->ingress_chunks;
+        SetJsonResponse(response, body);
+    });
+
     server.GetStream("/api/realtime/stream", [&](const HttpRequest & request, StreamWriter writer) {
         const std::string session_id = request.get_param_value("session_id");
         if (session_id.empty()) {
@@ -3317,7 +3844,9 @@ int RunServer(const ServerConfig & config) {
         SetJsonResponse(response, body);
     });
 
-    std::fprintf(stderr, "qasr_server listening on %s:%d\n", config.host.c_str(), config.port);
+    std::fprintf(stderr, "qasr_server listening on %s:%d (verbosity=%d%s)\n",
+                 config.host.c_str(), config.port, config.verbosity,
+                 config.verbosity == 0 ? ", quiet mode" : "");
     const bool ok = server.listen(config.host, config.port);
     {
         std::lock_guard<std::mutex> lock(maintenance_mu);

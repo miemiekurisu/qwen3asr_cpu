@@ -65,3 +65,15 @@ inline std::string EqualityFailureMessage(
                 #lhs, #rhs, lhs_value, rhs_value, __FILE__, __LINE__));                  \
         }                                                                                \
     } while (0)
+
+#define QASR_EQ(lhs, rhs) QASR_EXPECT_EQ(lhs, rhs)
+
+#define QASR_GE(lhs, rhs)                                                                \
+    do {                                                                                 \
+        const auto lhs_value = (lhs);                                                    \
+        const auto rhs_value = (rhs);                                                    \
+        if (!(lhs_value >= rhs_value)) {                                                 \
+            throw std::runtime_error(::qasr::test::EqualityFailureMessage(               \
+                #lhs ">=" #rhs, ">=", lhs_value, rhs_value, __FILE__, __LINE__));         \
+        }                                                                                \
+    } while (0)

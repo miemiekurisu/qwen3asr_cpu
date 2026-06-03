@@ -210,10 +210,86 @@ select {
   color: #93c5fd;
   text-decoration: underline dotted rgba(147, 197, 253, 0.6);
   text-underline-offset: 4px;
+  opacity: 0.72;
+  transition: opacity 120ms ease-out;
+}
+
+.output .partial.fading {
+  opacity: 0.32;
+}
+
+.output .partial::after {
+  content: "";
+  display: inline-block;
+  width: 0.4em;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -2px;
+  background: currentColor;
+  opacity: 0.45;
+  animation: liveCursor 1.0s steps(2, end) infinite;
+}
+
+@keyframes liveCursor {
+  0%, 49% { opacity: 0.45; }
+  50%, 100% { opacity: 0; }
 }
 
 .output .final {
   color: #fde68a;
+}
+
+/* ──────────────── Terminal waterfall ────────────────
+ * Each committed segment is a <div class="term-line done">.
+ * The "in progress" line is <div class="term-line typing">.
+ * The empty line waiting for the next segment is
+ * <div class="term-line cursor">.  All lines accumulate top-
+ * to-bottom; the user can scroll up to see history. */
+.output.terminal {
+  min-height: 320px;
+  max-height: 60vh;
+  overflow-y: auto;
+  font-size: 15px;
+  line-height: 1.7;
+}
+
+.term-line {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  min-height: 1.7em;
+}
+
+.term-line.done {
+  color: #e2e8f0;
+}
+
+.term-line.typing {
+  color: #fde68a;
+}
+
+.term-line.cursor {
+  color: #94a3b8;
+}
+
+.term-line .cursor-blink {
+  display: inline-block;
+  width: 0.55em;
+  height: 1em;
+  margin-left: 1px;
+  vertical-align: -2px;
+  background: currentColor;
+  opacity: 0.85;
+  animation: termBlink 1.05s steps(2, end) infinite;
+}
+
+.term-line.cursor.empty .cursor-blink {
+  margin-left: 0;
+}
+
+@keyframes termBlink {
+  0%, 49% { opacity: 0.9; }
+  50%, 100% { opacity: 0; }
 }
 
 .transcript-archive {

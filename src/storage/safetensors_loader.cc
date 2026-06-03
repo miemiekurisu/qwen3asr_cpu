@@ -4,8 +4,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <regex>
+#include <limits>
 #include <set>
+
+#include "qasr/runtime/model_bridge_internal.h"
 
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -206,7 +208,13 @@ Status SafeTensorIndex::Build(const MappedFile & file, SafeTensorIndex * out) {
     const auto * raw = static_cast<const uint8_t *>(file.data());
     std::uint64_t header_size = 0;
     std::memcpy(&header_size, raw, 8);
-    if (header_size > file.size() - 8 || header_size > 100 * 1024 * 1024) {
+    // Bounds check: file.size() >= 8 is already guaranteed by the early-return
+    // above.  Reject corrupt shards where header_size + 8 would overflow
+    // (uint64_t) or exceed the mapped file.  The 100 MiB upper bound keeps
+    // accidental JSON-parser blow-up bounded for benign-but-misformed files.
+    if (header_size > std::numeric_limits<std::uint64_t>::max() - 8 ||
+        header_size + 8 > static_cast<std::uint64_t>(file.size()) ||
+        header_size > 100ULL * 1024ULL * 1024ULL) {
         return Status(StatusCode::kInvalidArgument, "invalid safetensors header size");
     }
     // For now, just validate the structure is readable.
@@ -307,12 +315,10 @@ Status ValidateShardChecksums(const std::string & model_dir) {
     const std::string json_text((std::istreambuf_iterator<char>(input)),
                                  std::istreambuf_iterator<char>());
 
-    std::regex pattern(R"(model-[^"]+\.safetensors)");
-    std::set<std::string> indexed_files;
-    for (std::sregex_iterator it(json_text.begin(), json_text.end(), pattern), end;
-         it != end; ++it) {
-        indexed_files.insert(it->str());
-    }
+    // Use the shared O(n) scanner instead of a std::regex (which
+    // would instantiate several hundred KiB of generated state).
+    const std::set<std::string> indexed_files =
+        ExtractIndexedSafetensors(json_text);
 
     for (const auto & file_name : indexed_files) {
         if (!fs::exists(root / file_name)) {
