@@ -191,6 +191,12 @@ typedef struct {
     /* Separate lm_head (Aligner only; NULL when tied) */
     uint16_t *lm_head_bf16;    /* [classify_num, hidden] or NULL */
 
+    /* Suffix max-abs for argmax early termination.
+     * tok_embed_suffix_max[r] = max over rows r..N-1 of max(|W[row][k]|).
+     * Owned, NULL when compute failed. */
+    float *tok_embed_suffix_max;     /* [vocab_size] */
+    float *lm_head_suffix_max;       /* [classify_num] or NULL */
+
     /* Transformer layers */
     qwen_dec_layer_t layers[QWEN_MAX_DEC_LAYERS];
 
@@ -205,6 +211,48 @@ typedef struct {
 /* Called for each decoded text token during autoregressive generation.
  * 'piece' is the decoded token string (UTF-8). */
 typedef void (*qwen_token_cb)(const char *piece, void *userdata);
+
+/* Per-chunk snapshot delivered once after each streaming decode step.
+ *
+ * The C-side stream_impl already implements the industrial-grade
+ * rollback / tail-stable-promote / cross-chunk-dup-suppress pipeline.
+ * Most UIs need to surface BOTH the just-committed text and the still
+ * tentative tail in real time, but a per-token callback forces the
+ * caller to treat every token as "stable" (which is the source of the
+ * "front-end flicker" bug).  This callback gives the caller the natural
+ * unit of streaming display: one chunk's worth of new stable text plus
+ * the current tentative tail.
+ *
+ * Lifetime: 'stable_piece' and 'tentative_piece' are valid only for the
+ * duration of the callback.  If the receiver needs to keep them, it
+ * must copy.  The strings are owned by the streaming context.
+ *
+ * 'stable_piece'        UTF-8 text newly promoted to committed in this
+ *                        chunk (already stripped of any tentative tail
+ *                        and cross-chunk duplicates).  May be empty.
+ * 'tentative_piece'     UTF-8 text that the decoder is still working on
+ *                        and which may be revised or rolled back on the
+ *                        next chunk.  Empty on the final chunk (EOF).
+ * 'audio_cursor'        Total number of input samples consumed up to the
+ *                        end of this chunk (0 for non-live mode).
+ * 'decode_ms'           Wall time spent inside the decode for this chunk,
+ *                        excluding the background encoder overlap.
+ * 'is_first' / 'is_final' are set on the first and last chunk.
+ */
+typedef struct qwen_stream_chunk_t {
+    int chunk_index;
+    int is_first;
+    int is_final;
+    const char *stable_piece;
+    const char *tentative_piece;
+    int stable_token_count;
+    int tentative_token_count;
+    int64_t audio_cursor;
+    double decode_ms;
+} qwen_stream_chunk_t;
+
+typedef void (*qwen_stream_chunk_cb_t)(const qwen_stream_chunk_t *chunk,
+                                        void *userdata);
 
 /* Called to decide whether the current transcription should stop early.
  * Return non-zero to cancel the active run. */
@@ -275,6 +323,20 @@ typedef struct {
     qwen_token_cb token_cb;
     void *token_cb_userdata;
 
+    /* Per-chunk streaming callback (optional).  Fires once per chunk after
+     * the rollback / tail-stable / dup-suppress pipeline has decided which
+     * tokens are committed and which are still tentative.  See
+     * qwen_stream_chunk_t for fields.  Stable / tentative pieces are owned
+     * by the streaming context and only valid for the duration of the
+     * callback.  Reuse a single ctx-level scratch buffer to avoid per-
+     * chunk allocations. */
+    qwen_stream_chunk_cb_t chunk_cb;
+    void *chunk_cb_userdata;
+    char *chunk_stable_buf;       /* heap, grown on demand */
+    size_t chunk_stable_cap;
+    char *chunk_tentative_buf;
+    size_t chunk_tentative_cap;
+
     /* Cooperative cancellation callback (optional) */
     qwen_cancel_cb cancel_cb;
     void *cancel_cb_userdata;
@@ -299,6 +361,12 @@ typedef struct {
                                     * (legacy infinite wait, only EOF flushes the tail). */
     float stream_idle_flush_min_sec; /* minimum buffered audio (seconds) before an idle
                                     * timeout will trigger a partial-chunk decode. */
+    int stream_idle_flush_max_new_tokens; /* when an idle tail-flush decode fires
+                                    * (stream_idle_flush_ms timed out with no new audio),
+                                    * override the per-step max_new_tokens to this value
+                                    * to force the model to commit its current hypothesis
+                                    * instead of "imagining" more tokens. 0 disables
+                                    * (always use stream_max_new_tokens).  Default 16. */
     int past_text_conditioning;    /* 1=enable past text conditioning in -S/--stream (default: off).
                                     * In segmented mode, this also enables boundary cleanup/post-processing. */
     int skip_silence;              /* 1=drop long silent spans before transcription */
@@ -343,8 +411,20 @@ typedef struct {
 
     /* INT8 encoder acceleration (optional, via oneDNN) */
     int encoder_int8;              /* 0=disabled (default), 1=enabled */
-    void *int8_enc_layers;         /* qwen_int8_enc_layer_t[] or NULL */
+    void *int8_enc_layers;         /* qwen_int8_dec_layer_t[] or NULL */
     int n_int8_enc_layers;         /* number of valid entries */
+
+    /* Optional Silero VAD for endpoint detection.  NULL = disabled
+     * (use legacy timeout-based detection).  Owned by ctx; destroyed
+     * in qwen_free.  See qwen_silero_vad.h. */
+    struct qwen_silero_vad_t *vad;
+    /* Count of consecutive frames where VAD prob < threshold.  When
+     * this exceeds a small N, the speaker is considered to have
+     * stopped and the streaming loop forces a partial-chunk decode
+     * (tail-flush).  Reset on every chunk. */
+    int vad_silence_run;
+    /* Last speech prob reported by the VAD.  -1 = never updated. */
+    float vad_last_prob;
 } qwen_ctx_t;
 
 /* ========================================================================
@@ -383,6 +463,22 @@ qwen_ctx_t *qwen_load(const char *model_dir);
  * The source context must outlive the clone. */
 qwen_ctx_t *qwen_clone_shared(const qwen_ctx_t *src);
 
+/* Trim a UTF-8 byte string to the last complete character boundary.
+ * Scans backwards from the end; if the trailing bytes are a partial
+ * multi-byte sequence, truncates them.  Returns the new length in
+ * *out_len (or 0 if input is empty).  The string is mutated in place
+ * and re-terminated with NUL.  No-op for inputs <= 1 byte.
+ *
+ * Why we need this: Qwen3's BPE token boundaries do not align with
+ * UTF-8 character boundaries — a single Chinese character can span 1-3
+ * BPE tokens, each carrying a partial byte sequence.  When the decoder
+ * cuts mid-character (VAD early-stop, max_new_tokens cap, or recovery
+ * reset), the resulting string has a partial UTF-8 tail that renders
+ * as garbled bytes in the UI.  Trimming to the last complete char
+ * boundary removes the garbled tail and lets the next decode re-emit
+ * the rest of the character. */
+size_t qwen_utf8_truncate(char *s, size_t len);
+
 /* Free all resources */
 void qwen_free(qwen_ctx_t *ctx);
 
@@ -412,6 +508,21 @@ void qwen_set_cancel_callback(qwen_ctx_t *ctx, qwen_cancel_cb cb, void *userdata
 /* Set a callback invoked after each segment finishes in segmented transcription.
  * Set cb=NULL to disable. */
 void qwen_set_segment_callback(qwen_ctx_t *ctx, qwen_segment_cb cb, void *userdata);
+
+/* Set a per-chunk callback.  See qwen_stream_chunk_t above for semantics.
+ * This is the preferred way to drive a real-time UI: every chunk, the
+ * callback receives both the just-committed text and the still-tentative
+ * tail, so the UI can show a confirmed line + a "typing" line.
+ *
+ * If BOTH token_cb and chunk_cb are set, both are fired: token_cb once
+ * per token (legacy / debugging), chunk_cb once per chunk (UI).  The
+ * two are not redundant because the C-side rollback logic only operates
+ * at chunk boundaries; the per-token callback cannot know which tokens
+ * are "tentative" without the per-chunk view.
+ *
+ * Set cb=NULL to disable. */
+void qwen_set_chunk_callback(qwen_ctx_t *ctx,
+                             qwen_stream_chunk_cb_t cb, void *userdata);
 
 /* Returns non-zero if the most recent transcription exited due to cancellation. */
 int qwen_was_cancelled(const qwen_ctx_t *ctx);

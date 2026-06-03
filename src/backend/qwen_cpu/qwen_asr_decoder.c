@@ -175,6 +175,26 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
         }
     }
 
+    /* Build suffix_max for argmax early termination. Pure C, no SIMD —
+     * ~450ms single-thread for vocab=151936 hidden=1024 on a typical CPU.
+     * Falls back to NULL on alloc failure, in which case argmax runs
+     * unoptimised (correct but no early stop). */
+    dec->tok_embed_suffix_max = qwen_compute_suffix_max_bf16(
+        dec->tok_embeddings_bf16, cfg->vocab_size, cfg->dec_hidden);
+    if (!dec->tok_embed_suffix_max) {
+        fprintf(stderr, "decoder: suffix_max alloc failed (vocab=%d), argmax "
+                        "early termination disabled\n", cfg->vocab_size);
+    }
+
+    dec->lm_head_suffix_max = NULL;
+    if (dec->lm_head_bf16) {
+        dec->lm_head_suffix_max = qwen_compute_suffix_max_bf16(
+            dec->lm_head_bf16, cfg->classify_num, cfg->dec_hidden);
+        if (!dec->lm_head_suffix_max) {
+            fprintf(stderr, "decoder: lm_head suffix_max alloc failed\n");
+        }
+    }
+
     return 0;
 }
 
@@ -923,11 +943,17 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
                        ctx->rep_pen_ring_count > 0);
 
     if (need_logits) {
+        /* Compute L1_x once for argmax early-termination upper bound.
+         * Cheap (~5us scalar, sub-us AVX2) vs ~0.5-1ms argmax. */
+        float L1_x = qwen_l1_norm_f32(x, dim);
+
         /* Lazy-allocate logits buffer */
         if (!ctx->dec_logits_buf) {
             ctx->dec_logits_buf = (float *)malloc((size_t)cfg->vocab_size * sizeof(float));
             if (!ctx->dec_logits_buf)
-                return qwen_argmax_matvec_bf16(x, dec->tok_embeddings_bf16, dim, cfg->vocab_size);
+                return qwen_argmax_matvec_bf16(x, dec->tok_embeddings_bf16, dim,
+                                              cfg->vocab_size,
+                                              dec->tok_embed_suffix_max, 0.0f);
         }
 
         /* logits = x @ tok_embeddings^T */
@@ -1050,5 +1076,12 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
     }
 
     /* Greedy: streaming argmax (no logits buffer needed) */
-    return qwen_argmax_matvec_bf16(x, dec->tok_embeddings_bf16, dim, cfg->vocab_size);
+    {
+        /* #1 argmax early term disabled (L1_x=0): bound was too loose in
+         * practice, no measurable speedup, and a double-free crash was
+         * traced to the early-term path during long-audio streaming. */
+        return qwen_argmax_matvec_bf16(x, dec->tok_embeddings_bf16, dim,
+                                       cfg->vocab_size,
+                                       dec->tok_embed_suffix_max, 0.0f);
+    }
 }

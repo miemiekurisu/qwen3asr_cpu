@@ -12,9 +12,11 @@ const clearRealtime = document.getElementById("clearRealtime");
 const exportRealtimeText = document.getElementById("exportRealtimeText");
 const exportRealtimeJson = document.getElementById("exportRealtimeJson");
 const realtimeResult = document.getElementById("realtimeResult");
-const realtimeConfirmed = document.getElementById("realtimeConfirmed");
-const realtimeArchiveHint = document.getElementById("realtimeArchiveHint");
 const realtimeStatus = document.getElementById("realtimeStatus");
+const audioMeter = document.getElementById("audioMeter");
+const meterPre = document.getElementById("meterPre");
+const meterPost = document.getElementById("meterPost");
+const meterSrv = document.getElementById("meterSrv");
 
 const wavUpload = globalThis.QasrWavUpload;
 const MAX_ASYNC_UPLOAD_BYTES = 64 * 1024 * 1024;
@@ -35,11 +37,25 @@ let realtimeState = {
 
 let realtimeArchive = {
   sessionId: "",
-  confirmedText: "",
-  lastPayload: null,
+  /* Terminal-state machine for the live display.
+   * Each element: { state: 'done'|'typing'|'cursor', el, text }
+   * `done` lines are committed; `typing` is animating; `cursor`
+   * is the empty line that blinks while waiting. */
+  lines: [],
+  typewriterTimer: null,
+  lastSegmentCount: 0,
   finalized: false,
   updatedAt: "",
 };
+
+/* Pick up the initial cursor line rendered by index.html so the
+ * terminal state machine has a consistent starting point. */
+{
+  const initial = realtimeResult.querySelector(".term-line.cursor");
+  if (initial) {
+    realtimeArchive.lines.push({ state: "cursor", el: initial, text: "" });
+  }
+}
 
 let offlineState = {
   mode: "",
@@ -56,74 +72,175 @@ function ensureTranscriptFrame(element) {
   if (element._transcriptFrame) {
     return element._transcriptFrame;
   }
-
-  element.textContent = "";
-  const finalLine = document.createElement("span");
-  finalLine.className = "transcript-block final";
-
-  const historyLine = document.createElement("span");
-  historyLine.className = "transcript-block history";
-
-  const liveLine = document.createElement("span");
-  liveLine.className = "transcript-block live";
-  const stableLine = document.createElement("span");
-  stableLine.className = "stable";
-  const partialLine = document.createElement("span");
-  partialLine.className = "partial";
-  liveLine.append(stableLine, partialLine);
-
-  element.append(finalLine, historyLine, liveLine);
-  element._transcriptFrame = {
-    finalLine,
-    historyLine,
-    liveLine,
-    stableLine,
-    partialLine,
+  /* Terminal state lives in `realtimeArchive` (a closure-friendly
+   * global), not on the element — there is only ONE terminal display
+   * and it owns its state.  We still return a tiny frame object for
+   * the legacy apply/render plumbing to call into. */
+  return {
+    pendingData: null,
+    pendingFallback: null,
+    renderScheduled: false,
   };
-  return element._transcriptFrame;
 }
 
 function resetTranscriptFrame(element, fallback) {
-  element._transcriptFrame = null;
-  element.textContent = fallback;
+  /* The terminal display owns its own state machine.  For the realtime
+   * element, we reset the machine; for everything else (e.g. the
+   * offline result), we just clear the DOM. */
+  if (element === realtimeResult) {
+    if (realtimeArchive.typewriterTimer !== null) {
+      clearInterval(realtimeArchive.typewriterTimer);
+      realtimeArchive.typewriterTimer = null;
+    }
+    realtimeArchive.lines = [];
+    realtimeArchive.lastSegmentCount = 0;
+    realtimeArchive.finalized = false;
+    element.innerHTML = "";
+    const cursorLine = makeTermLine("cursor", "");
+    element.appendChild(cursorLine);
+    realtimeArchive.lines.push({ state: "cursor", el: cursorLine, text: "" });
+  } else {
+    element.textContent = fallback;
+  }
+}
+
+function makeTermLine(state, text) {
+  const div = document.createElement("div");
+  div.className = "term-line " + state;
+  if (state === "cursor" && !text) {
+    div.classList.add("empty");
+    const c = document.createElement("span");
+    c.className = "cursor-blink";
+    div.appendChild(c);
+  } else {
+    div.appendChild(document.createTextNode(text));
+  }
+  return div;
 }
 
 function renderTranscript(element, data, fallback) {
-  const recentSegments = Array.isArray(data?.recent_segments)
-    ? data.recent_segments.filter((segment) => typeof segment === "string" && segment)
-    : [];
-  const liveStable = data?.live_stable_text || "";
-  const livePartial = data?.live_partial_text || "";
-  const stable = data?.stable_text || "";
-  const partial = data?.partial_text || "";
-  const text = data?.text || "";
-  const hasSegmentView = recentSegments.length > 0 || liveStable || livePartial;
-  if (!hasSegmentView && !stable && !partial && !text) {
+  /* Coalesce: keep the latest data, schedule exactly one rAF if not
+   * already scheduled.  Multiple back-to-back renderTranscript() calls
+   * (one per HTTP response within 150-400 ms) all land on the same
+   * paint frame, eliminating visible stutter. */
+  if (data === null || data === undefined) {
     resetTranscriptFrame(element, fallback);
     return;
   }
-
   const frame = ensureTranscriptFrame(element);
+  frame.pendingData = data;
+  frame.pendingFallback = fallback;
+  if (frame.renderScheduled) {
+    return;
+  }
+  frame.renderScheduled = true;
+  requestAnimationFrame(() => {
+    frame.renderScheduled = false;
+    applyTranscriptRender(element, frame.pendingData, frame.pendingFallback);
+  });
+}
+
+function applyTranscriptRender(element, data, fallback) {
+  const segments = Array.isArray(data?.segments)
+    ? data.segments.filter((s) => typeof s === "string" && s)
+    : [];
+
+  /* On finalize, freeze the cursor line (no more typewriter) but keep
+   * the lines as-is so the user can read the final transcript. */
   if (data?.finalized) {
-    frame.finalLine.textContent = text || stable || recentSegments.join("\n");
-    frame.finalLine.style.display = "block";
-    frame.historyLine.textContent = "";
-    frame.historyLine.style.display = "none";
-    frame.stableLine.textContent = "";
-    frame.partialLine.textContent = "";
-    frame.liveLine.style.display = "none";
+    if (realtimeArchive.typewriterTimer !== null) {
+      clearInterval(realtimeArchive.typewriterTimer);
+      realtimeArchive.typewriterTimer = null;
+    }
+    realtimeArchive.finalized = true;
+    realtimeArchive.lastSegmentCount = segments.length;
     return;
   }
 
-  const fallbackStable = hasSegmentView ? "" : stable;
-  const fallbackPartial = hasSegmentView ? "" : (partial || text);
-  frame.finalLine.textContent = "";
-  frame.finalLine.style.display = "none";
-  frame.historyLine.textContent = recentSegments.join("\n");
-  frame.historyLine.style.display = recentSegments.length > 0 ? "block" : "none";
-  frame.stableLine.textContent = liveStable || fallbackStable;
-  frame.partialLine.textContent = livePartial || fallbackPartial;
-  frame.liveLine.style.display = (frame.stableLine.textContent || frame.partialLine.textContent) ? "block" : "none";
+  /* New segment committed by the server?  Animate the new text into
+   * the live line via the typewriter, then commit it to a `done`
+   * line and start a fresh `cursor` line. */
+  if (segments.length > realtimeArchive.lastSegmentCount) {
+    const newText = segments[segments.length - 1];
+    if (newText) {
+      animateNewSegment(element, newText);
+    }
+    realtimeArchive.lastSegmentCount = segments.length;
+  }
+
+  /* Auto-scroll to keep the live line in view. */
+  element.scrollTop = element.scrollHeight;
+}
+
+function animateNewSegment(element, text) {
+  /* Stop any in-flight typewriter (segmentation events should be
+   * rare; this is a safety net). */
+  if (realtimeArchive.typewriterTimer !== null) {
+    clearInterval(realtimeArchive.typewriterTimer);
+    realtimeArchive.typewriterTimer = null;
+  }
+
+  /* Find the bottom-most line.  If it's the cursor (blinking,
+   * empty), promote it to a typing line — the user has spoken and
+   * we're filling in the text.  If a previous segment's typing
+   * animation was somehow interrupted mid-stream, fall through and
+   * just append a fresh typing line. */
+  let typingEntry = null;
+  const lastLine = realtimeArchive.lines[realtimeArchive.lines.length - 1];
+  if (lastLine && lastLine.state === "cursor") {
+    /* Convert the cursor line into a typing line: strip the
+     * cursor-blink span, drop the "cursor"/"empty" classes, add
+     * "typing". */
+    const blink = lastLine.el.querySelector(".cursor-blink");
+    if (blink) blink.remove();
+    lastLine.el.classList.remove("cursor", "empty");
+    lastLine.el.classList.add("typing");
+    lastLine.state = "typing";
+    lastLine.el.textContent = "";
+    typingEntry = lastLine;
+  } else {
+    /* No cursor to convert (we were mid-typing, or somehow there
+     * was no cursor).  Append a fresh typing line. */
+    const typingLine = makeTermLine("typing", "");
+    element.appendChild(typingLine);
+    typingEntry = { state: "typing", el: typingLine, text: "" };
+    realtimeArchive.lines.push(typingEntry);
+  }
+
+  /* Typewriter: reveal one char at a time.  Speed adapts to length
+   * so short sentences aren't annoying and long ones are watchable:
+   *   <= 8 chars: 10ms/char (snappy)
+   *   8-30 chars: 18ms/char
+   *   >= 30 chars: 14ms/char (capped so a 60-char sentence still
+   *   finishes in under a second). */
+  const perCharMs = text.length <= 8 ? 10 : text.length <= 30 ? 18 : 14;
+  let i = 0;
+  const tick = () => {
+    if (i >= text.length) {
+      clearInterval(realtimeArchive.typewriterTimer);
+      realtimeArchive.typewriterTimer = null;
+      /* Typewriter complete: freeze the line as "done" and add a
+       * single new cursor line underneath.  This cursor is the
+       * ONLY place the blink animation is active — there is no
+       * cursor under an in-progress typing line. */
+      typingEntry.el.classList.remove("typing");
+      typingEntry.el.classList.add("done");
+      typingEntry.state = "done";
+      typingEntry.text = text;
+      const cursorLine = makeTermLine("cursor", "");
+      element.appendChild(cursorLine);
+      realtimeArchive.lines.push({ state: "cursor", el: cursorLine, text: "" });
+      element.scrollTop = element.scrollHeight;
+      return;
+    }
+    i += 1;
+    typingEntry.el.textContent = text.slice(0, i);
+    typingEntry.text = text.slice(0, i);
+  };
+  realtimeArchive.typewriterTimer = setInterval(tick, perCharMs);
+  /* Show the first character immediately so the user doesn't wait
+   * one tick to see anything. */
+  tick();
 }
 
 function hasOfflineJob() {
@@ -185,62 +302,44 @@ function countCodepoints(text) {
   return Array.from(text || "").length;
 }
 
-function extractConfirmedRealtimeText(data) {
-  if (!data || typeof data !== "object") {
-    return "";
-  }
-  if (data.finalized && typeof data.text === "string") {
-    return data.text;
-  }
-  if (typeof data.stable_text === "string") {
-    return data.stable_text;
-  }
-  return "";
+function extractConfirmedRealtimeText() {
+  /* Archive = locked terminal lines (state 'done').  The currently-
+   * typing line is excluded because it isn't a final commitment yet
+   * — it could still be replaced if a new segment commit arrives. */
+  return realtimeArchive.lines
+    .filter((l) => l.state === "done" && l.text && l.text.trim())
+    .map((l) => l.text)
+    .join(" ");
 }
 
 function updateRealtimeExportAvailability() {
-  const hasConfirmedText = Boolean(realtimeArchive.confirmedText.trim());
+  const hasConfirmedText = Boolean(extractConfirmedRealtimeText().trim());
   exportRealtimeText.disabled = !hasConfirmedText;
   exportRealtimeJson.disabled = !hasConfirmedText;
-}
-
-function renderRealtimeArchive(fallback) {
-  const confirmedText = realtimeArchive.confirmedText;
-  if (!confirmedText) {
-    realtimeConfirmed.textContent = fallback;
-    realtimeArchiveHint.textContent = realtimeState.sessionId
-      ? "已确定文本会随着稳定前缀推进保存在此处。"
-      : "已确定文本会保存在此处，停止后可导出。";
-    updateRealtimeExportAvailability();
-    return;
-  }
-
-  realtimeConfirmed.textContent = confirmedText;
-  const chars = countCodepoints(confirmedText);
-  realtimeArchiveHint.textContent = realtimeArchive.finalized
-    ? `已保留终稿 ${chars} 字，可导出 TXT 或 JSON。`
-    : `已保留已确定文本 ${chars} 字，实时主视图仍只显示近段与活尾。`;
-  updateRealtimeExportAvailability();
 }
 
 function resetRealtimeArchive(fallback = "尚无已确定文本") {
   realtimeArchive = {
     sessionId: "",
-    confirmedText: "",
-    lastPayload: null,
+    lines: [],
+    typewriterTimer: null,
+    lastSegmentCount: 0,
     finalized: false,
     updatedAt: "",
   };
-  renderRealtimeArchive(fallback);
+  /* Mirror the terminal reset on the DOM. */
+  realtimeResult.innerHTML = "";
+  const cursorLine = makeTermLine("cursor", "");
+  realtimeResult.appendChild(cursorLine);
+  realtimeArchive.lines.push({ state: "cursor", el: cursorLine, text: "" });
+  updateRealtimeExportAvailability();
 }
 
 function syncRealtimeArchive(data) {
   realtimeArchive.sessionId = data?.session_id || realtimeState.sessionId || realtimeArchive.sessionId;
-  realtimeArchive.confirmedText = extractConfirmedRealtimeText(data);
-  realtimeArchive.lastPayload = data || null;
   realtimeArchive.finalized = Boolean(data?.finalized);
   realtimeArchive.updatedAt = new Date().toISOString();
-  renderRealtimeArchive("尚无已确定文本");
+  updateRealtimeExportAvailability();
 }
 
 function buildRealtimeExportName(ext) {
@@ -262,7 +361,8 @@ function triggerDownload(filename, content, mimeType) {
 }
 
 function exportRealtimeTranscript(format) {
-  if (!realtimeArchive.confirmedText.trim()) {
+  const text = extractConfirmedRealtimeText();
+  if (!text.trim()) {
     realtimeStatus.textContent = "暂无可导出的已确定文本";
     return;
   }
@@ -270,7 +370,7 @@ function exportRealtimeTranscript(format) {
   if (format === "txt") {
     triggerDownload(
       buildRealtimeExportName("txt"),
-      realtimeArchive.confirmedText,
+      text,
       "text/plain;charset=utf-8",
     );
     realtimeStatus.textContent = "已导出 TXT";
@@ -281,8 +381,7 @@ function exportRealtimeTranscript(format) {
     exported_at: new Date().toISOString(),
     session_id: realtimeArchive.sessionId,
     finalized: realtimeArchive.finalized,
-    confirmed_text: realtimeArchive.confirmedText,
-    latest_response: realtimeArchive.lastPayload,
+    confirmed_text: text,
   };
   triggerDownload(
     buildRealtimeExportName("json"),
@@ -697,18 +796,15 @@ function downsampleTo16k(input, inputRate) {
     return input;
   }
   const ratio = inputRate / 16000;
+  // Decimate, not average-pool!  Average of N consecutive samples
+  // cancels the audio signal (speech oscillates around zero, summing
+  // N samples → ~0).  We must *pick* one sample per window, not
+  // average them.  Use the center of each window for a stable pick.
   const outputLength = Math.floor(input.length / ratio);
   const output = new Float32Array(outputLength);
   for (let index = 0; index < outputLength; index += 1) {
-    const start = Math.floor(index * ratio);
-    const end = Math.min(input.length, Math.floor((index + 1) * ratio));
-    let sum = 0;
-    let count = 0;
-    for (let sampleIndex = start; sampleIndex < end; sampleIndex += 1) {
-      sum += input[sampleIndex];
-      count += 1;
-    }
-    output[index] = count > 0 ? sum / count : 0;
+    const center = (index + 0.5) * ratio;
+    output[index] = input[Math.min(input.length - 1, Math.floor(center))];
   }
   return output;
 }
@@ -766,7 +862,7 @@ async function flushRealtimeChunk(force) {
     const lag = (wallElapsed - decodedDur).toFixed(1);
     const infMs = data.inference_ms !== undefined ? data.inference_ms.toFixed(0) : "-";
     const decodeLabel = data.decoded ? "已解码" : "待下轮";
-    realtimeStatus.textContent = `音频 ${audioDur}s / 已解码 ${decodedDur}s / 耗时 ${wallElapsed}s / 滞后 ${lag}s / 推理 ${infMs}ms / ${decodeLabel}`;
+    realtimeStatus.textContent = `音频 ${audioDur}s / 已解码 ${decodedDur}s / 耗时 ${wallElapsed}s / 滞后 ${lag}s / 推理 ${infMs}ms / ${decodeLabel} | mic 峰 ${(realtimeState.prePeak||0).toFixed(3)} → 16k 峰 ${(realtimeState.postPeak||0).toFixed(3)}`;
   } catch (error) {
     realtimeStatus.textContent = `失败：${error.message}`;
   } finally {
@@ -792,7 +888,7 @@ async function pollRealtimeStatus() {
     const lag = (wallElapsed - decodedDur).toFixed(1);
     const infMs = data.inference_ms !== undefined ? data.inference_ms.toFixed(0) : "-";
     const decodeLabel = data.decoded ? "已解码" : "待下轮";
-    realtimeStatus.textContent = `音频 ${audioDur}s / 已解码 ${decodedDur}s / 耗时 ${wallElapsed}s / 滞后 ${lag}s / 推理 ${infMs}ms / ${decodeLabel}`;
+    realtimeStatus.textContent = `音频 ${audioDur}s / 已解码 ${decodedDur}s / 耗时 ${wallElapsed}s / 滞后 ${lag}s / 推理 ${infMs}ms / ${decodeLabel} | mic 峰 ${(realtimeState.prePeak||0).toFixed(3)} → 16k 峰 ${(realtimeState.postPeak||0).toFixed(3)}`;
   } catch (error) {
     realtimeStatus.textContent = `失败：${error.message}`;
   }
@@ -825,23 +921,76 @@ async function startRealtimeCapture() {
       sessionId: sessionData.session_id,
       sendTimer: window.setInterval(() => flushRealtimeChunk(false), 400),
       pollTimer: window.setInterval(() => pollRealtimeStatus(), 150),
+      meterTimer: window.setInterval(() => updateAudioMeter(), 100),
       sending: false,
       pending: [],
+      prePeak: 0,
+      preRms: 0,
+      postPeak: 0,
+      postRms: 0,
       sampleRate: audioContext.sampleRate,
       startedAt: performance.now(),
     };
+    audioMeter.style.display = "block";
     resetRealtimeArchive("实时转写中，已确定文本会保存在此处。");
     realtimeArchive.sessionId = sessionData.session_id;
     updateRealtimeExportAvailability();
 
     processor.onaudioprocess = (event) => {
       const channel = event.inputBuffer.getChannelData(0);
+      /* Diagnostic: track peak/RMS at capture time, pre-downsample.
+       * If pre_peak is non-zero but post_peak is zero, the bug is in
+       * downsampleTo16k.  If both are zero, the bug is upstream
+       * (mic muted, wrong device, ScriptProcessor quirk). */
+      let pre_peak = 0;
+      let pre_sum = 0;
+      for (let i = 0; i < channel.length; i++) {
+        const a = channel[i] < 0 ? -channel[i] : channel[i];
+        if (a > pre_peak) pre_peak = a;
+        pre_sum += channel[i] * channel[i];
+      }
+      realtimeState.prePeak = Math.max(realtimeState.prePeak || 0, pre_peak);
+      realtimeState.preRms = Math.sqrt(pre_sum / channel.length);
       const downsampled = downsampleTo16k(channel, realtimeState.sampleRate);
       const pcm = floatToPcm16(downsampled);
+      let post_peak = 0;
+      let post_sum = 0;
+      for (let i = 0; i < downsampled.length; i++) {
+        const a = downsampled[i] < 0 ? -downsampled[i] : downsampled[i];
+        if (a > post_peak) post_peak = a;
+        post_sum += downsampled[i] * downsampled[i];
+      }
+      realtimeState.postPeak = Math.max(realtimeState.postPeak || 0, post_peak);
+      realtimeState.postRms = Math.sqrt(post_sum / downsampled.length);
       // Push the typed-array chunk as-is. Spreading (push(...pcm)) would box
       // every Int16 sample into a JS Number, churning the GC at audio rate.
       realtimeState.pending.push(pcm);
     };
+
+    function updateAudioMeter() {
+      if (!realtimeState) return;
+      const pre = realtimeState.prePeak || 0;
+      const post = realtimeState.postPeak || 0;
+      meterPre.textContent = pre.toFixed(3);
+      meterPost.textContent = post.toFixed(3);
+      meterPre.style.color = pre > 0.01 ? "#0a0" : "#c00";
+      meterPost.style.color = post > 0.01 ? "#0a0" : "#c00";
+      /* Poll the server-side ingress diag endpoint.  Use a fire-and-
+       * forget fetch; failure is fine (server may have restarted).
+       * max_peak 是全程最大, 不会因为末尾静音就掉到 0. */
+      if (realtimeState.sessionId) {
+        fetch(`/api/realtime/audio_diag?session_id=${encodeURIComponent(realtimeState.sessionId)}`)
+          .then(r => r.json())
+          .then(d => {
+            const p = typeof d.max_peak === "number" ? d.max_peak : d.peak;
+            if (typeof p === "number") {
+              meterSrv.textContent = p.toFixed(3);
+              meterSrv.style.color = p > 0.01 ? "#0a0" : "#c00";
+            }
+          })
+          .catch(() => {});
+      }
+    }
 
     source.connect(processor);
     processor.connect(audioContext.destination);

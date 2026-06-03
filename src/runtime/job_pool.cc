@@ -33,19 +33,43 @@ void JobPool::Shutdown() {
       w.join();
     }
   }
+  // Wake any pending WaitForIdle callers and let them observe idle.
+  {
+    std::lock_guard<std::mutex> lock(idle_mu_);
+    idle_cv_.notify_all();
+  }
 }
 
 std::int32_t JobPool::queue_size() const {
   return queue_.size();
 }
 
+bool JobPool::WaitForIdle(std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> lock(idle_mu_);
+  return idle_cv_.wait_for(lock, timeout, [this]() {
+    return shutdown_.load() || queue_.pending_count() == 0;
+  });
+}
+
 void JobPool::WorkerLoop() {
+  // We must block on the queue's "not empty" signal, not poll
+  // TryDequeue, otherwise all workers may exit if the queue is empty
+  // when the thread starts up (e.g. on a freshly-constructed pool).
   TaskItem item;
-  while (queue_.TryDequeue(&item)) {
+  while (queue_.WaitForItem(&item)) {
     if (item.work) {
       item.work();
     }
+    queue_.NotifyCompleted();
+    // Wake WaitForIdle: the predicate re-checks pending_count() and
+    // can now observe zero.
+    {
+      std::lock_guard<std::mutex> lock(idle_mu_);
+      idle_cv_.notify_all();
+    }
   }
+  // Reached only on shutdown.  Shutdown's notify_all on the queue's
+  // not_empty_ condition variable will wake us from WaitForItem.
 }
 
 }  // namespace qasr

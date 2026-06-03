@@ -53,17 +53,19 @@
             <button id="exportRealtimeText" class="ghost" type="button" disabled>导出 TXT</button>
             <button id="exportRealtimeJson" class="ghost" type="button" disabled>导出 JSON</button>
           </div>
-          <p id="realtimeStatus" class="hint">未开始</p>
-          <pre id="realtimeResult" class="output">尚无结果</pre>
-          <div class="stack transcript-archive">
-            <p id="realtimeArchiveHint" class="hint">已确定文本会保存在此处，停止后可导出。</p>
-            <pre id="realtimeConfirmed" class="output archive">尚无已确定文本</pre>
+          <p id="realtimeStatus" class="hint" style="font-size:14px;font-weight:bold;color:#333;background:#fffbe6;padding:6px 10px;border:1px solid #f0c000;border-radius:4px;">未开始 — 点击「启动」开始实时转写</p>
+          <div id="audioMeter" style="display:none;margin:6px 0;padding:6px 10px;background:#f5f5f5;border:1px solid #ccc;border-radius:4px;font-family:monospace;font-size:13px;">
+            <span style="color:#888">mic 48k:</span> <span id="meterPre" style="color:#c00;font-weight:bold;">0.000</span>
+            <span style="color:#888;margin-left:12px">→ 16k:</span> <span id="meterPost" style="color:#c00;font-weight:bold;">0.000</span>
+            <span style="color:#888;margin-left:12px">→ server peak:</span> <span id="meterSrv" style="color:#c00;font-weight:bold;">-</span>
           </div>
+          <div id="realtimeResult" class="output terminal"><div class="term-line cursor"><span class="cursor-blink">▌</span></div></div>
         </div>
       </article>
     </section>
   </main>
   <script src="/wav_stream_upload.js"></script>
+  <script src="/live_monitor.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

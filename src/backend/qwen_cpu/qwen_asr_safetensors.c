@@ -214,7 +214,11 @@ safetensors_file_t *safetensors_open(const char *path) {
 
     uint64_t header_size = 0;
     memcpy(&header_size, data, 8);
-    if (header_size > file_size - 8) {
+    /* Bounds check: `file_size` is guaranteed >= 8 by the early-return
+     * above, so the subtraction is safe.  Reject obviously corrupt or
+     * adversarial shards where header_size + 8 would overflow or exceed
+     * the mapped file. */
+    if (header_size > UINT64_MAX - 8 || header_size + 8 > (uint64_t)file_size) {
         UnmapViewOfFile(data); CloseHandle(hMap); CloseHandle(hFile); return NULL;
     }
 
@@ -251,7 +255,12 @@ safetensors_file_t *safetensors_open(const char *path) {
 
     uint64_t header_size = 0;
     memcpy(&header_size, data, 8);
-    if (header_size > file_size - 8) { munmap(data, file_size); return NULL; }
+    /* Bounds check: `file_size` is guaranteed >= 8 by the early-return
+     * above.  Reject obviously corrupt shards where header_size + 8
+     * would overflow or exceed the mapped file. */
+    if (header_size > UINT64_MAX - 8 || header_size + 8 > (uint64_t)file_size) {
+        munmap(data, file_size); return NULL;
+    }
 
     safetensors_file_t *sf = calloc(1, sizeof(safetensors_file_t));
     if (!sf) { munmap(data, file_size); return NULL; }
@@ -372,13 +381,13 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
         return ms;
     }
 
-    /* Try multi-shard: model-00001-of-NNNNN.safetensors */
-    for (int i = 1; i <= SAFETENSORS_MAX_SHARDS; i++) {
-        snprintf(path, sizeof(path), "%s/model-%05d-of-%05d.safetensors",
-                 model_dir, i, i); /* placeholder - need to detect count */
-        /* We don't know the total count yet, try common patterns */
-        break;
-    }
+    /* Try multi-shard: shard enumeration is performed by the directory
+     * scan below.  An earlier version of this function attempted a
+     * single-iteration probe of "model-NNNNN-of-NNNNN.safetensors" using
+     * a placeholder total shard count, but the probe produced a string
+     * that was immediately overwritten and never consumed.  Removing it
+     * has no observable effect on any valid input. */
+    (void)path;  /* `path` is the shared scratch buffer reused below. */
 
     /* Scan directory for shard files */
     char shard_names[SAFETENSORS_MAX_SHARDS][256];
