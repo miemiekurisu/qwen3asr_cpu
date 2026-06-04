@@ -37,9 +37,10 @@ $env:PATH = "D:\dev\OpenBLAS\bin;$env:PATH"
 
 1. 校验系统与编译工具链（g++ ≥ 10 / cmake ≥ 3.21 / ninja / pkg-config / ffmpeg / git / curl），缺失会提示安装命令并退出。
 2. 检查 OpenBLAS：先看 `${QASR_DEPS_DIR:-/opt/qasr-deps}` 与系统 pkg-config；没有则尝试 `apt-get install -y libopenblas-dev`；再没有则从 GitHub 拉 `${QASR_OPENBLAS_TAG:-v0.3.30}` 源码编译到 `${QASR_DEPS_DIR}`；都失败会打印手动步骤并退出。
-3. 探测 `Qwen3-ASR-0.6B` 模型（`$QASR_MODEL_DIR` → `--model-dir` → `~/.cache/huggingface/.../snapshots/*/model.safetensors` → `./models/<repo>`），缺失会提示三种下载方式。
-4. 探测 `testfile/*.wav`（缺失提示 `tools/aishell_fetch.py`）。
-5. 默认 `clean` 删除 `build/`，然后 `cmake -S/-B/-G Ninja` + `cmake --build` + `ctest`。
+3. 检查 ONNX Runtime（Silero VAD 依赖，preset `linux-openblas` 默认启用）：先看 `$QASR_ONNXRUNTIME_ROOT` / `${QASR_DEPS_DIR}/onnxruntime`；没有则复用相邻 `paddle_on_cpu/third_party/onnxruntime-linux-x64-*/`；再没有则从 GitHub releases 下 `v${QASR_ONNXRUNTIME_VERSION:-1.20.1}` 的预编译 `.tgz` 解到 `${QASR_DEPS_DIR}/onnxruntime`。找不到时 **不会**中断构建——Silero VAD 退化为 stub 模式（VAD 段式仍工作但不会自动 commit, 只在 40s 强制 cap 或 `eof` 时 commit）。
+4. 探测 `Qwen3-ASR-0.6B` 模型（`$QASR_MODEL_DIR` → `--model-dir` → `~/.cache/huggingface/.../snapshots/*/model.safetensors` → `./models/<repo>`），缺失会提示三种下载方式。
+5. 探测 `testfile/*.wav`（缺失提示 `tools/aishell_fetch.py`）。
+6. 默认 `clean` 删除 `build/`，然后 `cmake -S/-B/-G Ninja` + `cmake --build` + `ctest`。
 
 ```bash
 tools/build_linux.sh                       # 默认 clean + build + test
@@ -51,7 +52,7 @@ tools/build_linux.sh --model-dir /data/Qwen3-ASR-0.6B
 tools/build_linux.sh --no-dep --no-apt     # 离线：禁止自动装包/下载
 ```
 
-常用环境变量：`QASR_DEPS_DIR`（默认 `/opt/qasr-deps`）、`QASR_BUILD_DIR`（默认 `build/linux-openblas`）、`QASR_MODEL_DIR`、`QASR_OPENBLAS_TAG`（默认 `v0.3.30`）、`QASR_HF_CACHE`（默认 `~/.cache/huggingface`）、`QASR_JOBS`（默认 `nproc`）、`QASR_APT_MIRROR`。`tools/build_linux.sh --help` 看完整选项。
+常用环境变量：`QASR_DEPS_DIR`（默认 `/opt/qasr-deps`）、`QASR_BUILD_DIR`（默认 `build/linux-openblas`）、`QASR_MODEL_DIR`、`QASR_OPENBLAS_TAG`（默认 `v0.3.30`）、`QASR_HF_CACHE`（默认 `~/.cache/huggingface`）、`QASR_JOBS`（默认 `nproc`）、`QASR_APT_MIRROR`、`QASR_ONNXRUNTIME_ROOT`（手装 ONNX Runtime 时用）、`QASR_ONNXRUNTIME_VERSION`（默认 `1.20.1`）。`tools/build_linux.sh --help` 看完整选项。
 
 手动等价流程（脚本不可用时）：
 

@@ -31,7 +31,10 @@
     {
       "name": "linux-openblas",
       "inherits": "base",
-      "description": "Linux / OpenBLAS"
+      "description": "Linux / OpenBLAS with Silero VAD",
+      "cacheVariables": {
+        "QASR_ENABLE_SILERO_VAD": "ON"
+      }
     },
     {
       "name": "linux-openblas-asan",
