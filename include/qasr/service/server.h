@@ -34,6 +34,16 @@ struct OpenAiRealtimeRequest {
 
 struct ServerConfig {
     std::string model_dir;
+    /* Model used by the realtime / host-capture worker.  Empty means
+     * "same as model_dir" — the SharedAsrModel instance is then shared
+     * between batch and realtime paths, so loading the same model
+     * twice is avoided.  When set to a different path, a second
+     * SharedAsrModel is loaded for realtime (typical use: 0.6B for
+     * realtime, 1.7B for batch).  This is the per-feature model
+     * override the operator asked for: batch and realtime can use
+     * the same model (default) or independent models for quality
+     * / memory / latency trade-offs. */
+    std::string realtime_model_dir;
     std::string host = "127.0.0.1";
     std::string ui_dir = "ui";
     std::int32_t port = 8080;

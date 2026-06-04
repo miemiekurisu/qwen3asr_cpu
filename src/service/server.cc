@@ -2081,7 +2081,22 @@ Status ValidateServerConfig(const ServerConfig & config) {
     if (!fs::exists(fs::path(config.ui_dir) / "style.css")) {
         return Status(StatusCode::kNotFound, "ui_dir is missing style.css");
     }
-    return ValidateModelDirectory(config.model_dir);
+    if (Status status = ValidateModelDirectory(config.model_dir); !status.ok()) {
+        return status;
+    }
+    /* realtime_model_dir is optional; if set, it must point to a valid
+     * Qwen3-ASR model directory too.  An empty string means "use the
+     * same model as batch". */
+    if (!config.realtime_model_dir.empty() &&
+        config.realtime_model_dir != config.model_dir) {
+        if (Status status = ValidateModelDirectory(config.realtime_model_dir);
+            !status.ok()) {
+            return Status(
+                status.code(),
+                "realtime_model_dir invalid: " + status.message());
+        }
+    }
+    return OkStatus();
 }
 
 Status ParseServerArguments(int argc, const char * const argv[], ServerConfig * config, bool * show_help) {
@@ -2108,6 +2123,16 @@ Status ParseServerArguments(int argc, const char * const argv[], ServerConfig * 
                 return status;
             }
             config->model_dir = value;
+            ++index;
+            continue;
+        }
+        if (arg == "--realtime-model-dir") {
+            const char * value = nullptr;
+            Status status = RequireValue(argc, argv, index, "--realtime-model-dir", &value);
+            if (!status.ok()) {
+                return status;
+            }
+            config->realtime_model_dir = value;
             ++index;
             continue;
         }
@@ -2221,6 +2246,10 @@ std::string BuildServerUsage(std::string_view program_name) {
     std::string usage;
     usage += std::string(program_name);
     usage += " --model-dir <dir> [options]\n";
+    usage += "  --model-dir <dir>          (batch model, required)\n";
+    usage += "  --realtime-model-dir <dir> (realtime/host-capture model; default = same as --model-dir.\n";
+    usage += "                              If set to a different path, a second model is loaded.\n";
+    usage += "                              Typical use: 0.6B for realtime, 1.7B for batch.)\n";
     usage += "  --host <ip>\n";
     usage += "  --port <n>\n";
     usage += "  --ui-dir <dir>\n";
@@ -2591,12 +2620,66 @@ int RunServer(const ServerConfig & config) {
         return 1;
     }
 
-    SharedAsrModel model;
-    const Status load_status = model.Load(config);
-    if (!load_status.ok()) {
-        std::fprintf(stderr, "model load failed: %s\n", load_status.message().c_str());
-        return 1;
+    /* Load one or two models.
+     *
+     * The realtime / host-capture paths always use a per-session
+     * CLONE of the underlying model (CreateRealtimeClone on a
+     * SharedAsrModel) so that batch and realtime can run in parallel
+     * without contending on the master ctx_'s mutex.  The batch
+     * VAD-segmented path ALSO uses CreateRealtimeClone on a separate
+     * SharedAsrModel — it could share the realtime model, but doing
+     * so would make a long batch job block all live transcription.
+     *
+     * So we always need a "batch model" (used by sync/async TranscribeFile
+     * and the batch VAD-segmented clone) and a "realtime model" (used
+     * by the realtime worker).  When both paths are configured with
+     * the same --model-dir, we share the SharedAsrModel instance so
+     * the weights are loaded only once; otherwise two instances are
+     * loaded, each holding its own copy of the weights in memory. */
+    const std::string batch_dir = config.model_dir;
+    const std::string realtime_dir =
+        config.realtime_model_dir.empty() ? config.model_dir
+                                           : config.realtime_model_dir;
+    const bool share_model = (batch_dir == realtime_dir);
+
+    std::unique_ptr<SharedAsrModel> batch_model_storage;
+    std::unique_ptr<SharedAsrModel> realtime_model_storage;
+    if (share_model) {
+        batch_model_storage = std::make_unique<SharedAsrModel>();
+        const Status load_status = batch_model_storage->Load(config);
+        if (!load_status.ok()) {
+            std::fprintf(stderr, "model load failed: %s\n",
+                         load_status.message().c_str());
+            return 1;
+        }
+    } else {
+        /* Load each model with its own ServerConfig (only model_dir
+         * and the per-model INT8 / temperature knobs differ).  All
+         * other ServerConfig fields (port, host, ui_dir, ...) are
+         * shared at RunServer scope and don't affect Load(). */
+        ServerConfig batch_cfg = config;
+        batch_cfg.model_dir = batch_dir;
+        batch_model_storage = std::make_unique<SharedAsrModel>();
+        const Status batch_load = batch_model_storage->Load(batch_cfg);
+        if (!batch_load.ok()) {
+            std::fprintf(stderr, "batch model load failed (%s): %s\n",
+                         batch_dir.c_str(), batch_load.message().c_str());
+            return 1;
+        }
+        ServerConfig realtime_cfg = config;
+        realtime_cfg.model_dir = realtime_dir;
+        realtime_model_storage = std::make_unique<SharedAsrModel>();
+        const Status realtime_load = realtime_model_storage->Load(realtime_cfg);
+        if (!realtime_load.ok()) {
+            std::fprintf(stderr, "realtime model load failed (%s): %s\n",
+                         realtime_dir.c_str(),
+                         realtime_load.message().c_str());
+            return 1;
+        }
     }
+    SharedAsrModel *const batch_model = batch_model_storage.get();
+    SharedAsrModel *const realtime_model =
+        share_model ? batch_model : realtime_model_storage.get();
 
     const std::string served_model_id = ResolveServedModelId(config.model_dir);
     const fs::path ui_dir(config.ui_dir);
@@ -3061,7 +3144,7 @@ int RunServer(const ServerConfig & config) {
         }
         worker->live_ready = true;
 
-        qwen_ctx_t * live_ctx = model.CreateRealtimeClone();
+        qwen_ctx_t * live_ctx = realtime_model->CreateRealtimeClone();
         if (live_ctx == nullptr) {
             DestroyManualLiveAudio(&worker->live);
             return Status(StatusCode::kInternal, "failed to clone realtime model context");
@@ -3069,8 +3152,8 @@ int RunServer(const ServerConfig & config) {
 
         const float stream_chunk_sec = RealtimeStreamChunkSeconds(realtime_policy);
         const int stream_max_new_tokens = RealtimeStreamMaxNewTokens(realtime_policy);
-        const int verbosity = model.verbosity();
-        const float temperature = model.temperature();
+        const int verbosity = realtime_model->verbosity();
+        const float temperature = realtime_model->temperature();
         const std::string forced_language = session->language;
 
         worker->thread = std::thread([
@@ -3133,7 +3216,7 @@ int RunServer(const ServerConfig & config) {
         }
         worker->live_ready = true;
 
-        qwen_ctx_t * live_ctx = model.CreateRealtimeClone();
+        qwen_ctx_t * live_ctx = realtime_model->CreateRealtimeClone();
         if (live_ctx == nullptr) {
             DestroyManualLiveAudio(&worker->live);
             return Status(StatusCode::kInternal, "failed to clone capture model context");
@@ -3141,7 +3224,7 @@ int RunServer(const ServerConfig & config) {
 
         const float stream_chunk_sec = RealtimeStreamChunkSeconds(realtime_policy);
         const int stream_max_new_tokens = RealtimeStreamMaxNewTokens(realtime_policy);
-        const int verbosity = model.verbosity();
+        const int verbosity = realtime_model->verbosity();
 
         worker->thread = std::thread([
             capture,
@@ -3513,7 +3596,7 @@ int RunServer(const ServerConfig & config) {
         ModelDecodeOptions decode;
         decode.prompt = options.prompt;
         decode.language = options.language;
-        const AsrRunResult result = model.TranscribeFile(prepared.wav_path, decode);
+        const AsrRunResult result = batch_model->TranscribeFile(prepared.wav_path, decode);
         CleanupPreparedAudio(&prepared);
         if (!result.status.ok()) {
             SetErrorResponse(response, result.status, StatusToHttpCode(result.status));
@@ -3610,7 +3693,7 @@ int RunServer(const ServerConfig & config) {
              * The on_segment callback fires once per VAD-committed
              * segment, updating the job's text and audio_ms under
              * jobs_mu so the UI sees growing text in real time. */
-            qwen_ctx_t *batch_ctx = model.CreateRealtimeClone();
+            qwen_ctx_t *batch_ctx = batch_model->CreateRealtimeClone();
             if (batch_ctx == nullptr) {
                 std::lock_guard<std::mutex> lock(jobs_mu);
                 OfflineJob & current = jobs[job_id];
@@ -3620,7 +3703,7 @@ int RunServer(const ServerConfig & config) {
                 CleanupPreparedAudio(&prepared);
                 return;
             }
-            const int batch_verbosity = model.verbosity();
+            const int batch_verbosity = batch_model->verbosity();
             const int batch_max_new_tokens = 64;  /* per-segment cap */
             const char *batch_lang =
                 options.language.empty() ? nullptr : options.language.c_str();
@@ -3805,7 +3888,7 @@ int RunServer(const ServerConfig & config) {
         ModelDecodeOptions decode;
         decode.prompt = options.prompt;
         decode.language = options.language;
-        const AsrRunResult result = model.TranscribeFile(prepared.wav_path, decode);
+        const AsrRunResult result = batch_model->TranscribeFile(prepared.wav_path, decode);
         CleanupPreparedAudio(&prepared);
         if (!result.status.ok()) {
             SetErrorResponse(response, result.status, StatusToHttpCode(result.status));
@@ -3847,7 +3930,7 @@ int RunServer(const ServerConfig & config) {
         ModelDecodeOptions decode;
         decode.prompt = options.prompt;
         decode.language = options.language;
-        const AsrRunResult result = model.TranscribeFile(prepared.wav_path, decode);
+        const AsrRunResult result = batch_model->TranscribeFile(prepared.wav_path, decode);
         CleanupPreparedAudio(&prepared);
         if (!result.status.ok()) {
             SetErrorResponse(response, result.status, StatusToHttpCode(result.status));
