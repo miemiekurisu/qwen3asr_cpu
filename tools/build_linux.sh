@@ -94,6 +94,9 @@ EXTRA_BUILD_TARGET=""
 DETECTED_OPENBLAS_DIR=""   # 传给 cmake 的 -DOpenBLAS_DIR
 DETECTED_MODEL_DIR=""
 DETECTED_AUDIO=""
+DETECTED_ONNXRUNTIME_ROOT=""  # 传给 cmake 的 -DQASR_ONNXRUNTIME_ROOT
+ONNXRUNTIME_VERSION="${QASR_ONNXRUNTIME_VERSION:-1.20.1}"
+DO_onnxruntime=1          # 1 = 启用 VAD 路径需要 (linux-openblas preset 默认 ON)
 
 # ─────────────── 帮助 ───────────────
 usage() {
@@ -431,6 +434,110 @@ check_openblas() {
     fi
 }
 
+# ─────────────── 3.5 ONNX Runtime (Silero VAD 依赖) ───────────────
+# 探测顺序:
+#   1) $QASR_ONNXRUNTIME_ROOT (用户指定, 优先)
+#   2) $DEPS_DIR/onnxruntime/include/onnxruntime_c_api.h (自装)
+#   3) 复用相邻项目的预编译 (paddle_on_cpu/third_party/onnxruntime-linux-x64-*)
+#      拷到 $DEPS_DIR/onnxruntime (避免改 user 路径)
+#   4) 下载 GitHub release tarball 解压到 $DEPS_DIR/onnxruntime
+#   5) 失败 → warn + 提示手动, 但不强制退出 (VAD 是非关键路径, 缺则 VAD
+#      退化为 40s 强制 cap, 段式仍工作)
+probe_onnxruntime() {
+    if [[ -n "${QASR_ONNXRUNTIME_ROOT:-}" ]] \
+        && [[ -f "$QASR_ONNXRUNTIME_ROOT/include/onnxruntime_c_api.h" ]] \
+        && [[ -f "$QASR_ONNXRUNTIME_ROOT/lib/libonnxruntime.so" ]]; then
+        log_ok "ONNX Runtime (env QASR_ONNXRUNTIME_ROOT): $QASR_ONNXRUNTIME_ROOT"
+        DETECTED_ONNXRUNTIME_ROOT="$QASR_ONNXRUNTIME_ROOT"
+        return 0
+    fi
+    if [[ -f "$DEPS_DIR/onnxruntime/include/onnxruntime_c_api.h" ]] \
+        && [[ -f "$DEPS_DIR/onnxruntime/lib/libonnxruntime.so" ]]; then
+        log_ok "ONNX Runtime: $DEPS_DIR/onnxruntime"
+        DETECTED_ONNXRUNTIME_ROOT="$DEPS_DIR/onnxruntime"
+        return 0
+    fi
+    return 1
+}
+
+copy_local_onnxruntime_to_deps() {
+    # 复用 $PROJECT_ROOT/../paddle_on_cpu/third_party/onnxruntime-linux-x64-*
+    local proj_parent
+    proj_parent="$(dirname "$PROJECT_ROOT")"
+    local src
+    src="$(ls -d "$proj_parent"/paddle_on_cpu/third_party/onnxruntime-linux-x64-* 2>/dev/null | head -1)"
+    if [[ -z "$src" ]] || [[ ! -f "$src/include/onnxruntime_c_api.h" ]]; then
+        return 1
+    fi
+    log_info "复用相邻 paddle_on_cpu 预编译 ONNX Runtime: $src"
+    if [[ ! -d "$DEPS_DIR" ]]; then
+        $SUDO mkdir -p "$DEPS_DIR"
+    fi
+    rm -rf "$DEPS_DIR/onnxruntime"
+    if ! cp -r "$src" "$DEPS_DIR/onnxruntime"; then
+        log_warn "拷 $src 到 $DEPS_DIR/onnxruntime 失败"
+        return 1
+    fi
+    return 0
+}
+
+download_onnxruntime() {
+    local ver="$ONNXRUNTIME_VERSION"
+    local url="https://github.com/microsoft/onnxruntime/releases/download/v${ver}/onnxruntime-linux-x64-${ver}.tgz"
+    local work; work="$(mktemp -d -t qasr-onnx-XXXXXX)"
+    log_info "下载: $url"
+    if ! curl -fsSL --retry 3 --connect-timeout 15 \
+            -o "$work/onnxruntime.tgz" "$url"; then
+        log_warn "下载失败 (可能没代理或限速): $url"
+        rm -rf "$work"
+        return 1
+    fi
+    log_info "解压到 $DEPS_DIR/onnxruntime ..."
+    if ! $SUDO mkdir -p "$DEPS_DIR"; then
+        rm -rf "$work"; return 1
+    fi
+    if ! tar -xzf "$work/onnxruntime.tgz" -C "$work"; then
+        log_warn "解压失败"; rm -rf "$work"; return 1
+    fi
+    local extracted
+    extracted="$(find "$work" -maxdepth 1 -type d -name 'onnxruntime-linux-x64-*' | head -1)"
+    if [[ -z "$extracted" ]]; then
+        log_warn "找不到解压目录"; rm -rf "$work"; return 1
+    fi
+    if ! $SUDO mv "$extracted" "$DEPS_DIR/onnxruntime"; then
+        log_warn "移动到 $DEPS_DIR/onnxruntime 失败"; rm -rf "$work"; return 1
+    fi
+    rm -rf "$work"
+    return 0
+}
+
+check_onnxruntime() {
+    # linux-openblas preset 默认 -DQASR_ENABLE_SILERO_VAD=ON, 必须有 ONNX
+    if [[ $DO_onnxruntime -ne 1 ]]; then
+        return 0
+    fi
+    log_step "ONNX Runtime 依赖检查 (Silero VAD 需要)"
+    if probe_onnxruntime; then
+        return 0
+    fi
+    log_warn "未检测到 ONNX Runtime (silero VAD 需要, 缺则 VAD 退化为 40s 强制 cap)"
+    if [[ $DO_DEP -eq 0 ]]; then
+        log_warn "  --no-dep 禁止自动安装, 手动装:"
+        log_warn "    1) 从 https://github.com/microsoft/onnxruntime/releases 下载"
+        log_warn "       onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz"
+        log_warn "    2) 解到 $DEPS_DIR/onnxruntime (或设 QASR_ONNXRUNTIME_ROOT)"
+        return 0
+    fi
+    if copy_local_onnxruntime_to_deps && probe_onnxruntime; then
+        return 0
+    fi
+    if download_onnxruntime && probe_onnxruntime; then
+        return 0
+    fi
+    log_warn "ONNX Runtime 装不上, Silero VAD 将退化为 stub 模式 (VAD 段式仍工作,"
+    log_warn "  但不会自动 commit, 只在 40s cap 或 eof 时 commit)"
+}
+
 # ─────────────── 4. 模型检查 ───────────────
 # 探测顺序:
 #   $QASR_MODEL_DIR > --model-dir > $HF_CACHE/.../snapshots/*/model.safetensors
@@ -539,6 +646,12 @@ do_configure() {
     fi
     if [[ -n "$QASR_BLAS_CHOICE" ]]; then
         args+=("-DQASR_BLAS=$QASR_BLAS_CHOICE")
+    fi
+    if [[ -n "$DETECTED_ONNXRUNTIME_ROOT" ]]; then
+        args+=("-DQASR_ONNXRUNTIME_ROOT=$DETECTED_ONNXRUNTIME_ROOT")
+        # 显式覆盖 option() default, 避免 preset cacheVariables 被 option 默认值
+        # 优先规则胜过 preset
+        args+=("-DQASR_ENABLE_SILERO_VAD=ON")
     fi
     if [[ ${#EXTRA_CMAKE_DEFS[@]} -gt 0 ]]; then
         args+=("${EXTRA_CMAKE_DEFS[@]}")
@@ -653,6 +766,9 @@ main() {
     check_toolchain
     # 探测 OpenBLAS 总是要做(为了传 -DOpenBLAS_DIR),只是缺失时是否自动装取决于 DO_DEP
     check_openblas
+    # ONNX Runtime (Silero VAD 依赖); preset 启了 QASR_ENABLE_SILERO_VAD=ON 时必须
+    # 缺则 VAD 退化为 stub, warn 但不强制退出
+    check_onnxruntime
     [[ $DO_MODEL -eq 1 ]] && check_model
     [[ $DO_AUDIO -eq 1 ]] && check_audio
 
