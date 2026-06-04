@@ -26,8 +26,8 @@
         </header>
         <form id="uploadForm" class="stack">
           <label class="field">
-            <span>WAV 文件</span>
-            <input id="audioFile" type="file" accept=".wav,audio/wav">
+            <span>音频文件</span>
+            <input id="audioFile" type="file" accept="audio/*,.wav,.mp3,.m4a,.flac,.ogg,.opus,.aac,.wma">
           </label>
           <div class="button-row">
             <button id="offlineSubmit" class="action" type="submit">开始转写</button>
@@ -64,7 +64,6 @@
       </article>
     </section>
   </main>
-  <script src="/wav_stream_upload.js"></script>
   <script src="/live_monitor.js"></script>
   <script src="/app.js"></script>
 </body>

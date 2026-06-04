@@ -463,19 +463,33 @@ std::string NormalizeAudioLocator(std::string_view locator) {
 }
 
 bool CommandExists(const char * name) {
-    // Use the shared spawn helper instead of `system()` / `where` so
-    // we never invoke a shell and so the executable name cannot be
-    // interpreted as shell syntax if it ever contains unexpected
-    // metacharacters.  The probe runs `command -v <name>` /
-    // `where.exe <name>` directly with that name as a single argv
-    // element.
+    /* We must NOT use `command -v` here.  `command` is a bash shell
+     * builtin and is not a real executable at /usr/bin/command, so
+     * posix_spawnp("command", ...) fails (rc=127).  This was a long-
+     * standing bug that made every FfmpegAvailable() check return
+     * false on Linux, which in turn made every non-WAV /api/transcriptions*
+     * upload fail with "ffmpeg is required" even though /usr/bin/ffmpeg
+     * was clearly in PATH.
+     *
+     * Prefer `which` (a real binary on virtually every Linux distro and
+     * in /usr/bin on macOS).  Fall back to the explicit /usr/bin/which
+     * path on Linux if the PATH-only lookup fails.  On Windows the
+     * `where.exe` builtin is a real binary.  We still avoid `system()`
+     * so the executable name is never interpreted as shell syntax. */
     if (name == nullptr || name[0] == '\0') {
         return false;
     }
 #ifdef _WIN32
     return qasr::SpawnAndWait({"where", name}) == 0;
 #else
-    return qasr::SpawnAndWait({"command", "-v", name}) == 0;
+    if (qasr::SpawnAndWait({"which", name}) == 0) {
+        return true;
+    }
+    /* Hard-coded fallback for the most common Linux location. */
+    if (qasr::SpawnAndWait({"/usr/bin/which", name}) == 0) {
+        return true;
+    }
+    return false;
 #endif
 }
 
@@ -3035,14 +3049,6 @@ int RunServer(const ServerConfig & config) {
         const std::string body = LoadTextFile(ui_dir / "app.js");
         if (body.empty()) {
             SetErrorResponse(response, Status(StatusCode::kInternal, "failed to load app.js"), 500);
-            return;
-        }
-        response.set_content(body, "application/javascript; charset=utf-8");
-    });
-    server.Get("/wav_stream_upload.js", [&](const HttpRequest &, HttpResponse & response) {
-        const std::string body = LoadTextFile(ui_dir / "wav_stream_upload.js");
-        if (body.empty()) {
-            SetErrorResponse(response, Status(StatusCode::kInternal, "failed to load wav_stream_upload.js"), 500);
             return;
         }
         response.set_content(body, "application/javascript; charset=utf-8");
