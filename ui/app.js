@@ -452,7 +452,11 @@ async function submitOfflineViaAsync(file, startTime) {
 
   let lastTextLen = 0;
   let pollAttempts = 0;
-  const MAX_POLL_ATTEMPTS = 1000; // ~5min at 300ms; safety cap
+  /* Long-audio VAD-segmented batch can take 10-15 min for a 28 min
+   * file.  6000 × 300ms = 30 min safety cap.  The server's per-segment
+   * text callback fills job.text in real time, so the user sees
+   * progress even within this window. */
+  const MAX_POLL_ATTEMPTS = 6000;
   while (pollAttempts < MAX_POLL_ATTEMPTS) {
     pollAttempts += 1;
     await new Promise((resolve) => setTimeout(resolve, 300));
@@ -492,7 +496,7 @@ async function submitOfflineViaAsync(file, startTime) {
       `音频 ${audioDur}s / 推理 ${infMs}ms / RTF ${rtf} / ${tokens} tokens`;
     return;
   }
-  throw new Error("转写超时 (>5min), 请检查音频长度或服务端状态");
+  throw new Error("转写超时 (>30min), 请检查音频长度或服务端状态");
 }
 
 uploadForm.addEventListener("submit", async (event) => {

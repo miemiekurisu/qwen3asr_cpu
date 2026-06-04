@@ -39,4 +39,5 @@ tests/tmp/
 # Test audio files (large, download separately)
 testfile/*.mp3
 testfile/*.wav
+testfile/*.txt
 !testfile/README.md
