@@ -30,6 +30,22 @@ const MAX_ASYNC_UPLOAD_BYTES = 64 * 1024 * 1024;
 
 let activeFeature = "";
 
+/* Re-entrancy guard for the start button.
+ *
+ * The hang the operator saw after "batch → realtime → stop → clear →
+ * realtime" was a race: while startRealtimeCapture() is awaiting
+ * getUserMedia (line 668) and /api/realtime/start (line 669), a
+ * second click slips through because activeFeature is only set
+ * AFTER both awaits resolve (line 706).  The two clicks both
+ * create separate server sessions; the second click's
+ * realtimeState assignment overwrites the first's, leaking the
+ * first's mediaStream and routing audio to the wrong session.
+ *
+ * Fix: a single in-flight flag at the JS click-handler layer.
+ * The button is also disabled while a start is in flight.  This
+ * is symmetric to the offlineSubmit disable logic. */
+let realtimeStarting = false;
+
 let realtimeState = {
   audioContext: null,
   source: null,
@@ -664,6 +680,12 @@ async function startRealtimeCapture() {
   if (hasOfflineJob()) {
     throw new Error("离线转写进行中, 请先停止");
   }
+  if (activeFeature === REALTIME_FEATURE) {
+    /* Already live; re-entry is a no-op so the button click is
+     * idempotent.  Without this, a fast double-click after Stop
+     * would race with the cleanup of the previous session. */
+    return;
+  }
 
   const mediaStream = await navigator.mediaDevices.getUserMedia({audio: true});
   const sessionResponse = await fetch("/api/realtime/start", {method: "POST", body: ""});
@@ -850,10 +872,21 @@ async function stopRealtimeCapture() {
 }
 
 startRealtime.addEventListener("click", async () => {
+  if (realtimeStarting) {
+    return;
+  }
+  if (activeFeature === REALTIME_FEATURE) {
+    return;
+  }
+  realtimeStarting = true;
+  startRealtime.disabled = true;
   try {
     await startRealtimeCapture();
   } catch (error) {
     realtimeStatus.textContent = `启动失败：${error.message}`;
+  } finally {
+    realtimeStarting = false;
+    startRealtime.disabled = false;
   }
 });
 
