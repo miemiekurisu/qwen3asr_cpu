@@ -669,7 +669,6 @@ async function startRealtimeCapture() {
     throw new Error(sessionData.error.message);
   }
 
-  activeFeature = REALTIME_FEATURE;
   let audioContext = null;
   try {
     audioContext = new AudioContext();
@@ -694,6 +693,13 @@ async function startRealtimeCapture() {
       sampleRate: audioContext.sampleRate,
       startedAt: performance.now(),
     };
+    /* Only flip activeFeature AFTER realtimeState is fully populated.
+     * If anything between sessionData validation and this point throws
+     * (AudioContext failure, ScriptProcessor constructor, etc.) the
+     * catch below must clear activeFeature — otherwise the mutex
+     * thinks realtime is live but sessionId is empty, and the UI
+     * gets stuck. */
+    activeFeature = REALTIME_FEATURE;
     audioMeter.style.display = "block";
     resetRealtimeArchive("实时转写中，已确定文本会保存在此处。");
     realtimeArchive.sessionId = sessionData.session_id;
@@ -774,6 +780,14 @@ async function startRealtimeCapture() {
     } catch (_cleanupError) {
       // Best effort only; the original startup error is more important to surface.
     }
+    /* If we got as far as setting activeFeature = REALTIME_FEATURE
+     * (just after realtimeState was populated), clear it now so the
+     * mutex returns to a consistent state.  This is the only place
+     * the catch can leak state — everything below is wired up. */
+    if (activeFeature === REALTIME_FEATURE) {
+      activeFeature = "";
+    }
+    updateControlAvailability();
     throw error;
   }
 }
