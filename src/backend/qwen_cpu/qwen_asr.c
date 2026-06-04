@@ -1482,29 +1482,6 @@ static int should_insert_boundary_space(int prev_ch, int next_ch) {
     return 1;
 }
 
-typedef struct {
-    qwen_token_cb downstream_cb;
-    void *downstream_userdata;
-    int maybe_prepend_space;
-    int saw_first_piece;
-} segment_emit_state_t;
-
-static void segment_emit_cb(const char *piece, void *userdata) {
-    segment_emit_state_t *st = (segment_emit_state_t *)userdata;
-    if (!st || !st->downstream_cb || !piece) return;
-
-    if (!st->saw_first_piece) {
-        st->saw_first_piece = 1;
-        if (st->maybe_prepend_space) {
-            unsigned char c0 = (unsigned char)piece[0];
-            if (c0 != '\0' && !isspace(c0) && !ispunct(c0)) {
-                st->downstream_cb(" ", st->downstream_userdata);
-            }
-        }
-    }
-    st->downstream_cb(piece, st->downstream_userdata);
-}
-
 char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples) {
     ctx->last_run_cancelled = 0;
     ctx->perf_total_ms = 0;
@@ -2084,26 +2061,6 @@ typedef struct {
     float *enc_output; /* [seq_len, dec_hidden] */
 } stream_enc_window_t;
 
-static void stream_clear_enc_cache(stream_enc_window_t *enc_cache,
-                                   int *n_enc_cache,
-                                   int *enc_cache_start,
-                                   int *enc_cached_seq_total,
-                                   int64_t *next_window_start,
-                                   int64_t new_start_sample) {
-    if (!enc_cache || !n_enc_cache || !enc_cache_start ||
-        !enc_cached_seq_total || !next_window_start) {
-        return;
-    }
-    for (int i = *enc_cache_start; i < *n_enc_cache; i++) {
-        free(enc_cache[i].enc_output);
-        enc_cache[i].enc_output = NULL;
-    }
-    *n_enc_cache = 0;
-    *enc_cache_start = 0;
-    *enc_cached_seq_total = 0;
-    *next_window_start = new_start_sample;
-}
-
 /* Re-anchor stream text state to a short committed tail so decoding can
  * continue after a hard reset without replaying the full text history. */
 static int stream_reanchor_text_state(qwen_ctx_t *ctx,
@@ -2393,36 +2350,6 @@ static void stream_bg_encoder_invalidate(stream_bg_encoder_t *bg) {
     bg->result_enc = NULL;
     bg->has_result = 0;
     BG_UNLOCK(bg);
-}
-
-/* Blocking collect: wait for any in-flight encoding to finish, then
- * check if the result matches the expected window.  This ensures the
- * background encoder is idle before the caller proceeds with its own
- * encoder/BLAS work, avoiding concurrent OpenBLAS contention. */
-static int stream_bg_encoder_wait_collect(stream_bg_encoder_t *bg,
-                                          int64_t expected_start,
-                                          int expected_n_samples,
-                                          float **out_enc, int *out_seq_len) {
-    if (!bg) return 0;
-    *out_enc = NULL;
-    *out_seq_len = 0;
-
-    BG_LOCK(bg);
-    while ((bg->has_work || bg->is_busy) && !bg->stop)
-        BG_WAIT(bg);
-
-    if (bg->has_result &&
-        bg->result_start_sample == expected_start &&
-        bg->result_n_samples == expected_n_samples) {
-        *out_enc = bg->result_enc;
-        *out_seq_len = bg->result_seq_len;
-        bg->result_enc = NULL;
-        bg->has_result = 0;
-        BG_UNLOCK(bg);
-        return 1;
-    }
-    BG_UNLOCK(bg);
-    return 0;
 }
 
 /* Wait for the background encoder to become idle (not busy, no pending work).
