@@ -44,6 +44,7 @@
 extern "C" {
 #include "qwen_asr.h"
 #include "qwen_asr_kernels.h"
+#include "qwen_asr_audio.h"
 #include "qwen_silero_vad.h"
 }
 #include "qasr/base/http_server.h"
@@ -2237,6 +2238,347 @@ std::string BuildServerUsage(std::string_view program_name) {
     return usage;
 }
 
+/* ============================================================================
+ * VAD-segmented batch transcription (file → VAD segments → per-segment decode)
+ * ============================================================================
+ *
+ * Why this exists:  Qwen3-ASR has a 5×8s = 40s encoder context window.
+ * Feeding a 28-minute audio file directly to qwen_transcribe() makes the
+ * encoder run way past its designed window; token generation crawls
+ * (RTF > 1, the model never converges in any reasonable wall time), and
+ * the UI times out at 5 min.
+ *
+ * The fix is the same sentence-bounded VAD-decode pattern used by the
+ * realtime worker (see RunVadSegmentedDecode), but operating on a file:
+ *
+ *   1. Read the WAV file as 16 kHz mono float (qwen_load_wav handles
+ *      arbitrary source sample rate via sinc resampling).
+ *   2. Stream the samples through a 512-sample frame loop.
+ *   3. For each frame, run Silero VAD; track segment_active and
+ *      silence_run (consecutive non-speech frames after speech).
+ *   4. Commit the current segment when EITHER:
+ *        (a) silence_run reaches kBatchVadSilenceFrames (500ms) — the
+ *            speaker has paused between sentences, OR
+ *        (b) the segment buffer reaches 40 s — safety cap so a long
+ *            monologue never overflows the encoder window.
+ *   5. Run qwen_transcribe_audio() on the committed segment (full
+ *      offline decode, no rollback, no coalesce, no partial).  Append
+ *      the result, fire the per-segment callback (which the async
+ *      handler uses to update the job text under jobs_mu), and reset
+ *      the VAD state for the next segment.
+ *   6. After the loop, flush any trailing audio as a final EOF commit.
+ *
+ * Per-segment wall time is ~1.2-1.8 s (VAD silence 500 ms + decode
+ * 700-1300 ms for 2-5 s of speech).  A 28 min file with 200-400
+ * segments takes ~10-15 min total wall time, which is acceptable
+ * because the async API streams progress and the UI shows growing
+ * text per segment.
+ */
+struct VadSegmentedBatchResult {
+    Status status;
+    std::string text;
+    int64_t segments = 0;
+    double audio_ms = 0.0;
+    double inference_ms = 0.0;
+    int64_t total_samples = 0;
+    int64_t text_chars = 0;
+};
+
+/* Per-segment callback.  Called from the worker thread for each
+ * committed segment, before the next segment is decoded.  Must not
+ * throw (exceptions are caught by the caller and treated as cancel).
+ *
+ * Return true to continue decoding, false to cancel the whole job. */
+using VadSegmentCallback = std::function<bool(int /*seg_idx*/,
+                                               std::string_view /*seg_text*/,
+                                               int /*seg_samples*/,
+                                               int64_t /*total_samples*/)>;
+
+constexpr int kBatchVadSilenceFrames = 16;            /* 16 × 32ms = ~500ms */
+constexpr int kBatchVadMaxSamples = 40 * 16000;        /* 40 s safety cap */
+constexpr int kBatchVadFrameSamples = 512;            /* Silero VAD chunk */
+constexpr float kBatchVadSpeechProbThreshold = 0.35f;
+
+VadSegmentedBatchResult TranscribeFileVadSegmentedImpl(
+    qwen_ctx_t *ctx,
+    const char *wav_path,
+    const char *forced_language,
+    int max_new_tokens,
+    int verbosity,
+    const VadSegmentCallback &on_segment,
+    const std::function<bool()> &cancel_cb) {
+
+    VadSegmentedBatchResult out;
+
+    if (ctx == nullptr || wav_path == nullptr) {
+        out.status = Status(StatusCode::kInvalidArgument, "ctx and wav_path required");
+        return out;
+    }
+
+    /* Load WAV as 16 kHz mono float (handles any source rate via sinc
+     * resample inside qwen_load_wav). */
+    int n_samples = 0;
+    float *samples = qwen_load_wav(wav_path, &n_samples);
+    if (samples == nullptr) {
+        out.status = Status(StatusCode::kInvalidArgument,
+                            std::string("failed to load WAV file: ") + wav_path);
+        return out;
+    }
+    out.total_samples = n_samples;
+    out.audio_ms = (double)n_samples * 1000.0 / 16000.0;
+
+    if (verbosity >= 1) {
+        std::fprintf(stderr,
+                     "VAD-segmented batch: %.2fs of audio, lang=%s, max_new_tokens=%d\n",
+                     (double)n_samples / 16000.0,
+                     (forced_language != nullptr && forced_language[0] != '\0') ? forced_language : "<auto>",
+                     max_new_tokens);
+    }
+
+    /* Configure ctx for offline-style per-segment decode.  This matches
+     * the realtime VAD-segmented worker: each segment is decoded
+     * independently, with no streaming chunk cadence and no rolling
+     * rollback. */
+    ctx->segment_sec = 0.0f;
+    ctx->search_sec = 0.0f;
+    ctx->past_text_conditioning = 0;
+    ctx->stream_chunk_sec = 0.0f;
+    ctx->stream_max_new_tokens = 0;
+    if (qwen_set_force_language(ctx, forced_language) != 0) {
+        std::free(samples);
+        out.status = Status(StatusCode::kInvalidArgument,
+                            std::string("unsupported language: ") +
+                            (forced_language ? forced_language : ""));
+        return out;
+    }
+
+    /* Wire the cancel callback into the C decoder so qwen_transcribe_audio
+     * checks cancel mid-decode (not just between segments).  Uses the
+     * same ForwardCancelRequest trampoline as TranscribeFile. */
+    std::function<bool()> cancel_trampoline = cancel_cb;
+    if (cancel_trampoline) {
+        qwen_set_cancel_callback(ctx, ForwardCancelRequest, &cancel_trampoline);
+    } else {
+        qwen_set_cancel_callback(ctx, nullptr, nullptr);
+    }
+
+    /* Initialize Silero VAD (best effort).  If the model is missing or
+     * ONNX runtime is unavailable, fall back to a pure 40s timer —
+     * segments are bigger but the result is still correct, just
+     * coarser. */
+    qwen_silero_vad_t *vad = qwen_silero_vad_create(nullptr);
+    const bool vad_active = qwen_silero_vad_is_active(vad);
+    if (verbosity >= 1) {
+        std::fprintf(stderr, "VAD-segmented batch: Silero VAD %s\n",
+                     vad_active ? "active" : "inactive (40s timer fallback)");
+    }
+
+    std::vector<float> segment_buffer;
+    segment_buffer.reserve(kBatchVadMaxSamples * 2);
+    int64_t processed_frames = 0;   /* frames in segment_buffer already seen by VAD */
+    int silence_run = 0;            /* consecutive non-speech frames after segment_active */
+    bool segment_active = false;    /* speech is in progress in current segment */
+    int seg_idx = 0;
+    int64_t total_consumed = 0;     /* samples read from source into segment_buffer */
+
+    auto commit_segment = [&](const char *reason) -> bool {
+        if (segment_buffer.empty()) {
+            silence_run = 0;
+            return true;
+        }
+        const int seg_n = static_cast<int>(segment_buffer.size());
+        const double seg_sec = (double)seg_n / 16000.0;
+        if (verbosity >= 1) {
+            std::fprintf(stderr,
+                         "VAD-segmented batch: committing segment %d (%.2fs, reason=%s)\n",
+                         seg_idx, seg_sec, reason);
+        }
+        char *raw = qwen_transcribe_audio(ctx, segment_buffer.data(), seg_n);
+        std::string text;
+        if (raw != nullptr) {
+            text.assign(raw);
+            std::free(raw);
+            /* Trim trailing whitespace the model may emit. */
+            while (!text.empty() &&
+                   (text.back() == ' ' || text.back() == '\n' || text.back() == '\t')) {
+                text.pop_back();
+            }
+        } else if (verbosity >= 1) {
+            std::fprintf(stderr,
+                         "VAD-segmented batch: qwen_transcribe_audio returned null for seg %d\n",
+                         seg_idx);
+        }
+        const int this_seg_samples = seg_n;
+        out.text += text;
+        out.text_chars += static_cast<int64_t>(text.size());
+        /* qwen_transcribe_audio() resets ctx->perf_total_ms = 0 at the
+         * start of each call, so by the time we get here it's only
+         * the LAST segment's time.  Accumulate across segments so
+         * the final out.inference_ms is the cumulative wall time
+         * spent in qwen_transcribe_audio() across all VAD
+         * segments.  We also reset the perf counter right after
+         * reading so the next call's increment is uncontaminated
+         * (in case the C code didn't reset). */
+        out.inference_ms += ctx->perf_total_ms;
+        ctx->perf_total_ms = 0.0;
+        segment_buffer.clear();
+        processed_frames = 0;
+        silence_run = 0;
+        segment_active = false;
+        if (vad_active) qwen_silero_vad_reset(vad);
+
+        /* Fire the per-segment callback (async handler uses this to
+         * publish partial text to the job).  Returning false aborts. */
+        const bool keep_going = !on_segment
+            ? true
+            : on_segment(seg_idx, text, this_seg_samples, total_consumed);
+        seg_idx++;
+        out.segments = seg_idx;
+        return keep_going;
+    };
+
+    /* Main loop.  For each iteration:
+     *   1. Copy at most one VAD frame (512 samples) from the source
+     *      into segment_buffer (capped at 40 s).
+     *   2. Run VAD on any newly-copied frames, updating segment_active
+     *      and silence_run.
+     *   3. Decide whether to commit (silence ≥ 16 frames or 40 s cap).
+     *   4. Check cancel.  Exit on EOF + empty buffer. */
+    const int frame = kBatchVadFrameSamples;
+    while (true) {
+        /* Step 1: copy one frame.  Always resize() BEFORE memcpy() —
+         * std::vector value-initializes new elements to 0 on grow, so
+         * memcpy-first would be silently overwritten. */
+        if (segment_buffer.size() < static_cast<std::size_t>(kBatchVadMaxSamples) &&
+            total_consumed < n_samples) {
+            int64_t want = n_samples - total_consumed;
+            if (want > frame) want = frame;
+            const int64_t room = kBatchVadMaxSamples - static_cast<int64_t>(segment_buffer.size());
+            if (want > room) want = room;
+            if (want > 0) {
+                const std::size_t old = segment_buffer.size();
+                segment_buffer.resize(old + static_cast<std::size_t>(want));
+                std::memcpy(segment_buffer.data() + old,
+                            samples + total_consumed,
+                            static_cast<std::size_t>(want) * sizeof(float));
+                total_consumed += want;
+            }
+        }
+
+        /* Step 2: VAD sweep on any new frames. */
+        if (vad_active) {
+            const int64_t total_buf = static_cast<int64_t>(segment_buffer.size());
+            const int64_t total_frames = total_buf / frame;
+            for (int64_t fi = processed_frames; fi < total_frames; ++fi) {
+                float prob = 0.0f;
+                qwen_silero_vad_process(vad,
+                                        segment_buffer.data() + fi * frame,
+                                        frame, &prob);
+                if (prob >= kBatchVadSpeechProbThreshold) {
+                    segment_active = true;
+                    silence_run = 0;
+                } else {
+                    if (segment_active) {
+                        silence_run++;
+                    }
+                }
+            }
+            processed_frames = total_frames;
+        } else {
+            /* No VAD: activate after 0.5 s of buffered audio (treat the
+             * whole buffer as one continuous segment).  We do NOT
+             * advance silence_run here, so the only commit trigger is
+             * the 40 s safety cap or EOF. */
+            if (segment_buffer.size() >= 8000) {
+                segment_active = true;
+            }
+        }
+
+        /* Step 3: commit decision.
+         *
+         * Triggers, in priority order:
+         *   1. VAD active + segment active + 16 silent frames (~500ms)
+         *      → speaker paused, commit.
+         *   2. Buffer ≥ 40 s → safety cap (prevents encoder overflow).
+         *   3. Source exhausted and buffer has anything → "eof_soak"
+         *      safety: even if VAD never reported silence, the audio
+         *      is fully consumed, so commit what we have.  Prevents
+         *      an infinite loop when VAD is wrong and the audio ends
+         *      mid-speech.  The post-loop flush handles the case
+         *      where this branch is skipped because the source is
+         *      drained but the buffer still has data. */
+        bool should_commit = false;
+        const char *commit_reason = nullptr;
+        if (vad_active && segment_active && silence_run >= kBatchVadSilenceFrames) {
+            should_commit = true;
+            commit_reason = "vad_silence";
+        } else if (static_cast<int>(segment_buffer.size()) >= kBatchVadMaxSamples) {
+            should_commit = true;
+            commit_reason = "40s_safety_cap";
+        } else if (total_consumed >= n_samples && !segment_buffer.empty() &&
+                   segment_active) {
+            should_commit = true;
+            commit_reason = "eof_with_active_segment";
+        }
+        if (should_commit) {
+            if (!commit_segment(commit_reason)) {
+                std::free(samples);
+                qwen_silero_vad_destroy(vad);
+                qwen_set_cancel_callback(ctx, nullptr, nullptr);
+                out.status = Status(StatusCode::kFailedPrecondition,
+                                    "transcription cancelled by callback");
+                return out;
+            }
+        }
+
+        /* Step 4: exit conditions.
+         *
+         * (a) Source fully consumed AND no in-flight segment to flush
+         *     → all done, break immediately.
+         * (b) Source fully consumed AND in-flight segment present →
+         *     flush it now.  Without this branch, the loop would
+         *     spin forever on the trailing audio: step 1 copies 0
+         *     samples (EOF), step 2 processes 0 new VAD frames,
+         *     step 3 doesn't fire a commit (silence_run=0 if VAD
+         *     keeps reporting speech right up to the end), and
+         *     step 4's "empty buffer" check is false.  So we break
+         *     here and rely on the post-loop EOF flush to commit. */
+        if (total_consumed >= n_samples) {
+            if (segment_buffer.empty()) {
+                break;
+            }
+            if (verbosity >= 1) {
+                std::fprintf(stderr,
+                             "VAD-segmented batch: EOF + %zu samples trailing, "
+                             "breaking to post-loop EOF flush (segments=%lld)\n",
+                             segment_buffer.size(),
+                             static_cast<long long>(out.segments));
+            }
+            break;
+        }
+
+        /* Step 5: check cancel.  Cheap atomic load, no allocation. */
+        if (cancel_cb && cancel_cb()) {
+            std::free(samples);
+            qwen_silero_vad_destroy(vad);
+            qwen_set_cancel_callback(ctx, nullptr, nullptr);
+            out.status = Status(StatusCode::kFailedPrecondition,
+                                "transcription cancelled");
+            return out;
+        }
+    }
+
+    /* Flush any trailing audio (e.g. last segment cut by EOF). */
+    if (!segment_buffer.empty()) {
+        commit_segment("eof");
+    }
+
+    std::free(samples);
+    qwen_silero_vad_destroy(vad);
+    qwen_set_cancel_callback(ctx, nullptr, nullptr);
+    return out;
+}
+
 int RunServer(const ServerConfig & config) {
 #ifndef QASR_CPU_BACKEND_ENABLED
     (void)config;
@@ -3255,7 +3597,100 @@ int RunServer(const ServerConfig & config) {
                     it->second.token_count += (std::max)(static_cast<std::int32_t>(piece.size() / 3), std::int32_t{1});
                 }
             };
-            const AsrRunResult result = model.TranscribeFile(prepared.wav_path, decode);
+
+            /* Long audio (>40s) goes through VAD-segmented decode so
+             * the encoder's 5×8s context window is never exceeded.
+             * Short audio could in theory use the one-shot
+             * TranscribeFile path, but to keep behavior identical
+             * across audio lengths (and to stream progress for the
+             * UI), we use VAD-segmented for everything.  The realtime
+             * worker already proved this pattern works for live
+             * audio; here we apply the same loop to a file.
+             *
+             * The on_segment callback fires once per VAD-committed
+             * segment, updating the job's text and audio_ms under
+             * jobs_mu so the UI sees growing text in real time. */
+            qwen_ctx_t *batch_ctx = model.CreateRealtimeClone();
+            if (batch_ctx == nullptr) {
+                std::lock_guard<std::mutex> lock(jobs_mu);
+                OfflineJob & current = jobs[job_id];
+                current.state = "failed";
+                current.error = "failed to clone model context for batch";
+                current.updated_at = CurrentUnixSeconds();
+                CleanupPreparedAudio(&prepared);
+                return;
+            }
+            const int batch_verbosity = model.verbosity();
+            const int batch_max_new_tokens = 64;  /* per-segment cap */
+            const char *batch_lang =
+                options.language.empty() ? nullptr : options.language.c_str();
+
+            /* VAD-segmented per-segment callback.  Called from the
+             * worker thread for each committed segment, before the
+             * next segment is decoded.  Updates the job's text and
+             * audio_ms in-place so the UI sees growing text in real
+             * time.  Returns true to keep going, false to cancel
+             * (e.g. user clicked Stop). */
+            auto on_segment = [&jobs, &jobs_mu, &job_id, cancel_flag, prepared_wav = prepared.wav_path](
+                                  int seg_idx,
+                                  std::string_view seg_text,
+                                  int seg_samples,
+                                  int64_t total_samples) -> bool {
+                (void)seg_idx;
+                (void)seg_samples;
+                (void)prepared_wav;
+                if (cancel_flag && cancel_flag->load()) {
+                    return false;  /* signal cancel to caller */
+                }
+                std::lock_guard<std::mutex> lock(jobs_mu);
+                auto it = jobs.find(job_id);
+                if (it == jobs.end()) {
+                    return false;  /* job was deleted; treat as cancel */
+                }
+                OfflineJob &current = it->second;
+                /* Append segment text (with a single space separator if
+                 * the previous text doesn't end in punctuation or
+                 * whitespace).  The model rarely emits a trailing
+                 * space, so we always add one to keep words separated. */
+                if (!seg_text.empty()) {
+                    if (!current.text.empty() &&
+                        current.text.back() != ' ' &&
+                        current.text.back() != '\n' &&
+                        current.text.back() != '\t') {
+                        current.text.push_back(' ');
+                    }
+                    current.text.append(seg_text.data(), seg_text.size());
+                    /* Rough token estimate: 1.5 chars/token CJK, 4 chars/token
+                     * Latin.  Use 2.5 as a middle-of-the-road average. */
+                    current.token_count += (std::max)(
+                        static_cast<std::int32_t>(seg_text.size() / 3),
+                        std::int32_t{1});
+                }
+                current.audio_ms = static_cast<double>(total_samples) * 1000.0 / 16000.0;
+                current.updated_at = CurrentUnixSeconds();
+                return true;
+            };
+
+            VadSegmentedBatchResult vad_result;
+            try {
+                vad_result = TranscribeFileVadSegmentedImpl(
+                    batch_ctx,
+                    prepared.wav_path.string().c_str(),
+                    batch_lang,
+                    batch_max_new_tokens,
+                    batch_verbosity,
+                    on_segment,
+                    decode.cancel_callback);
+            } catch (const std::exception &e) {
+                vad_result.status = Status(StatusCode::kInternal,
+                                           std::string("vad-segmented exception: ") + e.what());
+            } catch (...) {
+                vad_result.status = Status(StatusCode::kInternal,
+                                           "vad-segmented unknown exception");
+            }
+            /* Free the batch clone; it holds per-batch decoder state
+             * (KV cache, etc.) and must be released even on cancel. */
+            qwen_free(batch_ctx);
             CleanupPreparedAudio(&prepared);
 
             {
@@ -3263,21 +3698,26 @@ int RunServer(const ServerConfig & config) {
                 OfflineJob & current = jobs[job_id];
                 current.updated_at = CurrentUnixSeconds();
                 current.language = DetectLanguageLabel(options.language);
-                current.inference_ms = result.total_ms;
-                current.audio_ms = result.audio_ms;
-                current.tokens = result.text_tokens;
+                current.inference_ms = vad_result.inference_ms;
+                current.audio_ms = vad_result.audio_ms;
                 if (cancel_flag && cancel_flag->load()) {
                     current.state = "cancelled";
                     current.error.clear();
-                    if (!result.text.empty()) {
-                        current.text = result.text;
-                    }
-                } else if (!result.status.ok()) {
+                    /* Keep whatever text the VAD segments emitted before cancel. */
+                } else if (!vad_result.status.ok()) {
                     current.state = "failed";
-                    current.error = result.status.message();
+                    current.error = vad_result.status.message();
                 } else {
                     current.state = "completed";
-                    current.text = result.text;
+                    /* If the VAD callback didn't already fill text
+                     * (e.g. zero-segment edge case), fall back to
+                     * vad_result.text. */
+                    if (current.text.empty() && !vad_result.text.empty()) {
+                        current.text = vad_result.text;
+                    }
+                }
+                if (current.tokens == 0 && current.token_count > 0) {
+                    current.tokens = current.token_count;
                 }
             }
         }).detach();
