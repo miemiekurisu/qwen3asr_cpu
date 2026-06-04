@@ -581,26 +581,17 @@ async function finalizeOfflineStreamSession(format) {
         const data = JSON.parse(event.data);
         lastData = data;
         // Offline batch: show full accumulated stable_text, not windowed
-        // recent_segments. The user needs to see the entire transcript growing.
-        const frame = ensureTranscriptFrame(offlineResult);
+        // recent_segments. The user needs to see the entire transcript
+        // growing.  offlineResult is a <pre>, so we collapse final/history/
+        // stable/partial into a single textContent (escaped implicitly).
         const fullStable = data.stable_text || "";
         const trailing = data.live_partial_text || data.partial_text || "";
         if (data.finalized) {
-          frame.finalLine.textContent = data.text || fullStable;
-          frame.finalLine.style.display = "block";
-          frame.historyLine.textContent = "";
-          frame.historyLine.style.display = "none";
-          frame.stableLine.textContent = "";
-          frame.partialLine.textContent = "";
-          frame.liveLine.style.display = "none";
+          offlineResult.textContent = data.text || fullStable;
         } else {
-          frame.finalLine.textContent = "";
-          frame.finalLine.style.display = "none";
-          frame.historyLine.textContent = fullStable;
-          frame.historyLine.style.display = fullStable ? "block" : "none";
-          frame.stableLine.textContent = "";
-          frame.partialLine.textContent = trailing;
-          frame.liveLine.style.display = trailing ? "block" : "none";
+          offlineResult.textContent = trailing
+            ? (fullStable ? fullStable + "\n" + trailing : trailing)
+            : fullStable;
         }
         updateOfflineStreamStatus(data, format, false);
       } catch (_parseErr) {
@@ -629,15 +620,8 @@ async function finalizeOfflineStreamSession(format) {
     const data = await response.json();
     if (response.ok) {
       // Show full final text, not windowed view.
-      const frame = ensureTranscriptFrame(offlineResult);
       const finalText = data.text || data.stable_text || "";
-      frame.finalLine.textContent = finalText;
-      frame.finalLine.style.display = finalText ? "block" : "none";
-      frame.historyLine.textContent = "";
-      frame.historyLine.style.display = "none";
-      frame.stableLine.textContent = "";
-      frame.partialLine.textContent = "";
-      frame.liveLine.style.display = "none";
+      offlineResult.textContent = finalText;
       updateOfflineStreamStatus(data, format, true);
       return data;
     }
@@ -700,17 +684,14 @@ async function submitOfflineViaStream(file, startTime, format) {
         continue;
       }
       const data = await sendOfflineStreamChunk(offlineState.sessionId, pcmChunk);
-      // Offline batch: show full accumulated stable_text, not windowed view.
-      const frame = ensureTranscriptFrame(offlineResult);
+      // Offline batch: show full accumulated stable_text, not windowed
+      // view.  offlineResult is a <pre>, so collapse to a single
+      // textContent (trailing partial appended on its own line).
       const fullStable = data.stable_text || "";
       const trailing = data.live_partial_text || data.partial_text || "";
-      frame.finalLine.textContent = "";
-      frame.finalLine.style.display = "none";
-      frame.historyLine.textContent = fullStable;
-      frame.historyLine.style.display = fullStable ? "block" : "none";
-      frame.stableLine.textContent = "";
-      frame.partialLine.textContent = trailing;
-      frame.liveLine.style.display = trailing ? "block" : "none";
+      offlineResult.textContent = trailing
+        ? (fullStable ? fullStable + "\n" + trailing : trailing)
+        : fullStable;
       updateOfflineStreamStatus(data, format, false);
     }
     await finalizeOfflineStreamSession(format);
