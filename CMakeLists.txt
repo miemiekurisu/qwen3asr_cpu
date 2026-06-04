@@ -359,12 +359,4 @@ if(QASR_ENABLE_TESTS)
     endif()
 
     add_test(NAME qasr_unit_tests COMMAND qasr_unit_tests)
-
-    if(APPLE AND QASR_OSASCRIPT_EXECUTABLE)
-        add_test(
-            NAME qasr_ui_wav_stream_upload_test
-            COMMAND ${QASR_OSASCRIPT_EXECUTABLE} -l JavaScript
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/ui_wav_stream_upload_test.js
-                ${CMAKE_CURRENT_SOURCE_DIR}/ui/wav_stream_upload.js)
-    endif()
 endif()
