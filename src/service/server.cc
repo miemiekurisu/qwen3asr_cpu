@@ -915,9 +915,10 @@ public:
             return Status(StatusCode::kInternal, "qwen_load failed");
         }
         if (config.encoder_int8) {
-            if (qwen_set_encoder_int8(ctx_, 1) != 0) {
-                std::fprintf(stderr, "warning: encoder INT8 init failed, falling back to F32\n");
-            }
+            /* encoder INT8 temporarily disabled (post-C8): see
+             * docs/INCIDENTS.md 2026-06-05 encoder INT8 disabled.
+             * Option still accepted for compatibility, but no-op. */
+            (void)0;
         }
         ctx_->past_text_conditioning = 1;
         ctx_->segment_sec = 30.0f;
@@ -1063,12 +1064,11 @@ public:
          * clones — it is the autoregressive Qwen3 LM and INT8 there
          * measurably degrades language consistency (English fragments
          * leaking into Chinese audio, hallucinations, etc.).  See
-         * docs/INCIDENTS.md for the rationale. */
+         * docs/INCIDENTS.md for the rationale.  Encoder INT8 is also
+         * temporarily disabled (post-C8) — see 2026-06-05 entry. */
         if (config_.encoder_int8) {
-            if (qwen_set_encoder_int8(clone, 1) != 0) {
-                std::fprintf(stderr,
-                             "warning: realtime clone encoder INT8 init failed, falling back to F32\n");
-            }
+            /* encoder INT8 disabled — see comment above */
+            (void)0;
         }
         return clone;
     }
@@ -2199,6 +2199,9 @@ Status ParseServerArguments(int argc, const char * const argv[], ServerConfig * 
         }
         if (arg == "--encoder-int8") {
             config->encoder_int8 = true;
+            std::fprintf(stderr,
+                "warning: --encoder-int8 is temporarily disabled (code retained, no-op); "
+                "see docs/INCIDENTS.md 2026-06-05 encoder INT8 disabled\n");
             continue;
         }
         if (arg == "--temperature") {
@@ -2244,7 +2247,6 @@ std::string BuildServerUsage(std::string_view program_name) {
     usage += "                           1=commit/summary, 2=per-poll, 3=raw\n";
     usage += "  --quiet, -q              alias for --verbosity 0\n";
     usage += "  --temperature <float>  (default: auto, 0=greedy, >0=sampling)\n";
-    usage += "  --encoder-int8         (encoder INT8: minimal quality impact, halves encoder memory)\n";
     usage += "  -h, --help\n";
     return usage;
 }

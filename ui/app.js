@@ -78,6 +78,12 @@ let realtimeArchive = {
 let offlineState = {
   jobId: "",
   stopRequested: false,
+  /* Non-empty when a stop attempt failed and the error message
+   * is currently displayed.  The poll loop refuses to overwrite
+   * the status formatter (which would say "转写中: …") while
+   * this is set, so the user actually sees "停止失败: …" instead
+   * of the error being silently replaced 300ms later. */
+  stopError: "",
   startedAt: 0,
 };
 
@@ -295,6 +301,7 @@ function resetOfflineState() {
   offlineState = {
     jobId: "",
     stopRequested: false,
+    stopError: "",
     startedAt: 0,
   };
   if (activeFeature === BATCH_FEATURE) {
@@ -304,7 +311,7 @@ function resetOfflineState() {
 }
 
 function countCodepoints(text) {
-  return Array.from(text || "").length;
+  return QasrStatePure.countCodepoints(text);
 }
 
 function extractConfirmedRealtimeText() {
@@ -387,9 +394,7 @@ function syncRealtimeArchive(data) {
 }
 
 function buildRealtimeExportName(ext) {
-  const sessionId = (realtimeArchive.sessionId || "session").replace(/[^a-zA-Z0-9_-]+/g, "-");
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  return `qasr-realtime-${sessionId}-${stamp}.${ext}`;
+  return QasrStatePure.buildRealtimeExportName(realtimeArchive.sessionId, ext);
 }
 
 function triggerDownload(filename, content, mimeType) {
@@ -516,21 +521,34 @@ async function submitOfflineViaAsync(file, startTime) {
         lastTextLen = text.length;
         offlineResult.textContent = text;
       }
-      updateOfflineAsyncStatus(job, startTime);
+      /* Don't overwrite the status line while a stop attempt is
+       * in flight OR a stop error is currently displayed.  The
+       * running formatter ("转写中: 0.6s") would otherwise replace
+       * the user's stop signal within 300ms.  We keep refreshing
+       * `offlineResult` (text content) because that is
+       * append-only, but the status line belongs to the stop
+       * flow until it terminates (state=cancelled/completed/
+       * failed, which the branches below clear stopError on). */
+      if (!offlineState.stopRequested && !offlineState.stopError) {
+        updateOfflineAsyncStatus(job, startTime);
+      }
       continue;
     }
 
     if (job.state === "cancelled") {
+      offlineState.stopError = "";
       offlineResult.textContent = job.text || "已停止";
       offlineStatus.textContent = "已停止";
       return;
     }
 
     if (job.state === "failed") {
+      offlineState.stopError = "";
       throw new Error(job.error || "转写失败");
     }
 
     // completed
+    offlineState.stopError = "";
     offlineResult.textContent = job.text || "";
     const audioDur = (job.audio_ms / 1000).toFixed(1);
     const infMs = (job.inference_ms || 0).toFixed(0);
@@ -594,38 +612,28 @@ offlineStop.addEventListener("click", async () => {
     if (!response.ok) {
       throw new Error(data.error?.message || "停止失败");
     }
-  } catch (error) {
+    /* Cancel accepted: clear stopRequested so the poll loop can
+     * pick up state="cancelled" and surface "已停止" when the
+     * server acknowledges. */
     offlineState.stopRequested = false;
+  } catch (error) {
+    /* Cancel failed: clear stopRequested so the user can retry,
+     * but record the error so the poll loop leaves the visible
+     * "停止失败: …" status alone (don't replace it with the
+     * "转写中: …" formatter on the next 300ms poll). */
+    offlineState.stopRequested = false;
+    offlineState.stopError = error.message;
     updateControlAvailability();
     offlineStatus.textContent = `停止失败: ${error.message}`;
   }
 });
 
 function downsampleTo16k(input, inputRate) {
-  if (inputRate === 16000) {
-    return input;
-  }
-  const ratio = inputRate / 16000;
-  // Decimate, not average-pool!  Average of N consecutive samples
-  // cancels the audio signal (speech oscillates around zero, summing
-  // N samples → ~0).  We must *pick* one sample per window, not
-  // average them.  Use the center of each window for a stable pick.
-  const outputLength = Math.floor(input.length / ratio);
-  const output = new Float32Array(outputLength);
-  for (let index = 0; index < outputLength; index += 1) {
-    const center = (index + 0.5) * ratio;
-    output[index] = input[Math.min(input.length - 1, Math.floor(center))];
-  }
-  return output;
+  return QasrStatePure.downsampleTo16k(input, inputRate);
 }
 
 function floatToPcm16(input) {
-  const output = new Int16Array(input.length);
-  for (let index = 0; index < input.length; index += 1) {
-    const sample = Math.max(-1, Math.min(1, input[index]));
-    output[index] = sample < 0 ? sample * 32768 : sample * 32767;
-  }
-  return output;
+  return QasrStatePure.floatToPcm16(input);
 }
 
 async function flushRealtimeChunk(force) {

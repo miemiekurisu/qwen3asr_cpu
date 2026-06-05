@@ -339,8 +339,13 @@ AsrRunResult RunAsr(const AsrRunOptions & options) {
     }
 
     if (options.encoder_int8) {
-        if (qwen_set_encoder_int8(ctx, 1) != 0) {
-            std::fprintf(stderr, "warning: encoder INT8 init failed, falling back to F32\n");
+        /* encoder INT8 temporarily disabled (post-C8):
+         * see docs/INCIDENTS.md 2026-06-05 entry. */
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr,
+                "warning: --encoder-int8 temporarily disabled, ignoring\n");
+            warned = true;
         }
     }
 
@@ -429,8 +434,13 @@ AsrRunResult RunAsrSegmented(const AsrRunOptions & options) {
     }
 
     if (options.encoder_int8) {
-        if (qwen_set_encoder_int8(ctx, 1) != 0) {
-            std::fprintf(stderr, "warning: encoder INT8 init failed, falling back to F32\n");
+        /* encoder INT8 temporarily disabled (post-C8):
+         * see docs/INCIDENTS.md 2026-06-05 entry. */
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr,
+                "warning: --encoder-int8 temporarily disabled, ignoring\n");
+            warned = true;
         }
     }
 
@@ -541,8 +551,14 @@ AsrRunResult RunAsrSegmentedStreaming(const AsrRunOptions & options,
     }
 
     if (options.encoder_int8) {
-        if (qwen_set_encoder_int8(ctx, 1) != 0)
-            std::fprintf(stderr, "warning: encoder INT8 init failed, falling back to F32\n");
+        /* encoder INT8 temporarily disabled (post-C8):
+         * see docs/INCIDENTS.md 2026-06-05 entry. */
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr,
+                "warning: --encoder-int8 temporarily disabled, ignoring\n");
+            warned = true;
+        }
     }
 
     ctx->stream_max_new_tokens = static_cast<int>(options.stream_max_new_tokens);
