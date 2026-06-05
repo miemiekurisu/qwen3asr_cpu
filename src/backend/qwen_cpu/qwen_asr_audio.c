@@ -437,6 +437,10 @@ static void live_audio_append(qwen_live_audio_t *la, const float *data, int n_ne
     memcpy(la->samples + (size_t)la->n_samples, data, (size_t)n_new * sizeof(float));
     la->n_samples += n_new;
     LA_SIGNAL(la);
+    /* TODO(oom-audit-C1): la->samples grows monotonically; live_reader_thread
+     * drains via sample_offset but the underlying buffer is never shrunk.
+     * See docs/AUDIT_C1.md §4.1 for the same OOM risk in the per-session
+     * AppendManualLiveAudio path. */
     LA_UNLOCK(la);
 }
 
