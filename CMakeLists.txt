@@ -333,6 +333,7 @@ if(QASR_ENABLE_TESTS)
         tests/aligner_types_test.cc
         tests/aligner_client_test.cc
         tests/chunk_callback_test.cc
+        tests/qwen_clone_shared_test.cc
     )
 
     if(QASR_ENABLE_CPU_BACKEND)
