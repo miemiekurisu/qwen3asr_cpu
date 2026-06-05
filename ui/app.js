@@ -29,42 +29,15 @@ const REALTIME_FEATURE = "realtime";
 const MAX_ASYNC_UPLOAD_BYTES = 64 * 1024 * 1024;
 
 let activeFeature = "";
-
-/* Re-entrancy guards + button state machine.
- *
- * Four states from the user's perspective:
- *   idle       — no session, Start enabled, Stop disabled, Clear visible
- *                (if has text), Export enabled (if has text)
- *   starting   — Start was clicked, getUserMedia / /api/realtime/start
- *                in flight. Start disabled (visual feedback), Stop
- *                disabled, Clear hidden, Export disabled.
- *   live       — session active. Start disabled, Stop enabled, Clear
- *                hidden, Export disabled. Old info stays in the
- *                terminal, new segments append.
- *   stopping   — Stop was clicked, /api/realtime/stop in flight
- *                ("backend inference delay"). Start disabled (the
- *                "wait for backend" rule), Stop disabled, Clear
- *                hidden, Export disabled. Once the POST resolves we
- *                transition back to idle.
- *
- * The original "can't start a second time" bug was two-fold:
- *   1. startRealtime click handler did `startRealtime.disabled = false`
- *      in its finally block, which overrode the `disabled = true`
- *      that updateControlAvailability() had just set inside
- *      startRealtimeCapture() on the success path. The button looked
- *      clickable while a session was live, but the second click was
- *      silently dropped by the `activeFeature === REALTIME_FEATURE`
- *      guard with no visible feedback.
- *   2. There was no `stopping` state. During the /api/realtime/stop
- *      await, activeFeature was still REALTIME_FEATURE, so a Start
- *      click during that window was also silently dropped.
- *
- * Fix: a single in-flight `starting` flag, a single `stopping` flag,
- * a single updateControlAvailability() that knows the full state
- * machine. The click handlers set flags + call updateControlAvailability;
- * they no longer poke button.disabled directly. */
 let realtimeStarting = false;
 let realtimeStopping = false;
+/* Synchronous in-flight guard for startRealtimeCapture.  Unlike
+ * `realtimeStarting` (which is set by the click handler) and
+ * `activeFeature` (which is set only after the awaits complete),
+ * this flag is set at the entry of startRealtimeCapture itself,
+ * before any await, so a second concurrent invocation of
+ * startRealtimeCapture cannot race past the guard at the top. */
+let realtimeCapturing = false;
 
 let realtimeState = {
   audioContext: null,
@@ -741,6 +714,19 @@ async function startRealtimeCapture() {
      * would race with the cleanup of the previous session. */
     return;
   }
+  /* Synchronous in-flight guard.  The previous guard above only
+   * checks `activeFeature`, but `activeFeature = REALTIME_FEATURE`
+   * is set AFTER the awaits below.  A second concurrent invocation
+   * (e.g. fast double-click, programmatic dispatch, or any re-entry
+   * path that bypasses the click handler's `realtimeStarting` flag)
+   * would also pass the guard and create a second server session.
+   * This flag is set synchronously here so the next concurrent call
+   * hits the guard at the top and bails.  Cleared in the catch and
+   * finally below. */
+  if (realtimeCapturing) {
+    return;
+  }
+  realtimeCapturing = true;
 
   const mediaStream = await navigator.mediaDevices.getUserMedia({audio: true});
   const sessionResponse = await fetch("/api/realtime/start", {method: "POST", body: ""});
@@ -851,13 +837,21 @@ async function startRealtimeCapture() {
     if (audioContext) {
       await audioContext.close();
     }
-    try {
-      await fetch(`/api/realtime/stop?session_id=${encodeURIComponent(sessionData.session_id)}`, {
-        method: "POST",
-        body: "",
-      });
-    } catch (_cleanupError) {
-      // Best effort only; the original startup error is more important to surface.
+    /* Cleanup: send stop to server only if we actually got a real
+     * session_id.  Before that point (getUserMedia rejected, fetch
+     * rejected, response not ok) the server has no session for us
+     * and a stop with an undefined / error-payload session_id would
+     * either 404 (best case) or create a phantom server-side entry
+     * in the worst case. */
+    if (sessionData && sessionResponse && sessionResponse.ok && sessionData.session_id) {
+      try {
+        await fetch(`/api/realtime/stop?session_id=${encodeURIComponent(sessionData.session_id)}`, {
+          method: "POST",
+          body: "",
+        });
+      } catch (_cleanupError) {
+        // Best effort only; the original startup error is more important to surface.
+      }
     }
     /* If we got as far as setting activeFeature = REALTIME_FEATURE
      * (just after realtimeState was populated), clear it now so the
@@ -866,8 +860,16 @@ async function startRealtimeCapture() {
     if (activeFeature === REALTIME_FEATURE) {
       activeFeature = "";
     }
+    realtimeCapturing = false;
     updateControlAvailability();
     throw error;
+  } finally {
+    /* Belt and suspenders: if the success path forgot to clear
+     * realtimeCapturing (it doesn't, but defensive), this finally
+     * guarantees it's released for the next click.  The catch above
+     * also sets it false; this is a no-op in the error path and
+     * the only release in the success path. */
+    realtimeCapturing = false;
   }
 }
 
@@ -876,16 +878,23 @@ async function stopRealtimeCapture() {
     return;
   }
   const sessionId = realtimeState.sessionId;
-  window.clearInterval(realtimeState.sendTimer);
-  window.clearInterval(realtimeState.pollTimer);
-  await flushRealtimeChunk(true);
-
-  realtimeState.processor.disconnect();
-  realtimeState.source.disconnect();
-  realtimeState.mediaStream.getTracks().forEach((track) => track.stop());
-  await realtimeState.audioContext.close();
-
+  /* Tear down the audio graph first, regardless of what the stop
+   * fetch does.  If any of these disconnects / close() throws
+   * (e.g. partial Web Audio implementation, double-stop race),
+   * we MUST still reset realtimeState and activeFeature below —
+   * otherwise the user is stuck with a UI that thinks a session
+   * is live when the server has already cleaned up.  Wrap the
+   * whole "disconnect + fetch" block in a single try/finally. */
   try {
+    window.clearInterval(realtimeState.sendTimer);
+    window.clearInterval(realtimeState.pollTimer);
+    await flushRealtimeChunk(true);
+
+    realtimeState.processor.disconnect();
+    realtimeState.source.disconnect();
+    realtimeState.mediaStream.getTracks().forEach((track) => track.stop());
+    await realtimeState.audioContext.close();
+
     const response = await fetch(`/api/realtime/stop?session_id=${encodeURIComponent(sessionId)}`, {
       method: "POST",
       body: "",

@@ -41,3 +41,6 @@ testfile/*.mp3
 testfile/*.wav
 testfile/*.txt
 !testfile/README.md
+
+# JS test deps (jsdom) — installed via npm install
+node_modules/
