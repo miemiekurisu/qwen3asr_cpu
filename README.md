@@ -422,7 +422,7 @@ docker run --rm -p 8080:8080 \
 | `QASR_UI_DIR` | run | `$PROJECT_ROOT/ui` | UI 目录 |
 | `QASR_THREADS` | run | `0`=auto | 推理线程 (透传给 `qasr_server --threads`) |
 | `QASR_VERBOSITY` | run | `0` | 日志级别 |
-| `QASR_VAD_MODEL` | run | `$PROJECT_ROOT/models/silero_vad/silero_vad.onnx` | Silero VAD ONNX 模型 |
+| `QASR_VAD_MODEL` | run | `$PROJECT_ROOT/models/silero_vad/silero_vad.onnx` | Silero VAD ONNX 模型 (由 `run_linux_server.sh` 透传给 server 作为 `QWEN_SILERO_VAD_MODEL`) |
 | `QASR_TLS_CERT_DIR` | run | mktemp -d | 持久化 cert 目录 (默认启动时 `mktemp -d`, 退出时删) |
 | `QASR_PROJECT_ROOT` | run | auto | 项目根 |
 | `QASR_BUILD_DIR` | run / build | `build/linux-openblas` | 编译输出 |
@@ -436,6 +436,8 @@ docker run --rm -p 8080:8080 \
 | `QASR_PYTHON` | build | auto | python3 路径 |
 | `QASR_JOBS` | build | `nproc` | 编译并发 |
 | `QASR_APT_MIRROR` | build | 系统默认 | apt 源 (留空用系统默认) |
+| `QASR_APT_RETRIES` | docker | `3` | (仅 `tools/docker_linux_openblas.sh`) `apt-get install` 重试次数 |
+| `QASR_APT_TIMEOUT` | docker | `20` | (仅 `tools/docker_linux_openblas.sh`) `apt-get install` 单次超时 (秒) |
 | `QASR_HF_CACHE` | build | `~/.cache/huggingface` | HF 缓存根 |
 | `QASR_HF_REPO` | build | `Qwen/Qwen3-ASR-0.6B` | 模型仓库 (探测失败时下载) |
 | `QASR_ONNXRUNTIME_ROOT` | build | auto | ONNX runtime 安装路径 (手装时指定) |
@@ -466,6 +468,22 @@ Qwen3-ASR 内部 C 后端用这些 env var 调线程 / 内存：
 | `QWEN_ENC_QKV_SHAPE_AUTO_LARGE_SEQ` | 96 | `shape_auto` 视为"大 seq"阈值 |
 | `QWEN_ENC_QKV_SHAPE_AUTO_LARGE_DMODEL` | 1024 | `shape_auto` 视为"大 dmodel"阈值 |
 | `QWEN_ENC_QKV_SHAPE_AUTO_MAX_SEPARATE_THREADS` | 8 | `shape_auto` 用 separate 的最大线程数 |
+| `QWEN_PREFILL_THREADS` | 0=auto | encoder QKV prefill 线程数 (覆盖 `shape_auto` 推断) |
+| `QWEN_DECODE_THREADS` | 0=auto | decoder 线程数 |
+| `QWEN_BF16_CACHE_MB` | 0=off | encoder BF16 权重缓存上限 (MB); 0=不缓存; 设了之后会按需 keep 住已量化权重 |
+| `QWEN_STREAM_NO_ENC_CACHE` | 0=cache on | 非 0=禁 encoder 缓存 (流式节省内存但每次重算); 注意: realtime 模式强制开启缓存, 此 env 不生效 |
+| `QWEN_DEC_LAYER_TIMING` | 0=off | 非 0=打印每层 decoder 时间 (debug 用, 影响性能) |
+
+#### Silero VAD 路径查找 (`QWEN_*`)
+
+C 端 `qwen_silero_vad_resolve_path` 按下列顺序查找 ONNX 文件。`run_linux_server.sh`
+已把 `$QASR_VAD_MODEL` 透传给 `QWEN_SILERO_VAD_MODEL`, 普通用户无需设这些:
+
+| Env | 默认 | 说明 |
+|---|---|---|
+| `QWEN_SILERO_VAD_MODEL` | (空) | 直接路径: `/path/to/silero_vad.onnx` |
+| `QWEN_SILERO_VAD_DIR` | (空) | 目录: `$DIR/silero_vad.onnx` |
+| `QWEN_MODEL_DIR` | (空) | 兜底: `$QWEN_MODEL_DIR/silero_vad.onnx` (与 ASR 模型同目录) |
 
 实战 (i7-14700KF, 0.6B)：
 
