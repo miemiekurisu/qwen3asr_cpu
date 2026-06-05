@@ -56,7 +56,7 @@ qwen3asr_cpu 的模块边界、数据流和状态机。
 - **qwen_asr.c**: ctx 生命周期 (`qwen_load` / `qwen_clone_shared` / `qwen_free`)。`qwen_clone_shared` 是浅 struct copy + `owns_model_data=0`，让多 session 共享权重。
 - **qwen_asr_encoder.c / qwen_asr_decoder.c**: 编码器 (Whisper-style conv) 和解码器 (autoregressive LM)。
 - **qwen_asr_kernels_*.c**: GEMV / softmax / RoPE / sample，按 ISA 分发 (AVX2 / NEON / generic)。
-- **qwen_asr_onednn.c**: 可选 INT8 加速，仅在 `--encoder-int8` / `--decoder-int8` 启用时调用。**注意**: decoder INT8 显著降低识别质量，realtime 默认关闭 (需 `--realtime-decoder-int8` 显式开)。
+- **qwen_asr_onednn.c**: 可选 INT8 加速，仅在 `--encoder-int8` 启用时调用。Decoder INT8 已移除 (C8) — 显著降低识别质量 (语言一致性 / code-switch / 幻觉) 且 ASan 跑出大量越界 (走 quantize + oneDNN matmul 的 fast path 难调试)。Encoder INT8 风险小、收益明显，保留。
 - **qwen_silero_vad.c**: Silero VAD v5 ONNX runtime 集成，用于实时流 VAD 段式。
 - **qwen_asr_audio.c**: live audio chunk 累积、VAD 状态维护。
 

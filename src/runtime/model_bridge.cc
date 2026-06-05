@@ -338,12 +338,6 @@ AsrRunResult RunAsr(const AsrRunOptions & options) {
         return result;
     }
 
-    if (options.decoder_int8) {
-        if (qwen_set_decoder_int8(ctx, 1) != 0) {
-            std::fprintf(stderr, "warning: decoder INT8 init failed, falling back to BF16\n");
-        }
-    }
-
     if (options.encoder_int8) {
         if (qwen_set_encoder_int8(ctx, 1) != 0) {
             std::fprintf(stderr, "warning: encoder INT8 init failed, falling back to F32\n");
@@ -434,11 +428,6 @@ AsrRunResult RunAsrSegmented(const AsrRunOptions & options) {
         return result;
     }
 
-    if (options.decoder_int8) {
-        if (qwen_set_decoder_int8(ctx, 1) != 0) {
-            std::fprintf(stderr, "warning: decoder INT8 init failed, falling back to BF16\n");
-        }
-    }
     if (options.encoder_int8) {
         if (qwen_set_encoder_int8(ctx, 1) != 0) {
             std::fprintf(stderr, "warning: encoder INT8 init failed, falling back to F32\n");
@@ -551,10 +540,6 @@ AsrRunResult RunAsrSegmentedStreaming(const AsrRunOptions & options,
         return result;
     }
 
-    if (options.decoder_int8) {
-        if (qwen_set_decoder_int8(ctx, 1) != 0)
-            std::fprintf(stderr, "warning: decoder INT8 init failed, falling back to BF16\n");
-    }
     if (options.encoder_int8) {
         if (qwen_set_encoder_int8(ctx, 1) != 0)
             std::fprintf(stderr, "warning: encoder INT8 init failed, falling back to F32\n");

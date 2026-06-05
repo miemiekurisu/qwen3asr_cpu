@@ -273,25 +273,20 @@ QASR_TEST(QwenCloneSharedClearsCallbacks) {
     qwen_free(src);
 }
 
-QASR_TEST(QwenCloneSharedDisablesInt8) {
+QASR_TEST(QwenCloneSharedDisablesEncoderInt8) {
+    // The clone must zero encoder_int8 + the int8_enc_layers pointer
+    // (INT8 resources are per-context, see qwen_asr.c).  The decoder
+    // INT8 path was removed in C8 — see docs/INCIDENTS.md.
     qwen_ctx_t *src = MakeSourceCtx();
-    src->decoder_int8 = 1;
-    // Real calloc'd pointers (not fake addresses): qwen_free()
-    // walks the int8 layer array via n_int8_dec_layers and would
-    // deref whatever int8_dec_layers points to.  The layer
-    // members themselves are zeroed (calloc), so the inner
-    // qwen_int8_weight_free / matmul_free calls are no-ops.
-    src->int8_dec_layers = std::calloc(28, sizeof(qwen_int8_dec_layer_t));
-    src->n_int8_dec_layers = 28;
     src->encoder_int8 = 1;
+    // Real calloc'd pointers (not fake addresses): qwen_free() walks
+    // the int8 layer array via n_int8_enc_layers.  The layer members
+    // are zeroed (calloc), so the inner free calls are no-ops.
     src->int8_enc_layers = std::calloc(18, sizeof(qwen_int8_enc_layer_t));
     src->n_int8_enc_layers = 18;
 
     qwen_ctx_t *clone = qwen_clone_shared(src);
     QASR_EXPECT(clone != nullptr);
-    QASR_EXPECT_EQ(clone->decoder_int8, 0);
-    QASR_EXPECT(clone->int8_dec_layers == nullptr);
-    QASR_EXPECT_EQ(clone->n_int8_dec_layers, 0);
     QASR_EXPECT_EQ(clone->encoder_int8, 0);
     QASR_EXPECT(clone->int8_enc_layers == nullptr);
     QASR_EXPECT_EQ(clone->n_int8_enc_layers, 0);

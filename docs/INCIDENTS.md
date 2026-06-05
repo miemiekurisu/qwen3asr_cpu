@@ -184,3 +184,36 @@ VAD commit 路径在 `ApplyStableRealtimeCommit` 之后更新 `live->decoded_cur
 | `CliDispatcher` | ~100 | 解析 HTTP 路径参数 |
 
 **回滚方案**: 不动则无需回滚。
+
+---
+
+## 2026-06-05: `--decoder-int8` 移除 (C8)
+
+**症状**: `--decoder-int8` 在 C1 审计时就已标记"显著降低识别质量":
+- 语言一致性下降 (Chinese 音频里出 English 片段)
+- 中英混杂泄漏 (code-switch)
+- 低置信度音频上更易产生幻觉
+
+加 `--realtime-decoder-int8` 也救不了 — 解码器 INT8 量化的是自回归 Qwen3 LM 的权重, 不是缓存. 选项本身有毒.
+
+**修复** (C8): 整套移除.
+- `qwen_set_decoder_int8` C API 删除 (无调用方)
+- `decoder_int8` / `int8_dec_layers` / `n_int8_dec_layers` 字段从 `qwen_ctx_t` 删除
+- `qwen_decoder_prepare_int8` / `qwen_decoder_free_int8` (oneDNN path + stub) 删除
+- `qwen_int8_dec_layer_t` struct 删除
+- `--decoder-int8` / `--realtime-decoder-int8` 从 `qasr_cli` / `qasr_server` 删除
+- `qwen_asr_decoder.c` 两个 QKV/wo/gate_up/down 处的 `if (il) { qwen_int8_matvec(...) } else { ... }` 三元块全部塌缩为 `else` 路径
+- `QwenCloneSharedDisablesInt8` → `QwenCloneSharedDisablesEncoderInt8` (只测 encoder)
+- `onednn_int8_test.cc` 删 group 3 (8 个 CLI 测试)
+
+**保留**:
+- `--encoder-int8`: encoder 是 Whisper-style conv, INT8 风险小, 收益明显
+- `qwen_int8_enc_layer_t` + `qwen_encoder_prepare_int8` + `qwen_encoder_free_int8` 全保留
+- `qwen_asr_encoder.c` INT8 路径保留
+- `onednn_int8_test.cc` group 1+2 (encoder-relevant) 全部保留
+
+**验证**:
+- C++ 665/665 PASS (linux-openblas)
+- ASAN: 654 PASS, 0 ASan/UBSan errors
+
+**回滚方案**: git revert afb70d1..HEAD. 但强烈建议不回滚, 理由如上.

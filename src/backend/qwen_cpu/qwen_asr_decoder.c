@@ -657,25 +657,15 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
     for (int layer = 0; layer < cfg->dec_layers; layer++) {
         qwen_dec_layer_t *l = &dec->layers[layer];
 
-        /* INT8 layer pointer (NULL if unavailable) */
-        qwen_int8_dec_layer_t *il = NULL;
-        if (ctx->int8_dec_layers && layer < ctx->n_int8_dec_layers) {
-            il = &((qwen_int8_dec_layer_t *)ctx->int8_dec_layers)[layer];
-            if (!il->mm_wq) il = NULL;  /* guard against partial init */
-        }
-
         /* Input RMSNorm */
         qwen_rms_norm(x_norm, x, l->input_norm, seq_len, dim, eps);
 
-        /* QKV projections — INT8 path uses separate Q/K/V matmuls,
-         * BF16/F32 path uses fused single GEMM */
+        /* QKV projections — BF16 path uses fused single GEMM.
+         * (Decoder INT8 removed in C8; the per-layer `il` selection
+         * block was deleted alongside the int8 layer array.) */
         {
             const double qkv_start = qwen_perf_now_ms();
-            if (il) {
-                qwen_int8_matvec(il->mm_wq, x_norm, seq_len, q);
-                qwen_int8_matvec(il->mm_wk, x_norm, seq_len, k);
-                qwen_int8_matvec(il->mm_wv, x_norm, seq_len, v);
-            } else if (seq_len > 1 && l->prefill_qkv_prepared.f32_data) {
+            if (seq_len > 1 && l->prefill_qkv_prepared.f32_data) {
                 qwen_linear_nobias_qkv_f32_packed(q, k, v,
                                                   qkv_out_scratch,
                                                   x_norm,
@@ -726,13 +716,9 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
         /* Output projection + residual */
         {
             const double wo_t0 = qwen_perf_now_ms();
-            if (il) {
-                qwen_int8_matvec(il->mm_wo, attn_out, seq_len, proj_out);
-            } else {
-                qwen_linear_nobias_bf16_scratch(proj_out, attn_out, l->wo_weight_bf16,
-                                linear_weight_scratch,
-                                seq_len, q_dim, dim);
-            }
+            qwen_linear_nobias_bf16_scratch(proj_out, attn_out, l->wo_weight_bf16,
+                            linear_weight_scratch,
+                            seq_len, q_dim, dim);
             call_wo_ms += qwen_perf_now_ms() - wo_t0;
         }
         qwen_add_inplace(x, proj_out, seq_len * dim);
@@ -743,9 +729,7 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
         /* SwiGLU MLP */
         {
             const double gate_up_start = qwen_perf_now_ms();
-            if (il) {
-                qwen_int8_matvec(il->mm_gate_up, x_norm, seq_len, gate_up);
-            } else if (l->prefill_gate_up_prepared.f32_data) {
+            if (l->prefill_gate_up_prepared.f32_data) {
                 qwen_linear_nobias(gate_up, x_norm, l->prefill_gate_up_prepared.f32_data,
                                    seq_len, dim, 2 * intermediate);
             } else {
@@ -758,13 +742,9 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
         qwen_swiglu_multiply(gate, gate_up, seq_len, intermediate);
         {
             const double down_t0 = qwen_perf_now_ms();
-            if (il) {
-                qwen_int8_matvec(il->mm_down, gate, seq_len, ffn_out);
-            } else {
-                qwen_linear_nobias_bf16_scratch(ffn_out, gate, l->down_weight_bf16,
-                                                linear_weight_scratch,
-                                                seq_len, intermediate, dim);
-            }
+            qwen_linear_nobias_bf16_scratch(ffn_out, gate, l->down_weight_bf16,
+                                            linear_weight_scratch,
+                                            seq_len, intermediate, dim);
             call_down_ms += qwen_perf_now_ms() - down_t0;
         }
 
@@ -867,24 +847,14 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
 
         qwen_rms_norm(x_norm, x, l->input_norm, 1, dim, eps);
 
-        /* INT8 path: use oneDNN matmul when available */
-        qwen_int8_dec_layer_t *il = NULL;
-        if (ctx->int8_dec_layers && layer < ctx->n_int8_dec_layers) {
-            il = &((qwen_int8_dec_layer_t *)ctx->int8_dec_layers)[layer];
-            if (!il->mm_wq) il = NULL;  /* guard against partial init */
-        }
-
-        if (il) {
-            qwen_int8_matvec(il->mm_wq, x_norm, 1, q);
-            qwen_int8_matvec(il->mm_wk, x_norm, 1, k);
-            qwen_int8_matvec(il->mm_wv, x_norm, 1, v);
-        } else {
-            qwen_linear_nobias_bf16_qkv(q, k, v, x_norm,
-                                        l->wq_weight_bf16,
-                                        l->wk_weight_bf16,
-                                        l->wv_weight_bf16,
-                                        dim, q_dim, kv_dim);
-        }
+        /* BF16 QKV path.  (Decoder INT8 removed in C8; the per-layer
+         * `il` selection block was deleted alongside the int8 layer
+         * array.) */
+        qwen_linear_nobias_bf16_qkv(q, k, v, x_norm,
+                                    l->wq_weight_bf16,
+                                    l->wk_weight_bf16,
+                                    l->wv_weight_bf16,
+                                    dim, q_dim, kv_dim);
 
         /* Per-head Q/K RMSNorm */
         qwen_rms_norm_per_head(q, l->q_norm_weight, 1, n_heads, head_dim, eps);
@@ -905,29 +875,17 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
                                1, total_seq, n_heads, n_kv_heads,
                                head_dim, scale, pos, NULL);
 
-        if (il) {
-            qwen_int8_matvec(il->mm_wo, attn_out, 1, proj_out);
-        } else {
-            qwen_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
-        }
+        qwen_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
         qwen_add_inplace(x, proj_out, dim);
 
         qwen_rms_norm(x_norm, x, l->post_attn_norm, 1, dim, eps);
 
         /* Fused gate+up matvec: one pass over x_norm, output interleaved [g0,u0,g1,u1,...] */
-        if (il) {
-            qwen_int8_matvec(il->mm_gate_up, x_norm, 1, gate_buf);
-        } else {
-            qwen_linear_nobias_bf16(gate_buf, x_norm, l->gate_up_fused_bf16,
-                                     1, dim, 2 * intermediate);
-        }
+        qwen_linear_nobias_bf16(gate_buf, x_norm, l->gate_up_fused_bf16,
+                                 1, dim, 2 * intermediate);
         /* In-place for seq=1: gate_buf[0:inter] receives SwiGLU output. */
         qwen_swiglu_multiply(gate_buf, gate_buf, 1, intermediate);
-        if (il) {
-            qwen_int8_matvec(il->mm_down, gate_buf, 1, ffn_out);
-        } else {
-            qwen_linear_nobias_bf16(ffn_out, gate_buf, l->down_weight_bf16, 1, intermediate, dim);
-        }
+        qwen_linear_nobias_bf16(ffn_out, gate_buf, l->down_weight_bf16, 1, intermediate, dim);
         qwen_add_inplace(x, ffn_out, dim);
     }
 
