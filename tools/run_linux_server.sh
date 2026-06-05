@@ -11,10 +11,13 @@
 #   tools/run_linux_server.sh --https-info          # 显示 cert / proxy 状态
 #
 # 必填环境变量:
-#   QASR_MODEL_DIR     Qwen3-ASR-0.6B 目录 (含 model.safetensors)
-#                      例: export QASR_MODEL_DIR=$HOME/models/Qwen3-ASR-0.6B
+#   QASR_MODEL_DIR         Qwen3-ASR-0.6B 目录 (含 model.safetensors)
+#                          例: export QASR_MODEL_DIR=$HOME/models/Qwen3-ASR-0.6B
 #
 # 可选环境变量 (有合理默认):
+#   QASR_REALTIME_MODEL_DIR  实时/host-capture 模型目录 (默认 = 跟 batch 同 = 共享内存)
+#                            推荐: 0.6B 跑 realtime, 1.7B 跑 batch
+#                            例: 1.7B 离线高质量 + 0.6B 实时低延迟
 #   QASR_HOST          监听地址 (默认 0.0.0.0)
 #   QASR_PORT          监听端口 (默认 19991)
 #   QASR_UI_DIR        UI 目录 (默认 $PROJECT_ROOT/ui)
@@ -82,6 +85,7 @@ PROXY_PID="${QASR_PROXY_PID:-/tmp/qasr_proxy.pid}"
 HTTPS_PORT="${QASR_HTTPS_PORT:-19992}"
 TLS_CERT_DIR="${QASR_TLS_CERT_DIR:-}"
 MODEL_DIR="${QASR_MODEL_DIR:-}"
+REALTIME_MODEL_DIR="${QASR_REALTIME_MODEL_DIR:-}"
 DETACHED=0
 DO_STOP=0
 DO_STATUS=0
@@ -108,6 +112,8 @@ usage() {
                       例: export QASR_MODEL_DIR=\$HOME/models/Qwen3-ASR-0.6B
 
 可选环境变量 (有默认):
+  QASR_REALTIME_MODEL_DIR  realtime 模型 (默认 = 跟 batch 共享内存)
+                           推荐: 1.7B batch + 0.6B realtime
   QASR_HOST=0.0.0.0   QASR_PORT=19991   QASR_HTTPS_PORT=19992
   QASR_THREADS=0      (0=自动)
   QASR_VERBOSITY=0    (0=silent, 1=commit, 2=per-poll, 3=raw)
@@ -123,6 +129,12 @@ usage() {
   export QASR_MODEL_DIR=\$HOME/.cache/huggingface/models--Qwen--Qwen3-ASR-0.6B/snapshots/<rev>
   tools/run_linux_server.sh --detach                  # 后台 HTTP only (API/curl 用)
   tools/run_linux_server.sh --detach --https          # 后台 HTTP + HTTPS (浏览器用, 推荐)
+
+  # 1.7B batch + 0.6B realtime (推荐: 离线要质量, 实时要速度)
+  export QASR_MODEL_DIR=\$HOME/.../Qwen3-ASR-1.7B/snapshots/<rev>
+  export QASR_REALTIME_MODEL_DIR=\$HOME/.../Qwen3-ASR-0.6B/snapshots/<rev>
+  tools/run_linux_server.sh --detach --https
+
   tools/run_linux_server.sh --stop                    # 停
   tools/run_linux_server.sh --status                  # 健康检查
   tools/run_linux_server.sh --https-info              # cert / proxy 状态
@@ -170,6 +182,21 @@ check_required() {
         exit 1
     fi
     log_ok "QASR_MODEL_DIR=$MODEL_DIR"
+
+    # 可选: realtime 模型 (默认 = 跟 batch 共享)
+    if [[ -n "$REALTIME_MODEL_DIR" ]]; then
+        if [[ ! -d "$REALTIME_MODEL_DIR" ]]; then
+            log_err "QASR_REALTIME_MODEL_DIR=$REALTIME_MODEL_DIR 目录不存在"
+            exit 1
+        fi
+        if [[ ! -f "$REALTIME_MODEL_DIR/model.safetensors" && ! -f "$REALTIME_MODEL_DIR/model-00001-of-00002.safetensors" && ! -f "$REALTIME_MODEL_DIR/model-00001-of-00003.safetensors" ]]; then
+            log_err "QASR_REALTIME_MODEL_DIR=$REALTIME_MODEL_DIR 不含 model.safetensors"
+            exit 1
+        fi
+        log_ok "QASR_REALTIME_MODEL_DIR=$REALTIME_MODEL_DIR"
+    else
+        log_ok "QASR_REALTIME_MODEL_DIR=<unset>  (realtime 与 batch 共享内存)"
+    fi
 
     if [[ ! -x "$BUILD_DIR/qasr_server" ]]; then
         log_err "找不到 $BUILD_DIR/qasr_server"
@@ -283,11 +310,43 @@ do_https_info() {
 }
 
 # ─────────────── 启动 ───────────────
+# ─────────────── 端口预检 ───────────────
+check_port_free() {
+    local port="$1" label="$2"
+    if command -v ss >/dev/null 2>&1; then
+        if ss -tln "sport = :$port" 2>/dev/null | grep -q ":$port"; then
+            local occupant
+            occupant="$(ss -tlnp "sport = :$port" 2>/dev/null | grep ":$port" | head -1 | sed -E 's/.*users:\(\("([^,]+)".*/\1/' )"
+            log_err "$label 端口 $port 已被占用: $occupant"
+            log_err "  解决: 杀旧进程:    kill \$(cat $PID_FILE 2>/dev/null) 2>/dev/null"
+            log_err "        或跑本脚本 --stop"
+            log_err "        或换端口:    QASR_PORT=19993 tools/run_linux_server.sh --detach --https"
+            return 1
+        fi
+    elif command -v lsof >/dev/null 2>&1; then
+        if lsof -iTCP:"$port" -sTCP:LISTEN -P -n 2>/dev/null | grep -q ":$port"; then
+            local pid
+            pid="$(lsof -iTCP:"$port" -sTCP:LISTEN -P -n -t 2>/dev/null | head -1)"
+            log_err "$label 端口 $port 已被占用 (PID $pid)"
+            return 1
+        fi
+    fi
+    return 0
+}
+
 do_start() {
     log_step "启动参数"
     log_info "binary:  $BUILD_DIR/qasr_server"
     log_info "model:   $MODEL_DIR"
+    if [[ -n "$REALTIME_MODEL_DIR" ]]; then
+        log_info "realtime-model: $REALTIME_MODEL_DIR  (2 个独立实例, 内存吃紧)"
+    else
+        log_info "realtime-model: <shared with batch>     (0 额外内存)"
+    fi
     log_info "ui:      $UI_DIR"
+
+    check_port_free "$PORT"     "server"  || exit 1
+    [[ $USE_HTTPS -eq 1 ]] && check_port_free "$HTTPS_PORT" "proxy" || exit 1
     log_info "host:    $HOST"
     log_info "port:    $PORT  (HTTP)"
     [[ $USE_HTTPS -eq 1 ]] && log_info "         $HTTPS_PORT  (HTTPS, --https)"
@@ -302,6 +361,7 @@ do_start() {
         --threads   "$THREADS"
         --verbosity "$VERBOSITY"
     )
+    [[ -n "$REALTIME_MODEL_DIR" ]] && args+=(--realtime-model-dir "$REALTIME_MODEL_DIR")
 
     if [[ $DETACHED -eq 1 ]]; then
         log_step "后台启动 server (日志 $LOG_FILE, PID $PID_FILE)"
