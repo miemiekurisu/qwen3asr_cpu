@@ -338,10 +338,7 @@ function extractConfirmedRealtimeText() {
   /* Archive = locked terminal lines (state 'done').  The currently-
    * typing line is excluded because it isn't a final commitment yet
    * — it could still be replaced if a new segment commit arrives. */
-  return realtimeArchive.lines
-    .filter((l) => l.state === "done" && l.text && l.text.trim())
-    .map((l) => l.text)
-    .join(" ");
+  return QasrStatePure.computeConfirmedRealtimeText(realtimeArchive.lines);
 }
 
 function updateRealtimeExportAvailability() {
