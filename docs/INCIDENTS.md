@@ -79,3 +79,108 @@ git revert <commit>           # 直接回滚
 7. **代码审计**：`qwen_clone_shared` 第 390 行 `ctx->decoder = src->decoder;` 浅拷贝 + `qwen_free` 第 573-574 行 free 写在 `owns_model_data` 块**外** → 共享指针被多次释放。**根因锁定**。
 
 工具用过的：valgrind（10× 慢，3 min 才跑完 1 session，弃用）、ASAN（chunk header 已被破坏后自身 SEGV）、MALLOC_CHECK_=3（glibc 准确报告）。**最终** MALLOC_CHECK_=3 是性价比最高的工具。
+
+---
+
+## 2026-06-05: UI 实时启动按钮逻辑错误（"按第二次没反应" / 旧信息丢失）
+
+**症状**: 用户在浏览器里按 Stop 后再按 Start，第二次 Start 无响应；或允许在直播中点 Clear/Export 误操作；或 Start 后旧文字被整块清空，违反"旧信息保留"原则。
+
+**根因**（三点叠加）:
+
+1. `startRealtime` click handler 的 `finally` 块强制 `startRealtime.disabled = false`，覆盖了 `updateControlAvailability()` 算出的 `true`（在启动/停止中应当灰化）。
+2. 没有 `realtimeStopping` 标志位。Stop 后 `activeFeature` 还在等后台识别延时清理（有时 200-500ms），用户在这个窗口里再点 Start 命中 `hasRealtimeSession()`，早返回静默。
+3. 第二次 Start 调用 `resetRealtimeArchive()` 整块清掉所有 `done` 行，违反"第二次 Start 应在旧文字下方追加"的需求。
+
+**复现**（修复前）:
+
+1. 打开 Web UI，点 Start → 允许麦克风 → 说话。
+2. 等出现 2-3 句文字 → 点 Stop。
+3. 立即点 Start（无延迟）。现象: 按钮看起来亮但没反应（console 无日志）。
+4. 等待 5s + 再次点 Start → 旧文字整块消失，新文字从头开始。
+
+**修复**（`ui/app.js`）:
+
+- 新增 `realtimeStopping` 标志，`stopRealtime` click handler 入口置 true，`finally` 调 `updateControlAvailability()` 解禁（不再硬置 disabled）。
+- 新增 `softResetRealtimeArchive(newSessionId)`：保 `done` 行 → 把 `typing` 行（如果有文字）提交 `done` → 删空 cursor → 加新空 cursor。
+- 重写 `updateControlAvailability()` 统一管 4 态（idle/starting/live/stopping）:
+
+  | 状态 | Start | Stop | Clear | Export | AudioMeter |
+  |------|-------|------|-------|--------|------------|
+  | idle (无活) | ✅ | ❌ | ✅ | ✅(有字) | 隐 |
+  | starting | ❌ | ❌ | 隐 | ❌ | 隐 |
+  | live | ❌ | ✅ | 隐 | ❌ | 显 |
+  | stopping | ❌ | ❌ | 隐 | ❌ | 隐 |
+
+- `clearRealtime` / `exportRealtimeText/Json` 在 idle 之外一律 disabled。
+- `startRealtime` click handler 入口早返 `if (realtimeStarting || realtimeStopping) return;` + `finally { realtimeStarting = false; updateControlAvailability(); }`，3 道闸确保不重入。
+
+**验证**（手工）:
+
+| 场景 | 结果 |
+|------|------|
+| Start → Stop → 文字保留 | ✅ |
+| Stop 立即再 Start → 旧文字下追加 | ✅ |
+| Start 期间点 Start → 按钮置灰无反应 | ✅ |
+| Live 期间点 Clear → 按钮 disabled | ✅ |
+| Live 期间 Export → 按钮 disabled | ✅ |
+| Stopping 期间点 Start → 按钮 disabled | ✅ |
+| Idle 期间 Export(有字) → 可下载 | ✅ |
+
+**回归**:
+- `node -c ui/app.js` PASS
+- `node tests/state_pure_test.js` 24/24 PASS（`computeSoftResetLines` 是 `softResetRealtimeArchive` 的纯逻辑镜像）
+- `bash tools/smoke_test.sh` 18/18 PASS
+
+**回滚方案**:
+```bash
+git revert <commit>  # 直接回滚 UI 改动
+```
+
+---
+
+## 2026-06-05: OOM 风险 — `qwen_live_audio_t::samples` 单调增长
+
+**症状**: 长跑实时 session（≥1h），RSS 持续上涨。审计发现 `qwen_live_audio_t::samples` 在整个 session 生命周期内只 realloc 不 trim，单 session 1h 累积 ~230 MB；按 `kMaxRealtimeSessions=64` 上限理论可吃 14.7 GB。当前未触发 OOM 因为单 session 短跑（<5 min）测试覆盖不到，**这是 C1 审计发现的高危风险点**。
+
+**根因**:
+
+`AppendManualLiveAudio`（`src/service/server.cc:1764`）调用 `realloc()` 扩展 `live->samples` 容量，但不释放已消费的前缀；`DestroyManualLiveAudio`（`src/service/server.cc:1745`）在 session 退出时才整体 `free()`。`live_audio_append`（`src/backend/qwen_cpu/qwen_asr_audio.c:417`）同模式。
+
+VAD commit 路径在 `ApplyStableRealtimeCommit` 之后更新 `live->decoded_cursor`，但 cursor 之前的样本从未被 trim。
+
+**当前缓解**（已加 TODO 注释）:
+
+`src/service/server.cc:1808-1813` 和 `src/backend/qwen_cpu/qwen_asr_audio.c:439` 已加 TODO 注释指向 `docs/AUDIT_C1.md §4.1`。
+
+**待实施**（任选其一）:
+
+| 方案 | 改动量 | 内存上限 | 复杂度 |
+|------|--------|----------|--------|
+| Ring buffer 固定 cap 64 MB | 中 | 64 MB × 64 sessions = 4 GB | 中（需改 audio append 逻辑） |
+| 周期 trim `samples[0..decoded_cursor]` | 小 | 1h session = 230 MB → ~10 MB 稳态 | 小（VAD commit 时 memmove） |
+| Session wall-clock cap（≥1h 强制结束） | 小 | 0 额外（只限制时长） | 小 |
+
+**当前策略**: 暂不修，因为实际用户场景为短跑（5-10 min）。待真实长跑需求出现时再做 C5.2+。
+
+**回滚方案**: TODO 注释无运行时影响，无需回滚。
+
+---
+
+## 2026-06-05: God function `RunServer` (1784 行)
+
+**症状**: `RunServer` 函数 1784 行（`src/service/server.cc:2610-4394`），单文件 4241 行，难以单测、code review、扩展。
+
+**当前状态**: 仅 `TODO(god-function-audit-C1)` 注释，按 C1 审计策略"只标注 TODO，不拆分"暂不动。
+
+**待拆**（`docs/AUDIT_C1.md §5.1` 建议）:
+
+| 子模块 | 行数估计 | 职责 |
+|--------|----------|------|
+| `RoutesRegistration` | ~150 | 注册 HTTP 路由表 |
+| `SessionLifecycle` | ~400 | session start/chunk/stop/eof/stream |
+| `VadSegmentedWorker` | ~600 | VAD 段式解码 + 段提交 |
+| `LiveWorker` | ~500 | 实时 worker 主循环 |
+| `CliDispatcher` | ~100 | 解析 HTTP 路径参数 |
+
+**回滚方案**: 不动则无需回滚。

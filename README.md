@@ -325,3 +325,47 @@ docs/                   Design notes and internal references
 ## License
 
 MIT. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
+
+## 进一步阅读
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — 模块边界、数据流、UI 状态机、并发模型、god function 拆分计划
+- [`docs/API.md`](docs/API.md) — 全部 HTTP 端点、错误码、SSE 事件
+- [`docs/SECURITY.md`](docs/SECURITY.md) — 信任边界、威胁清单、生产部署 checklist
+- [`docs/AUDIT_C1.md`](docs/AUDIT_C1.md) — C1 审计报告 (死代码 / UAF / OOM / god function)
+- [`docs/INCIDENTS.md`](docs/INCIDENTS.md) — 历史事故 + 修复 (150s crash / UI 状态机 / OOM 风险)
+- [`docs/BLAS_COMPARISON.md`](docs/BLAS_COMPARISON.md) — OpenBLAS / Accelerate / oneDNN 对比
+
+### 高级特性
+
+#### Per-feature 模型 (`--realtime-model-dir`)
+
+`tools/run_linux_server.sh` 启动时, batch 和 realtime 可独立指定模型:
+
+```bash
+export QASR_MODEL_DIR=.../Qwen3-ASR-1.7B/...   # batch (高质量)
+export QASR_REALTIME_MODEL_DIR=.../Qwen3-ASR-0.6B/...  # realtime (低延迟)
+tools/run_linux_server.sh --detach --https
+```
+
+同路径时共享 `SharedAsrModel` 实例 (省 1.2 GB); 不同路径各自 `qwen_load` (总计 4.6 GB)。日志会打印 "2 个独立实例" 或 "0 额外内存"。
+
+#### VAD 段式批量转写
+
+`POST /api/transcriptions/async` 现在走 VAD 段式 (`kBatchVadSilenceFrames=16` = 500ms 静音, 40s 强制 cap)。28.77 min 长音频从单次全段改为 ~40 个段, 单段 RTF 0.16-0.18, 总 wall time ~ RTF 1.3-1.5x (因 VAD sweep + 段提交 overhead)。`long.mp3` (6.9 MB, 28.77 min) 端到端 ~600s 跑通。
+
+#### UI 状态机 4 态
+
+`ui/app.js` 实现 4 态按钮机 (idle/starting/live/stopping)。`realtimeStarting` + `realtimeStopping` 双 flag + `updateControlAvailability()` 统一管控件。旧文字保留 (Stop→Start 在下方追加), 启停期间控件全置灰, 杜绝重入。详见 `docs/INCIDENTS.md` (2026-06-05 entry) + `docs/ARCHITECTURE.md` 状态机图。
+
+#### 测试
+
+```bash
+# C++ 单测 (665 cases)
+ctest --test-dir build/linux-openblas
+
+# JS 状态机纯函数 (24 cases)
+node tests/state_pure_test.js
+
+# Bash 烟雾测试 (18 cases)
+bash tools/smoke_test.sh
+```
