@@ -24,6 +24,18 @@ int qwen_grow_buffer(
     if (element_size == 0) return 0;
     if (needed_capacity < current_capacity) return 0;
 
+    /* True no-op when the caller already has at least the requested
+     * capacity.  Asking for a strict-equal size must NOT call realloc
+     * (realloc may legally move the pointer even when the size is
+     * unchanged, which would invalidate any caller-side pointer
+     * identity assertions and is wasteful). */
+    if (needed_capacity == current_capacity) {
+        if (out_new_capacity != NULL) {
+            *out_new_capacity = current_capacity;
+        }
+        return 1;
+    }
+
     /* Reject sizes that would overflow size_t when multiplied by
      * element_size.  This protects against caller mistakes and against
      * adversarial inputs that might have slipped through. */

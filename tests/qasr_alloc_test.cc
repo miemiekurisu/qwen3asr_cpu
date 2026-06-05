@@ -18,7 +18,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <vector>
 
 extern "C" {
 #include "qwen_asr_alloc.h"
@@ -54,13 +53,22 @@ QASR_TEST(GrowBufferNoOpWhenAlreadyLarge) {
     // helper must return success without changing the capacity or the
     // pointer.  (Asking for strictly less than the current capacity is
     // invalid usage and is rejected by a separate test.)
-    std::vector<int> backing(16);
-    int * original = backing.data();
-    void * buffer = original;
+    //
+    // Important: the buffer must come from the C malloc family, NOT
+    // from C++ operator new.  qwen_grow_buffer uses realloc(3), which
+    // is part of the malloc family; pairing it with delete[] at the
+    // end is an alloc-dealloc-mismatch and trips ASan.  The
+    // production call site (qwen_asr.c, prev_tail_tokens) always
+    // starts from NULL and pairs realloc with free, so this test
+    // mirrors that contract.
+    void * buffer = std::malloc(16 * sizeof(int));
+    QASR_EXPECT(buffer != nullptr);
+    int * original = static_cast<int *>(buffer);
     std::size_t new_cap = 0;
     int ok = qwen_grow_buffer(&buffer, sizeof(int), 16, 16, &new_cap);
     QASR_EXPECT_EQ(ok, 1);
     QASR_EXPECT_EQ(buffer, static_cast<void *>(original));
+    std::free(buffer);
 }
 
 QASR_TEST(GrowBufferDoublesUntilNeeded) {
