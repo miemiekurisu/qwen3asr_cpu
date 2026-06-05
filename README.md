@@ -4,6 +4,8 @@ Qwen3-ASR 的 CPU 推理服务与命令行工具，使用 C/C++17 实现。项�
 
 支持 Qwen3-ASR 0.6B / 1.7B safetensors 模型；Windows 和 Linux 使用 OpenBLAS，macOS 使用 Accelerate。可选 oneDNN INT8 路径用于 encoder / decoder 加速。
 
+> ⚠️ **本文档由 AI 根据代码编写,可能存在疏漏**。请以实际代码为准: 命令行参数以 `qasr_cli --help` / `qasr_server --help` / `qasr_cpu_bench --help` 输出为权威; HTTP API 以 `src/service/server.cc` 的路由注册为权威; 环境变量以 `src/backend/qwen_cpu/qwen_asr_perf.c` / `tools/run_linux_server.sh` 的解析为权威。
+
 ## 快速开始
 
 ### Windows
@@ -22,13 +24,13 @@ build.bat
 build.bat --test
 build.bat --benchmark
 build.bat --test --benchmark
-build.bat --openblas-dir D:\dev\OpenBLAS
+build.bat --openblas-dir <path-to-openblas>   :: 例如 C:\dev\OpenBLAS
 ```
 
 运行时需要让 OpenBLAS DLL 可见：
 
 ```powershell
-$env:PATH = "D:\dev\OpenBLAS\bin;$env:PATH"
+$env:PATH = "<path-to-openblas>\bin;$env:PATH"   :: 例如 C:\dev\OpenBLAS\bin
 ```
 
 ### Linux
@@ -439,11 +441,12 @@ docker run --rm -p 8080:8080 \
 | `QASR_ONNXRUNTIME_ROOT` | build | auto | ONNX runtime 安装路径 (手装时指定) |
 | `QASR_ONNXRUNTIME_VERSION` | build | `1.20.1` | ONNX runtime 版本 (自动下载时用) |
 
-HF / 包下载代理 (内网环境)：
+HF / 包下载代理 (内网环境，按需启用)：
 
 ```bash
-export https_proxy=http://192.168.2.100:8117
-export no_proxy=127.0.0.1,localhost,192.168.2.*,10.*,172.16-31.*
+# 替换 <your-proxy-host> / <your-lan-cidr> 为实际代理地址和局域网段
+export https_proxy=http://<your-proxy-host>:8117
+export no_proxy=127.0.0.1,localhost,<your-lan-cidr>,10.0.0.0/8,172.16.0.0/12
 ```
 
 ### 推理性能微调 (`QWEN_*`)
