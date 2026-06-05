@@ -30,21 +30,41 @@ const MAX_ASYNC_UPLOAD_BYTES = 64 * 1024 * 1024;
 
 let activeFeature = "";
 
-/* Re-entrancy guard for the start button.
+/* Re-entrancy guards + button state machine.
  *
- * The hang the operator saw after "batch → realtime → stop → clear →
- * realtime" was a race: while startRealtimeCapture() is awaiting
- * getUserMedia (line 668) and /api/realtime/start (line 669), a
- * second click slips through because activeFeature is only set
- * AFTER both awaits resolve (line 706).  The two clicks both
- * create separate server sessions; the second click's
- * realtimeState assignment overwrites the first's, leaking the
- * first's mediaStream and routing audio to the wrong session.
+ * Four states from the user's perspective:
+ *   idle       — no session, Start enabled, Stop disabled, Clear visible
+ *                (if has text), Export enabled (if has text)
+ *   starting   — Start was clicked, getUserMedia / /api/realtime/start
+ *                in flight. Start disabled (visual feedback), Stop
+ *                disabled, Clear hidden, Export disabled.
+ *   live       — session active. Start disabled, Stop enabled, Clear
+ *                hidden, Export disabled. Old info stays in the
+ *                terminal, new segments append.
+ *   stopping   — Stop was clicked, /api/realtime/stop in flight
+ *                ("backend inference delay"). Start disabled (the
+ *                "wait for backend" rule), Stop disabled, Clear
+ *                hidden, Export disabled. Once the POST resolves we
+ *                transition back to idle.
  *
- * Fix: a single in-flight flag at the JS click-handler layer.
- * The button is also disabled while a start is in flight.  This
- * is symmetric to the offlineSubmit disable logic. */
+ * The original "can't start a second time" bug was two-fold:
+ *   1. startRealtime click handler did `startRealtime.disabled = false`
+ *      in its finally block, which overrode the `disabled = true`
+ *      that updateControlAvailability() had just set inside
+ *      startRealtimeCapture() on the success path. The button looked
+ *      clickable while a session was live, but the second click was
+ *      silently dropped by the `activeFeature === REALTIME_FEATURE`
+ *      guard with no visible feedback.
+ *   2. There was no `stopping` state. During the /api/realtime/stop
+ *      await, activeFeature was still REALTIME_FEATURE, so a Start
+ *      click during that window was also silently dropped.
+ *
+ * Fix: a single in-flight `starting` flag, a single `stopping` flag,
+ * a single updateControlAvailability() that knows the full state
+ * machine. The click handlers set flags + call updateControlAvailability;
+ * they no longer poke button.disabled directly. */
 let realtimeStarting = false;
+let realtimeStopping = false;
 
 let realtimeState = {
   audioContext: null,
@@ -274,12 +294,28 @@ function hasRealtimeSession() {
 function updateControlAvailability() {
   const offlineActive = hasOfflineJob();
   const realtimeActive = hasRealtimeSession();
+  const realtimeBusy = realtimeStarting || realtimeStopping || realtimeActive;
   const canStopOffline = offlineActive && offlineState.jobId !== "" && !offlineState.stopRequested;
+  const hasConfirmedText = Boolean(extractConfirmedRealtimeText().trim());
+
   audioFile.disabled = offlineActive || realtimeActive;
   offlineSubmit.disabled = offlineActive || realtimeActive;
   offlineStop.disabled = !canStopOffline;
-  startRealtime.disabled = offlineActive || realtimeActive;
-  stopRealtime.disabled = !realtimeActive;
+
+  startRealtime.disabled = offlineActive || realtimeBusy;
+  stopRealtime.disabled = !realtimeActive || realtimeStopping;
+  /* Clear is allowed only in idle (not live, not starting, not stopping).
+   * Hide it during the in-flight windows and during a live session. */
+  clearRealtime.style.display = realtimeBusy || offlineActive ? "none" : "";
+  /* Export follows the same rule as clear: only after stop, never
+   * while a session is live or being set up/torn down. */
+  exportRealtimeText.disabled = realtimeBusy || offlineActive || !hasConfirmedText;
+  exportRealtimeJson.disabled = realtimeBusy || offlineActive || !hasConfirmedText;
+
+  /* Audio meter is only useful when audio is actually flowing. */
+  if (audioMeter) {
+    audioMeter.style.display = realtimeActive ? "block" : "none";
+  }
 }
 
 function resetOfflineState() {
@@ -292,26 +328,6 @@ function resetOfflineState() {
     activeFeature = "";
   }
   updateControlAvailability();
-}
-
-function offlineElapsedSeconds() {
-  if (!offlineState.startedAt) {
-    return 0;
-  }
-  return (performance.now() - offlineState.startedAt) / 1000;
-}
-
-function formatSeconds(value) {
-  return value.toFixed(1);
-}
-
-function escapeHtml(text) {
-  return String(text)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
 }
 
 function countCodepoints(text) {
@@ -348,6 +364,48 @@ function resetRealtimeArchive(fallback = "尚无已确定文本") {
   const cursorLine = makeTermLine("cursor", "");
   realtimeResult.appendChild(cursorLine);
   realtimeArchive.lines.push({ state: "cursor", el: cursorLine, text: "" });
+  updateRealtimeExportAvailability();
+}
+
+/* Soft reset for "Start a new session after Stop".  Keeps the
+ * already-committed `done` lines visible (the "old info preserved"
+ * rule the operator asked for), stops the typewriter, and ensures
+ * the terminal ends with a fresh empty cursor so the next session's
+ * segments animate into a clean line. */
+function softResetRealtimeArchive(newSessionId) {
+  if (realtimeArchive.typewriterTimer !== null) {
+    clearInterval(realtimeArchive.typewriterTimer);
+    realtimeArchive.typewriterTimer = null;
+  }
+  realtimeArchive.sessionId = newSessionId;
+  realtimeArchive.lastSegmentCount = 0;
+  realtimeArchive.finalized = false;
+  realtimeArchive.updatedAt = new Date().toISOString();
+
+  /* If the previous session ended on an in-flight typing line, decide
+   * whether to keep its text (commit to done) or drop it (empty). */
+  const lastLine = realtimeArchive.lines[realtimeArchive.lines.length - 1];
+  if (lastLine && lastLine.state === "typing") {
+    if (lastLine.text) {
+      lastLine.state = "done";
+      lastLine.el.classList.remove("typing");
+      lastLine.el.classList.add("done");
+    } else {
+      realtimeArchive.lines.pop();
+      if (lastLine.el && lastLine.el.parentNode) {
+        lastLine.el.parentNode.removeChild(lastLine.el);
+      }
+    }
+  }
+
+  /* Ensure the terminal ends with a fresh empty cursor. */
+  const tail = realtimeArchive.lines[realtimeArchive.lines.length - 1];
+  if (!tail || tail.state !== "cursor" || tail.text) {
+    const cursorLine = makeTermLine("cursor", "");
+    realtimeResult.appendChild(cursorLine);
+    realtimeArchive.lines.push({ state: "cursor", el: cursorLine, text: "" });
+  }
+
   updateRealtimeExportAvailability();
 }
 
@@ -726,10 +784,10 @@ async function startRealtimeCapture() {
      * thinks realtime is live but sessionId is empty, and the UI
      * gets stuck. */
     activeFeature = REALTIME_FEATURE;
-    audioMeter.style.display = "block";
-    resetRealtimeArchive("实时转写中，已确定文本会保存在此处。");
-    realtimeArchive.sessionId = sessionData.session_id;
-    updateRealtimeExportAvailability();
+    /* Soft reset: keep the prior session's done lines (the
+     * "old info preserved, new info appends" rule), stop the
+     * typewriter, and append a fresh cursor for the new session. */
+    softResetRealtimeArchive(sessionData.session_id);
 
     processor.onaudioprocess = (event) => {
       const channel = event.inputBuffer.getChannelData(0);
@@ -790,8 +848,6 @@ async function startRealtimeCapture() {
     source.connect(processor);
     processor.connect(audioContext.destination);
     updateControlAvailability();
-    clearRealtime.style.display = "none";
-    renderTranscript(realtimeResult, null, "实时转写中...");
     realtimeStatus.textContent = `会话 ${realtimeState.sessionId} 已启动`;
   } catch (error) {
     mediaStream.getTracks().forEach((track) => track.stop());
@@ -867,42 +923,87 @@ async function stopRealtimeCapture() {
       activeFeature = "";
     }
     updateControlAvailability();
-    clearRealtime.style.display = "";
   }
 }
 
 startRealtime.addEventListener("click", async () => {
+  /* Defensive: each guard also lives inside startRealtimeCapture, but
+   * we want immediate visible feedback (button stays disabled) rather
+   * than a silent no-op that the user has to debug. */
   if (realtimeStarting) {
+    return;
+  }
+  if (realtimeStopping) {
+    realtimeStatus.textContent = "正在停止后台转写, 请稍候...";
     return;
   }
   if (activeFeature === REALTIME_FEATURE) {
     return;
   }
+  if (hasOfflineJob()) {
+    realtimeStatus.textContent = "离线转写进行中, 请先停止";
+    return;
+  }
   realtimeStarting = true;
-  startRealtime.disabled = true;
+  updateControlAvailability();
   try {
     await startRealtimeCapture();
   } catch (error) {
     realtimeStatus.textContent = `启动失败：${error.message}`;
   } finally {
     realtimeStarting = false;
-    startRealtime.disabled = false;
+    /* Defer the button state to updateControlAvailability() so we
+     * never re-enable a button that the state machine says should
+     * stay disabled (e.g. after a successful start, activeFeature
+     * is REALTIME_FEATURE so Start should remain disabled). */
+    updateControlAvailability();
   }
 });
 
 stopRealtime.addEventListener("click", async () => {
+  if (realtimeStopping) {
+    return;
+  }
+  if (activeFeature !== REALTIME_FEATURE || !realtimeState.sessionId) {
+    return;
+  }
+  realtimeStopping = true;
+  /* Lock the UI immediately so a second Start click is visibly
+   * disabled while /api/realtime/stop is in flight (the "wait for
+   * backend inference delay" rule). */
+  updateControlAvailability();
+  realtimeStatus.textContent = "正在停止后台转写, 请稍候...";
   try {
     await stopRealtimeCapture();
   } catch (error) {
     realtimeStatus.textContent = `停止失败：${error.message}`;
+  } finally {
+    realtimeStopping = false;
+    updateControlAvailability();
   }
 });
 
 clearRealtime.addEventListener("click", () => {
+  /* Clear is only meaningful in the idle state.  Block the click
+   * (with a status hint) if a session is live or a transition is
+   * in flight, otherwise the user could lose the audio pipeline
+   * state. */
+  if (realtimeStarting || realtimeStopping) {
+    realtimeStatus.textContent = "正在启动/停止, 请稍候...";
+    return;
+  }
+  if (activeFeature === REALTIME_FEATURE) {
+    realtimeStatus.textContent = "实时转写进行中, 请先停止";
+    return;
+  }
+  if (hasOfflineJob()) {
+    realtimeStatus.textContent = "离线转写进行中, 请先停止";
+    return;
+  }
   resetTranscriptFrame(realtimeResult, "尚无结果");
   resetRealtimeArchive();
   realtimeStatus.textContent = "未开始";
-  clearRealtime.style.display = "none";
+  updateControlAvailability();
 });
 
 exportRealtimeText.addEventListener("click", () => {

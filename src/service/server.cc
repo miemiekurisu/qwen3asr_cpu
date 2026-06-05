@@ -1805,6 +1805,12 @@ Status AppendManualLiveAudio(qwen_live_audio_t * live, const float * samples, st
     SignalLiveAudio(live);
     UnlockLiveAudio(live);
     return OkStatus();
+    /* TODO(oom-audit-C1): live->samples grows monotonically; VAD commit
+     * updates live->decoded_cursor but never trims the underlying buffer.
+     * 1h realtime session = 230 MB / session; with kMaxRealtimeSessions=64
+     * worst-case 14.7 GB resident.  See docs/AUDIT_C1.md §4.1.  Mitigation
+     * options: ring buffer (cap 64 MB), periodic trim of
+     * samples[0..decoded_cursor], or session wall-clock cap. */
 }
 
 void FinishManualLiveAudio(qwen_live_audio_t * live) {
@@ -4394,3 +4400,14 @@ int RunServer(const ServerConfig & config) {
 }
 
 }  // namespace qasr
+/* TODO(god-function-C1): RunServer (server.cc:2610-4394) is 1784 lines,
+ * covering all HTTP route registration, lambdas for VAD-segmented batch
+ * decode, live worker boot, async transcription job dispatch, and
+ * shutdown.  Suggested split (whenever maintenance cost outweighs the
+ * churn risk):
+ *   - server_routes.cc     Register* handlers + HttpServer wiring
+ *   - server_session.cc    SessionManager, RealtimeSession lifecycle
+ *   - server_vad.cc        RunVadSegmentedDecode + TranscribeFileVadSegmentedImpl
+ *   - server_live.cc       StartRealtimeLiveWorker + StartHostCaptureLiveWorker
+ * See docs/AUDIT_C1.md §5.1 for the full god-function inventory and
+ * docs/AUDIT_C1.md §5.2 for the god-file inventory. */
