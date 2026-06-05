@@ -52,7 +52,7 @@ tools/build_linux.sh --model-dir /data/Qwen3-ASR-0.6B
 tools/build_linux.sh --no-dep --no-apt     # 离线：禁止自动装包/下载
 ```
 
-常用环境变量：`QASR_DEPS_DIR`（默认 `/opt/qasr-deps`）、`QASR_BUILD_DIR`（默认 `build/linux-openblas`）、`QASR_MODEL_DIR`、`QASR_OPENBLAS_TAG`（默认 `v0.3.30`）、`QASR_HF_CACHE`（默认 `~/.cache/huggingface`）、`QASR_JOBS`（默认 `nproc`）、`QASR_APT_MIRROR`、`QASR_ONNXRUNTIME_ROOT`（手装 ONNX Runtime 时用）、`QASR_ONNXRUNTIME_VERSION`（默认 `1.20.1`）。`tools/build_linux.sh --help` 看完整选项。
+常用环境变量：见 [`docs/CLI.md`](docs/CLI.md) §"tools/build_linux.sh" 节。`tools/build_linux.sh --help` 同步列出。
 
 手动等价流程（脚本不可用时）：
 
@@ -76,7 +76,7 @@ tools/run_linux_server.sh --status                  # /api/health 检查
 tools/run_linux_server.sh --stop                    # 停 --detach 起的 server / proxy
 ```
 
-HTTPS 反代每次启动 `mktemp -d` 生成自签 cert（退出时自动清，仓库卫生 + 临时安全）；想跨重启复用 cert 设 `QASR_TLS_CERT_DIR=/path/to/cert` 即可。常用环境变量：`QASR_HOST=0.0.0.0`、`QASR_PORT=19991`、`QASR_HTTPS_PORT=19992`、`QASR_THREADS=0`(0=自动)、`QASR_VERBOSITY=0`(0=silent)、`QASR_VAD_MODEL=`。完整参数 `tools/run_linux_server.sh --help`。
+HTTPS 反代每次启动 `mktemp -d` 生成自签 cert（退出时自动清，仓库卫生 + 临时安全）；想跨重启复用 cert 设 `QASR_TLS_CERT_DIR=/path/to/cert` 即可。完整环境变量 + flags 见 [`docs/CLI.md`](docs/CLI.md) §"tools/run_linux_server.sh" 节。
 
 ### macOS
 
@@ -108,6 +108,8 @@ CLI、server 和 API 都通过 `--model-dir` / `model` 指定 ASR 模型，不�
 在 CPU 上不建议把 1.7B 当严格实时模型使用；入口上可以运行，但延迟通常会很高。
 
 ## CLI 示例
+
+> 完整参数表 (含默认值 + 影响) 见 [`docs/CLI.md`](docs/CLI.md) §"`qasr_cli` — 离线 CLI 转写"。本节只列常用例子。
 
 基本转写：
 
@@ -164,16 +166,13 @@ qasr_cli --model-dir /path/to/Qwen3-ASR-1.7B --audio interview.wav \
   --output interview.json
 ```
 
-启用可选 INT8 路径：
+启用可选 INT8 路径（仅 encoder，decoder INT8 已移除 — 见 [`docs/INCIDENTS.md`](docs/INCIDENTS.md) C8 条目）：
 
 ```bash
 qasr_cli --model-dir /path/to/Qwen3-ASR-0.6B --audio audio.wav \
-  --decoder-int8 \
   --encoder-int8 \
   --threads 16
 ```
-
-> ⚠️ **`--decoder-int8` 会显著降低识别质量**：语言一致性下降、中英文混杂泄漏、低置信度音频上更易产生幻觉。仅在内存严重受限时启用；批量转写优先只开 `--encoder-int8`。实时（`/api/realtime`、`/v1/realtime`）会话默认 **不会** 沿用 `--decoder-int8`，需显式 `--realtime-decoder-int8` 才会启用。
 
 流式分段推理：
 
@@ -191,6 +190,8 @@ qasr_cli --help
 ```
 
 ## Server 示例
+
+> 完整参数表见 [`docs/CLI.md`](docs/CLI.md) §"`qasr_server` — HTTP / WebSocket 服务"。本节只列常用例子。
 
 启动 Web UI 和 HTTP API：
 
@@ -213,12 +214,9 @@ http://127.0.0.1:8080/
 ```bash
 qasr_server --model-dir /path/to/Qwen3-ASR-0.6B \
   --port 8080 \
-  --decoder-int8 \
   --encoder-int8 \
   --threads 16
 ```
-
-> ⚠️ 同上：`--decoder-int8` 主要节省内存，但识别质量明显下降，且不会自动应用到实时会话。如确需实时也使用 INT8 解码器，请同时加 `--realtime-decoder-int8`。
 
 查看服务帮助：
 
@@ -328,11 +326,12 @@ MIT. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
 
 ## 进一步阅读
 
+- [`docs/CLI.md`](docs/CLI.md) — 全套启动参数 single source of truth (C++ flags / env vars / shell tools)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — 模块边界、数据流、UI 状态机、并发模型、god function 拆分计划
 - [`docs/API.md`](docs/API.md) — 全部 HTTP 端点、错误码、SSE 事件
 - [`docs/SECURITY.md`](docs/SECURITY.md) — 信任边界、威胁清单、生产部署 checklist
 - [`docs/AUDIT_C1.md`](docs/AUDIT_C1.md) — C1 审计报告 (死代码 / UAF / OOM / god function)
-- [`docs/INCIDENTS.md`](docs/INCIDENTS.md) — 历史事故 + 修复 (150s crash / UI 状态机 / OOM 风险)
+- [`docs/INCIDENTS.md`](docs/INCIDENTS.md) — 历史事故 + 修复 (150s crash / UI 状态机 / OOM 风险 / decoder-int8 移除)
 - [`docs/BLAS_COMPARISON.md`](docs/BLAS_COMPARISON.md) — OpenBLAS / Accelerate / oneDNN 对比
 
 ### 高级特性

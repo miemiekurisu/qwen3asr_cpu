@@ -95,9 +95,9 @@ USE_HTTPS=0
 # ─────────────── 参数解析 ───────────────
 usage() {
     cat <<EOF
-用法: $(basename "$0") [选项]
+Usage: $(basename "$0") [flags]
 
-选项:
+Flags:
   --detach            后台启动 qasr_server, 写 PID 到 $PID_FILE
   --https             同时启动 HTTPS 反代 (推荐, 浏览器 mic 权限需要 https)
                       默认 mktemp -d 临时 cert (退出时删), 想持久: 设 QASR_TLS_CERT_DIR
@@ -105,13 +105,13 @@ usage() {
   --status            查 /api/health (HTTP + HTTPS, 若后者在跑)
   --https-info        显示 cert 目录 / proxy 状态
   --verbose           覆盖 \$QASR_VERBOSITY=3 (开发用, 一行一 poll)
-  -h, --help          显示本帮助
+  -h, --help          打印本帮助
 
-必填环境变量:
+Env vars (必填):
   QASR_MODEL_DIR      Qwen3-ASR-0.6B 目录
                       例: export QASR_MODEL_DIR=\$HOME/models/Qwen3-ASR-0.6B
 
-可选环境变量 (有默认):
+Env vars (可选, 完整列表见 docs/CLI.md):
   QASR_REALTIME_MODEL_DIR  realtime 模型 (默认 = 跟 batch 共享内存)
                            推荐: 1.7B batch + 0.6B realtime
   QASR_HOST=0.0.0.0   QASR_PORT=19991   QASR_HTTPS_PORT=19992
@@ -125,24 +125,27 @@ usage() {
   QASR_PROXY_PID=...  (默认 /tmp/qasr_proxy.pid, --https 时)
   QASR_TLS_CERT_DIR=... 持久化 cert 目录 (默认 mktemp -d, 退出时删)
 
-示例:
-  export QASR_MODEL_DIR=\$HOME/.cache/huggingface/models--Qwen--Qwen3-ASR-0.6B/snapshots/<rev>
-  tools/run_linux_server.sh --detach                  # 后台 HTTP only (API/curl 用)
-  tools/run_linux_server.sh --detach --https          # 后台 HTTP + HTTPS (浏览器用, 推荐)
+Examples:
+  # 1) 标准: 后台 + HTTPS
+  export QASR_MODEL_DIR=\$HF/Qwen3-ASR-0.6B
+  $(basename "$0") --detach --https
 
-  # 1.7B batch + 0.6B realtime (推荐: 离线要质量, 实时要速度)
-  export QASR_MODEL_DIR=\$HOME/.../Qwen3-ASR-1.7B/snapshots/<rev>
-  export QASR_REALTIME_MODEL_DIR=\$HOME/.../Qwen3-ASR-0.6B/snapshots/<rev>
-  tools/run_linux_server.sh --detach --https
+  # 2) 双模型: 1.7B batch + 0.6B realtime
+  export QASR_MODEL_DIR=\$HF/Qwen3-ASR-1.7B
+  export QASR_REALTIME_MODEL_DIR=\$HF/Qwen3-ASR-0.6B
+  $(basename "$0") --detach --https
 
-  tools/run_linux_server.sh --stop                    # 停
-  tools/run_linux_server.sh --status                  # 健康检查
-  tools/run_linux_server.sh --https-info              # cert / proxy 状态
+  # 3) 运维
+  $(basename "$0") --status                  # 健康检查
+  $(basename "$0") --stop                    # 停
+  $(basename "$0") --https-info              # cert / proxy 状态
 
 HTTPS 方案对比:
   --https (本工具, 当前推荐)   Python 反代 + 每次新 cert, 0 配置, 临时
   A. qasr_server 自带 TLS        待 mbedTLS 集成
   C. Caddy / nginx 反代         需系统装, 适合生产
+
+完整参数 + 其他工具: docs/CLI.md
 EOF
 }
 

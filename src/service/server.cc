@@ -914,11 +914,6 @@ public:
         if (ctx_ == nullptr) {
             return Status(StatusCode::kInternal, "qwen_load failed");
         }
-        if (config.decoder_int8) {
-            if (qwen_set_decoder_int8(ctx_, 1) != 0) {
-                std::fprintf(stderr, "warning: decoder INT8 init failed, falling back to BF16\n");
-            }
-        }
         if (config.encoder_int8) {
             if (qwen_set_encoder_int8(ctx_, 1) != 0) {
                 std::fprintf(stderr, "warning: encoder INT8 init failed, falling back to F32\n");
@@ -1058,24 +1053,17 @@ public:
         if (clone == nullptr) {
             return nullptr;
         }
-        /* qwen_clone_shared() resets decoder_int8/encoder_int8 to 0 on the
-         * clone (INT8 resources are per-context, see qwen_asr.c). Without
-         * re-applying the configured INT8 flags here, every realtime/host
-         * capture session silently runs on the BF16/F32 path even when the
-         * server was started with INT8 enabled.
+        /* qwen_clone_shared() resets encoder_int8 to 0 on the clone
+         * (INT8 resources are per-context, see qwen_asr.c).  Without
+         * re-applying the configured flag here, every realtime/host
+         * capture session silently runs on the F32 path even when
+         * the server was started with encoder INT8 enabled.
          *
-         * Decoder INT8 is the autoregressive Qwen3 LM and INT8 quantization
-         * there has a measurable impact on language consistency (e.g. English
-         * fragments leaking into Chinese audio with onomatopoeia, repeated
-         * words, etc.). For realtime sessions we therefore default to BF16
-         * decoder regardless of --decoder-int8, and only opt in when the
-         * operator explicitly passes --realtime-decoder-int8. */
-        if (config_.decoder_int8 && config_.realtime_decoder_int8) {
-            if (qwen_set_decoder_int8(clone, 1) != 0) {
-                std::fprintf(stderr,
-                             "warning: realtime clone decoder INT8 init failed, falling back to BF16\n");
-            }
-        }
+         * Decoder INT8 is intentionally never applied to realtime
+         * clones — it is the autoregressive Qwen3 LM and INT8 there
+         * measurably degrades language consistency (English fragments
+         * leaking into Chinese audio, hallucinations, etc.).  See
+         * docs/INCIDENTS.md for the rationale. */
         if (config_.encoder_int8) {
             if (qwen_set_encoder_int8(clone, 1) != 0) {
                 std::fprintf(stderr,
@@ -2209,16 +2197,8 @@ Status ParseServerArguments(int argc, const char * const argv[], ServerConfig * 
             config->verbosity = 0;
             continue;
         }
-        if (arg == "--decoder-int8") {
-            config->decoder_int8 = true;
-            continue;
-        }
         if (arg == "--encoder-int8") {
             config->encoder_int8 = true;
-            continue;
-        }
-        if (arg == "--realtime-decoder-int8") {
-            config->realtime_decoder_int8 = true;
             continue;
         }
         if (arg == "--temperature") {
@@ -2264,11 +2244,7 @@ std::string BuildServerUsage(std::string_view program_name) {
     usage += "                           1=commit/summary, 2=per-poll, 3=raw\n";
     usage += "  --quiet, -q              alias for --verbosity 0\n";
     usage += "  --temperature <float>  (default: auto, 0=greedy, >0=sampling)\n";
-    usage += "  --decoder-int8           (decoder INT8: saves memory but DEGRADES quality:\n";
-    usage += "                            language consistency drops, code-switch leakage,\n";
-    usage += "                            hallucinations on low-confidence audio; use only when memory-bound)\n";
-    usage += "  --encoder-int8\n";
-    usage += "  --realtime-decoder-int8  (apply --decoder-int8 to realtime sessions; default off for language consistency)\n";
+    usage += "  --encoder-int8         (encoder INT8: minimal quality impact, halves encoder memory)\n";
     usage += "  -h, --help\n";
     return usage;
 }

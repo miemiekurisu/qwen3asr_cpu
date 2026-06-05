@@ -404,14 +404,12 @@ typedef struct {
     int rep_pen_ring_pos;            /* next write position in ring */
     int rep_pen_ring_count;          /* valid entries (up to RING_SIZE) */
 
-    /* INT8 decoder acceleration (optional, via oneDNN) */
-    int decoder_int8;              /* 0=disabled (default), 1=enabled */
-    void *int8_dec_layers;         /* qwen_int8_dec_layer_t[] or NULL */
-    int n_int8_dec_layers;         /* number of valid entries */
-
-    /* INT8 encoder acceleration (optional, via oneDNN) */
+    /* INT8 encoder acceleration (optional, via oneDNN).  Decoder INT8
+     * was removed in C8 — it measurably degraded the autoregressive
+     * Qwen3 LM (language consistency, code-switch leakage, low-confidence
+     * hallucinations).  See docs/INCIDENTS.md. */
     int encoder_int8;              /* 0=disabled (default), 1=enabled */
-    void *int8_enc_layers;         /* qwen_int8_dec_layer_t[] or NULL */
+    void *int8_enc_layers;         /* qwen_int8_enc_layer_t[] or NULL */
     int n_int8_enc_layers;         /* number of valid entries */
 
     /* Optional Silero VAD for endpoint detection.  NULL = disabled
@@ -484,12 +482,6 @@ void qwen_free(qwen_ctx_t *ctx);
 
 /* Internal runtime preparation step used after decoder weights are loaded. */
 int qwen_decoder_prepare_runtime(qwen_ctx_t *ctx);
-
-/* Enable or disable INT8 decoder acceleration (requires oneDNN).
- * Must be called after qwen_load(). Quantizes weights on first enable.
- * enable=0 frees INT8 resources and reverts to BF16 path.
- * Returns 0 on success, -1 on failure (remains on BF16 path). */
-int qwen_set_decoder_int8(qwen_ctx_t *ctx, int enable);
 
 /* Enable or disable INT8 encoder acceleration (requires oneDNN).
  * Must be called after qwen_load(). Quantizes F32 encoder weights to INT8.

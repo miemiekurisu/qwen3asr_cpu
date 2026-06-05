@@ -101,9 +101,9 @@ DO_onnxruntime=1          # 1 = 启用 VAD 路径需要 (linux-openblas preset �
 # ─────────────── 帮助 ───────────────
 usage() {
     cat <<EOF
-用法: $(basename "$0") [选项]
+Usage: $(basename "$0") [flags]
 
-编译选项:
+Flags:
   --clean              删除 build 目录后从头构建 (默认)
   --incremental        增量编译, 不删 build/
   --clean-only         只清理, 不配置/编译/测试
@@ -137,7 +137,20 @@ BLAS 后端 (覆盖 linux-openblas preset, 通过 -DQASR_BLAS 传给 cmake):
   -h, --help           显示本帮助
   -v, --version        显示脚本版本
 
-示例:
+Env vars (完整列表见 docs/CLI.md):
+  QASR_DEPS_DIR       OpenBLAS 源码安装位置 (默认 /opt/qasr-deps)
+  QASR_BUILD_DIR      编译输出目录 (默认 build/linux-openblas)
+  QASR_MODEL_DIR      模型目录 (优先于自动探测)
+  QASR_OPENBLAS_TAG   OpenBLAS 版本 (默认 v0.3.30, 用于源码下载)
+  QASR_PYTHON         python3 路径 (默认自动探测)
+  QASR_JOBS           并发数 (默认 nproc)
+  QASR_APT_MIRROR     apt 源 (留空用系统默认)
+  QASR_HF_CACHE       HF 缓存根目录 (默认 \$HOME/.cache/huggingface)
+  QASR_HF_REPO        模型仓库 (默认 Qwen/Qwen3-ASR-0.6B)
+  QASR_ONNXRUNTIME_ROOT   ONNX runtime 路径 (默认自动探测)
+  QASR_ONNXRUNTIME_VERSION  ONNX runtime 版本 (默认 1.20.1)
+
+Examples:
   $(basename "$0")                              # clean + build + test (OpenBLAS)
   $(basename "$0") --incremental                # 增量
   $(basename "$0") --asan                       # ASan 构建
@@ -147,6 +160,8 @@ BLAS 后端 (覆盖 linux-openblas preset, 通过 -DQASR_BLAS 传给 cmake):
   $(basename "$0") --blas blis --incremental    # 切到 BLIS (BSD-3 备选)
   $(basename "$0") --blas mkl --incremental     # 切到 oneAPI MKL (专有)
   $(basename "$0") --compare-blas               # 跑 OpenBLAS/BLIS/MKL 三家对比
+
+完整参数 + 其他工具: docs/CLI.md
 EOF
 }
 

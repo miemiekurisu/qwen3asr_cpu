@@ -408,13 +408,8 @@ qwen_ctx_t *qwen_clone_shared(const qwen_ctx_t *src) {
     ctx->skip_silence = src->skip_silence;
 
     /* Cloned contexts do not own INT8 resources (they are per-context).
-     * The clone starts on the BF16 path; call qwen_set_decoder_int8() if needed. */
-    ctx->decoder_int8 = 0;
-    ctx->int8_dec_layers = NULL;
-    ctx->n_int8_dec_layers = 0;
-
-    /* Encoder INT8: clone does not share (handles have mutable per-call state).
-     * Call qwen_set_encoder_int8() on the clone if needed. */
+     * Encoder INT8 clone does not share (handles have mutable per-call
+     * state).  Call qwen_set_encoder_int8() on the clone if needed. */
     ctx->encoder_int8 = 0;
     ctx->int8_enc_layers = NULL;
     ctx->n_int8_enc_layers = 0;
@@ -581,9 +576,6 @@ void qwen_free(qwen_ctx_t *ctx) {
 
     #undef FREE0
 
-    /* INT8 decoder resources (oneDNN) */
-    qwen_decoder_free_int8(ctx);
-
     /* INT8 encoder resources (oneDNN) */
     qwen_encoder_free_int8(ctx);
 
@@ -633,31 +625,8 @@ void qwen_free(qwen_ctx_t *ctx) {
 }
 
 /* ========================================================================
- * INT8 Decoder Acceleration
+ * INT8 Encoder Acceleration
  * ======================================================================== */
-
-int qwen_set_decoder_int8(qwen_ctx_t *ctx, int enable) {
-    if (!ctx) return -1;
-
-    if (enable) {
-        if (ctx->int8_dec_layers) {
-            /* Already prepared */
-            ctx->decoder_int8 = 1;
-            return 0;
-        }
-        int rc = qwen_decoder_prepare_int8(ctx);
-        if (rc != 0) {
-            ctx->decoder_int8 = 0;
-            return -1;
-        }
-        ctx->decoder_int8 = 1;
-        return 0;
-    } else {
-        qwen_decoder_free_int8(ctx);
-        ctx->decoder_int8 = 0;
-        return 0;
-    }
-}
 
 int qwen_set_encoder_int8(qwen_ctx_t *ctx, int enable) {
     if (!ctx) return -1;

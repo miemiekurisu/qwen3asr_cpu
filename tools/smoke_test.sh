@@ -57,7 +57,7 @@ expect_contains() {
 out="$(tools/run_linux_server.sh --help 2>&1)"
 code=$?
 expect_eq "run --help exits 0"        "0"            "$code"
-expect_contains "run --help usage"  "用法:"       "$out"
+expect_contains "run --help usage"  "Usage:"       "$out"
 expect_contains "run --help detach" "--detach"   "$out"
 expect_contains "run --help https"  "--https"    "$out"
 expect_contains "run --help stop"   "--stop"     "$out"
@@ -73,7 +73,7 @@ expect_contains "run --garbage msg" "未知选项"   "$out"
 out="$(tools/build_linux.sh --help 2>&1)"
 code=$?
 expect_eq "build --help exits 0"      "0"            "$code"
-expect_contains "build --help usage" "用法:"      "$out"
+expect_contains "build --help usage" "Usage:"      "$out"
 
 # ───── 4. build_linux.sh --garbage ─────
 out="$(tools/build_linux.sh --garbage 2>&1)"

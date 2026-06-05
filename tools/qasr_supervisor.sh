@@ -2,19 +2,8 @@
 #
 # qasr_supervisor.sh — Auto-restart qasr_server on crash.
 #
-# 用法:
-#   QASR_MODEL_DIR=/path/to/model tools/qasr_supervisor.sh          # 永远循环, 死了拉起
-#   QASR_MODEL_DIR=... tools/qasr_supervisor.sh --no-loop           # 单次启动, 死了不拉 (调试用)
-#
-# 行为:
-#   启动前先杀干净旧 qasr_server, 然后 exec 启动, 死了 2s 后拉起
-#   日志追加到 /tmp/qasr_supervisor.log + 转发到子进程
-#
-# 优先用本脚本, 因为它管的事少 (只看住 server), 启停参数全在 run_linux_server.sh 里
-# 任何参数调整直接改 run_linux_server.sh 即可, supervisor 不持参数
-#
-# 替代品:
-#   systemd unit (更稳, 待补), 暂未补, 因要 root + 配置 unit file
+# 启停参数全在 run_linux_server.sh 里, supervisor 不持参数.
+# 完整 env / flags 参考 docs/CLI.md (single source of truth).
 
 set -e
 
@@ -30,12 +19,23 @@ for arg in "$@"; do
         --no-loop) NO_LOOP=1 ;;
         -h|--help)
             cat <<EOF
-用法: $(basename "$0") [--no-loop]
+Usage: $(basename "$0") [--no-loop]
 
-必填环境变量:
-  QASR_MODEL_DIR    Qwen3-ASR-0.6B 模型目录
+Flags:
+  --no-loop        单次启动, 死了不拉起 (调试用)
+  -h, --help       打印本帮助
 
---no-loop    单次启动, 死了不拉起 (调试用)
+Env vars (透传给 run_linux_server.sh, 详见 docs/CLI.md):
+  QASR_MODEL_DIR   Qwen3-ASR-0.6B 模型目录 (必填)
+
+Examples:
+  # 永远循环, 死了拉起
+  QASR_MODEL_DIR=\$HF/Qwen3-ASR-0.6B $(basename "$0")
+
+  # 单次启动, 死了不拉
+  QASR_MODEL_DIR=\$HF/Qwen3-ASR-0.6B $(basename "$0") --no-loop
+
+完整参数 + 其他工具: docs/CLI.md
 EOF
             exit 0
             ;;

@@ -75,37 +75,6 @@ int qwen_onednn_matmul_execute(qwen_onednn_matmul_t *handle,
 void qwen_onednn_matmul_free(qwen_onednn_matmul_t *handle);
 
 /* ========================================================================
- * Per-Layer INT8 Decoder Weights
- * ======================================================================== */
-
-typedef struct {
-    /* Attention projections */
-    qwen_int8_weight_t  wq_int8;
-    qwen_int8_weight_t  wk_int8;
-    qwen_int8_weight_t  wv_int8;
-    qwen_int8_weight_t  wo_int8;
-
-    /* MLP projections */
-    qwen_int8_weight_t  gate_up_int8;    /* [2*intermediate, hidden] */
-    qwen_int8_weight_t  down_int8;       /* [hidden, intermediate] */
-
-    /* oneDNN matmul handles (NULL if not using oneDNN) */
-    qwen_onednn_matmul_t *mm_wq;
-    qwen_onednn_matmul_t *mm_wk;
-    qwen_onednn_matmul_t *mm_wv;
-    qwen_onednn_matmul_t *mm_wo;
-    qwen_onednn_matmul_t *mm_gate_up;
-    qwen_onednn_matmul_t *mm_down;
-} qwen_int8_dec_layer_t;
-
-/* Prepare INT8 weights + oneDNN primitives for all decoder layers.
- * Returns 0 on success, -1 on failure (caller should fall back to BF16). */
-int qwen_decoder_prepare_int8(void *ctx_ptr);
-
-/* Free all INT8 decoder resources for all layers. */
-void qwen_decoder_free_int8(void *ctx_ptr);
-
-/* ========================================================================
  * Per-Layer INT8 Encoder Weights
  * ======================================================================== */
 

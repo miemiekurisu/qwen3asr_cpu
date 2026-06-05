@@ -30,7 +30,6 @@ struct AsrRunOptions {
     bool stream = false;
     bool emit_tokens = false;
     bool emit_segments = false;
-    bool decoder_int8 = false;
     bool encoder_int8 = false;
     float temperature = -1.0f;
     std::string prompt;

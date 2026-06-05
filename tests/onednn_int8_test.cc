@@ -1,14 +1,17 @@
 /*
  * onednn_int8_test.cc - Tests for INT8 quantization and oneDNN matmul
  *
- * Tests are split into three groups:
+ * Tests are split into two groups:
  *   1. INT8 quantization (always compiled, no oneDNN dependency)
  *   2. oneDNN matmul (only when QASR_ONEDNN_AVAILABLE is defined)
- *   3. CLI/server --decoder-int8 option parsing
+ *
+ * Note: the decoder INT8 CLI tests and the qwen_int8_dec_layer_t
+ * machinery were removed in C8 (decoder INT8 measurably degraded
+ * autoregressive Qwen3 LM quality — see docs/INCIDENTS.md).
+ * Encoder INT8 remains supported.
  */
 
 #include "tests/test_registry.h"
-#include "tests/test_paths.h"
 
 extern "C" {
 #include "src/backend/qwen_cpu/qwen_asr_onednn.h"
@@ -18,15 +21,8 @@ extern "C" {
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <string>
 #include <vector>
-
-#include "qasr/cli/options.h"
-#include "qasr/service/server.h"
-
-namespace fs = std::filesystem;
 
 namespace {
 
@@ -62,19 +58,6 @@ void FillBf16Random(std::vector<std::uint16_t> *bf16,
         float v = NextPseudoRandom(&state) * scale;
         (*bf16)[i] = FloatToBf16(v);
     }
-}
-
-fs::path MakeInt8FixtureDirectory() {
-    const fs::path dir = qasr_test::FreshTempDir(__FILE__, "qasr_int8_fixture");
-    fs::create_directories(dir / "ui");
-    std::ofstream(dir / "config.json") << "{}";
-    std::ofstream(dir / "vocab.json") << "{}";
-    std::ofstream(dir / "merges.txt") << "";
-    std::ofstream(dir / "model-00001-of-00002.safetensors") << "";
-    std::ofstream(dir / "ui" / "index.html") << "ok";
-    std::ofstream(dir / "ui" / "app.js") << "ok";
-    std::ofstream(dir / "ui" / "style.css") << "ok";
-    return dir;
 }
 
 }  // namespace
@@ -630,86 +613,3 @@ QASR_TEST(OneDnnInt8MatvecMatchesExecute) {
 
 #endif  /* QASR_ONEDNN_AVAILABLE */
 
-/* ========================================================================
- * Group 3: CLI / Server --decoder-int8 Option Parsing
- * ======================================================================== */
-
-QASR_TEST(ParseCliArgumentsAcceptsDecoderInt8) {
-    const fs::path dir = MakeInt8FixtureDirectory();
-    const std::string model_dir = dir.string();
-    const std::string audio_path = (dir / "model-00001-of-00002.safetensors").string();
-    const char * argv[] = {
-        "qasr_cli",
-        "--model-dir", model_dir.c_str(),
-        "--audio", audio_path.c_str(),
-        "--threads", "1",
-        "--decoder-int8",
-    };
-
-    qasr::CliOptions options;
-    const qasr::Status status = qasr::ParseCliArguments(
-        static_cast<int>(sizeof(argv) / sizeof(argv[0])), argv, &options);
-    QASR_EXPECT(status.ok());
-    QASR_EXPECT(options.asr.decoder_int8);
-}
-
-QASR_TEST(ParseCliArgumentsDefaultsDecoderInt8Off) {
-    const fs::path dir = MakeInt8FixtureDirectory();
-    const std::string model_dir = dir.string();
-    const std::string audio_path = (dir / "model-00001-of-00002.safetensors").string();
-    const char * argv[] = {
-        "qasr_cli",
-        "--model-dir", model_dir.c_str(),
-        "--audio", audio_path.c_str(),
-        "--threads", "1",
-    };
-
-    qasr::CliOptions options;
-    const qasr::Status status = qasr::ParseCliArguments(
-        static_cast<int>(sizeof(argv) / sizeof(argv[0])), argv, &options);
-    QASR_EXPECT(status.ok());
-    QASR_EXPECT(!options.asr.decoder_int8);
-}
-
-QASR_TEST(BuildCliUsageMentionsDecoderInt8) {
-    const std::string usage = qasr::BuildCliUsage("qasr_cli");
-    QASR_EXPECT(usage.find("--decoder-int8") != std::string::npos);
-}
-
-QASR_TEST(ParseServerArgumentsAcceptsDecoderInt8) {
-    const fs::path dir = MakeInt8FixtureDirectory();
-    const std::string model_dir = dir.string();
-    const std::string ui_dir = (dir / "ui").string();
-    const char * argv[] = {
-        "qasr_server",
-        "--model-dir", model_dir.c_str(),
-        "--ui-dir", ui_dir.c_str(),
-        "--decoder-int8",
-    };
-
-    qasr::ServerConfig config;
-    bool show_help = false;
-    const qasr::Status status = qasr::ParseServerArguments(
-        static_cast<int>(sizeof(argv) / sizeof(argv[0])), argv, &config, &show_help);
-    QASR_EXPECT(status.ok());
-    QASR_EXPECT(config.decoder_int8);
-}
-
-QASR_TEST(ParseServerArgumentsDefaultsDecoderInt8Off) {
-    const char * argv[] = {"qasr_server", "--help"};
-    qasr::ServerConfig config;
-    bool show_help = false;
-    const qasr::Status status = qasr::ParseServerArguments(2, argv, &config, &show_help);
-    QASR_EXPECT(status.ok());
-    QASR_EXPECT(!config.decoder_int8);
-}
-
-QASR_TEST(BuildServerUsageMentionsDecoderInt8) {
-    const std::string usage = qasr::BuildServerUsage("qasr_server");
-    QASR_EXPECT(usage.find("--decoder-int8") != std::string::npos);
-}
-
-QASR_TEST(ServerConfigDecoderInt8DefaultFalse) {
-    qasr::ServerConfig config;
-    QASR_EXPECT(!config.decoder_int8);
-}
