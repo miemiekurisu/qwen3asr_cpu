@@ -360,4 +360,7 @@ if(QASR_ENABLE_TESTS)
     endif()
 
     add_test(NAME qasr_unit_tests COMMAND qasr_unit_tests)
+    set_tests_properties(qasr_unit_tests PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    )
 endif()

@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Test streaming upload (same path as web UI) and check for repetition."""
+"""Test streaming upload (same path as web UI) and check for repetition.
+
+Env vars:
+  QASR_TEST_SERVER  default http://127.0.0.1:19991  (qasr_server --port default)
+  QASR_TEST_AUDIO   default testfile/english_60s.wav
+"""
 import subprocess, time, json, os, sys, urllib.request
 
-SERVER = "http://127.0.0.1:3458"
-AUDIO = "/Users/kurisu/Library/CloudStorage/OneDrive-个人/文档/orange/wavs/output.wav"
+SERVER = os.environ.get("QASR_TEST_SERVER", "http://127.0.0.1:19991")
+AUDIO = os.environ.get("QASR_TEST_AUDIO", "testfile/english_60s.wav")
 TMPPCM = "/tmp/qasr_test.raw"
 
 # Convert to 16kHz mono PCM
