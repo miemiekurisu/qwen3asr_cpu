@@ -1,10 +1,12 @@
 #pragma once
 
+#include <filesystem>
 #include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "qasr/base/http_server.h"
 #include "qasr/core/status.h"
 #include "qasr/service/realtime.h"
 
@@ -84,5 +86,33 @@ Status ValidateServerConfig(const ServerConfig & config);
 Status ParseServerArguments(int argc, const char * const argv[], ServerConfig * config, bool * show_help);
 std::string BuildServerUsage(std::string_view program_name);
 int RunServer(const ServerConfig & config);
+
+/* ────── HTTP handler helpers (extracted for testability) ──────
+ *
+ * These were previously inline lambdas inside RunServer.  They
+ * were pulled out so unit tests can drive them without spinning
+ * up the full server (which requires a real model on disk).  The
+ * signatures are designed to be mockable: ServeStaticTextFile
+ * takes the file path and content type as parameters, never
+ * reaches into module-level state. */
+
+namespace fs = std::filesystem;
+
+/// Serve a static text file from \p path.  On success sets the
+/// response body and the given MIME content type.  On failure
+/// (empty file, unreadable) sends a 500 with an error message
+/// identifying \p label for operator diagnostics.
+void ServeStaticTextFile(
+    HttpResponse & response,
+    const fs::path & path,
+    const std::string & content_type,
+    const std::string & label);
+
+/// Build the JSON body returned by /health and /api/health.  The
+/// current contract is a constant {"status": "ok"}, but pulling
+/// this out as a free function lets a future test (or a future
+/// "deep health" endpoint) replace it without touching the
+/// route-registration code.
+std::string BuildHealthJson();
 
 }  // namespace qasr

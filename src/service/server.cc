@@ -2273,6 +2273,28 @@ std::string BuildServerUsage(std::string_view program_name) {
     return usage;
 }
 
+/* ────── HTTP handler helpers (testable wrappers) ────── */
+
+void ServeStaticTextFile(
+    HttpResponse & response,
+    const fs::path & path,
+    const std::string & content_type,
+    const std::string & label) {
+    const std::string body = LoadTextFile(path);
+    if (body.empty()) {
+        SetErrorResponse(response, Status(StatusCode::kInternal, "failed to load " + label), 500);
+        return;
+    }
+    response.set_content(body, content_type);
+}
+
+std::string BuildHealthJson() {
+    /* Constant for now.  If we ever add a "deep health" endpoint
+     * (model loaded, last successful inference, etc.), this is
+     * where the per-field logic goes. */
+    return "{\"status\":\"ok\"}";
+}
+
 /* ============================================================================
  * VAD-segmented batch transcription (file → VAD segments → per-segment decode)
  * ============================================================================
@@ -3469,43 +3491,26 @@ int RunServer(const ServerConfig & config) {
     };
 
     server.Get("/", [&](const HttpRequest &, HttpResponse & response) {
-        const std::string body = LoadTextFile(ui_dir / "index.html");
-        if (body.empty()) {
-            SetErrorResponse(response, Status(StatusCode::kInternal, "failed to load index.html"), 500);
-            return;
-        }
-        response.set_content(body, "text/html; charset=utf-8");
+        ServeStaticTextFile(response, ui_dir / "index.html", "text/html; charset=utf-8", "index.html");
     });
     server.Get("/app.js", [&](const HttpRequest &, HttpResponse & response) {
-        const std::string body = LoadTextFile(ui_dir / "app.js");
-        if (body.empty()) {
-            SetErrorResponse(response, Status(StatusCode::kInternal, "failed to load app.js"), 500);
-            return;
-        }
-        response.set_content(body, "application/javascript; charset=utf-8");
+        ServeStaticTextFile(response, ui_dir / "app.js", "application/javascript; charset=utf-8", "app.js");
     });
     server.Get("/live_monitor.js", [&](const HttpRequest &, HttpResponse & response) {
-        const std::string body = LoadTextFile(ui_dir / "live_monitor.js");
-        if (body.empty()) {
-            SetErrorResponse(response, Status(StatusCode::kInternal, "failed to load live_monitor.js"), 500);
-            return;
-        }
-        response.set_content(body, "application/javascript; charset=utf-8");
+        ServeStaticTextFile(response, ui_dir / "live_monitor.js", "application/javascript; charset=utf-8", "live_monitor.js");
+    });
+    server.Get("/state_pure.js", [&](const HttpRequest &, HttpResponse & response) {
+        ServeStaticTextFile(response, ui_dir / "state_pure.js", "application/javascript; charset=utf-8", "state_pure.js");
     });
     server.Get("/style.css", [&](const HttpRequest &, HttpResponse & response) {
-        const std::string body = LoadTextFile(ui_dir / "style.css");
-        if (body.empty()) {
-            SetErrorResponse(response, Status(StatusCode::kInternal, "failed to load style.css"), 500);
-            return;
-        }
-        response.set_content(body, "text/css; charset=utf-8");
+        ServeStaticTextFile(response, ui_dir / "style.css", "text/css; charset=utf-8", "style.css");
     });
 
     server.Get("/health", [&](const HttpRequest &, HttpResponse & response) {
-        SetJsonResponse(response, Json::object({{"status", "ok"}}));
+        response.set_content(BuildHealthJson(), "application/json; charset=utf-8");
     });
     server.Get("/api/health", [&](const HttpRequest &, HttpResponse & response) {
-        SetJsonResponse(response, Json::object({{"status", "ok"}}));
+        response.set_content(BuildHealthJson(), "application/json; charset=utf-8");
     });
     /* Debug endpoint: page JS POSTs DOM snapshots here, server keeps the
      * latest in `debug_state` (a mutex-guarded std::string).  Curl

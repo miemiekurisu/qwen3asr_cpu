@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 
+#include "qasr/base/json.h"
 #include "qasr/service/server.h"
 
 namespace fs = std::filesystem;
@@ -202,4 +203,108 @@ QASR_TEST(RealtimeStreamMaxNewTokensTracksChunkCadence) {
 
     policy.min_decode_interval_ms = 950;
     QASR_EXPECT_EQ(qasr::RealtimeStreamMaxNewTokens(policy), 32);
+
+    policy.min_decode_interval_ms = 0;
+    QASR_EXPECT_EQ(qasr::RealtimeStreamMaxNewTokens(policy), 24);
+}
+
+/* ────── HTTP handler helpers (extracted from RunServer) ────── */
+
+QASR_TEST(BuildHealthJsonReturnsOkStatus) {
+    /* The current contract: /health and /api/health both return
+     * {"status":"ok"} regardless of model state.  This is the
+     * "liveness" probe, not the "readiness" probe.  A future
+     * readiness endpoint would query the SharedAsrModel and the
+     * realtime worker.  Until then, this is the contract. */
+    const std::string body = qasr::BuildHealthJson();
+    QASR_EXPECT_EQ(body, std::string("{\"status\":\"ok\"}"));
+}
+
+QASR_TEST(BuildHealthJsonIsValidJson) {
+    /* Just parsing it to catch accidental syntax breakage in a
+     * future "add more fields" commit. */
+    const std::string body = qasr::BuildHealthJson();
+    qasr::Json parsed = qasr::Json::parse(body);
+    QASR_EXPECT_EQ(parsed["status"].get<std::string>(), std::string("ok"));
+}
+
+QASR_TEST(ServeStaticTextFileLoadsExistingFile) {
+    /* Write a temp file, point the helper at it, verify the
+     * response body matches and the content type is set. */
+    namespace fs = std::filesystem;
+    const fs::path tmp = fs::temp_directory_path() / "qasr_static_test.txt";
+    {
+        std::ofstream out(tmp);
+        out << "hello world\n";
+    }
+    qasr::HttpResponse response;
+    qasr::ServeStaticTextFile(response, tmp, "text/plain; charset=utf-8", "test.txt");
+    QASR_EXPECT_EQ(response.status, 200);
+    QASR_EXPECT_EQ(response.body_, std::string("hello world\n"));
+    QASR_EXPECT_EQ(response.content_type_, std::string("text/plain; charset=utf-8"));
+    fs::remove(tmp);
+}
+
+QASR_TEST(ServeStaticTextFileReportsMissingFileAsError) {
+    /* When the file is missing or empty, the helper must set a
+     * 500 with an error message that names the file.  This is
+     * what the operator sees in the browser when ui/index.html
+     * is missing. */
+    qasr::HttpResponse response;
+    qasr::ServeStaticTextFile(
+        response,
+        std::filesystem::path("/nonexistent/path/missing.html"),
+        "text/html; charset=utf-8",
+        "missing.html");
+    QASR_EXPECT_EQ(response.status, 500);
+    QASR_EXPECT(response.body_.find("missing.html") != std::string::npos);
+}
+
+QASR_TEST(ServeStaticTextFileReportsEmptyFileAsError) {
+    /* Zero-byte file == LoadTextFile returns empty == error path.
+     * Same 500 + named label. */
+    namespace fs = std::filesystem;
+    const fs::path tmp = fs::temp_directory_path() / "qasr_empty_test.txt";
+    {
+        std::ofstream out(tmp);
+        /* write nothing */
+    }
+    qasr::HttpResponse response;
+    qasr::ServeStaticTextFile(response, tmp, "text/plain", "empty.txt");
+    QASR_EXPECT_EQ(response.status, 500);
+    QASR_EXPECT(response.body_.find("empty.txt") != std::string::npos);
+    fs::remove(tmp);
+}
+
+QASR_TEST(ServeStaticTextFileHandlesAllUiAssets) {
+    /* Walk the real ui/ directory and verify each static asset
+     * loads with its expected content type.  This catches the
+     * case where a script is renamed but the route still points
+     * at the old name (the bug class that produced the
+     * "404 on /app.js" 90s-after-deploy outage). */
+    namespace fs = std::filesystem;
+    const fs::path ui = std::filesystem::current_path() / "ui";
+    struct Asset { const char * path; const char * mime; };
+    const Asset assets[] = {
+        {"index.html", "text/html; charset=utf-8"},
+        {"app.js", "application/javascript; charset=utf-8"},
+        {"live_monitor.js", "application/javascript; charset=utf-8"},
+        {"state_pure.js", "application/javascript; charset=utf-8"},
+        {"style.css", "text/css; charset=utf-8"},
+    };
+    for (const Asset & a : assets) {
+        qasr::HttpResponse response;
+        qasr::ServeStaticTextFile(response, ui / a.path, a.mime, a.path);
+        QASR_EXPECT_EQ(response.status, 200);
+        QASR_EXPECT(!response.body_.empty());
+        QASR_EXPECT_EQ(response.content_type_, std::string(a.mime));
+    }
+}
+
+QASR_TEST(BuildServerUsageMentionsRealtimeModelDir) {
+    /* Sanity: the usage string documents the new --realtime-model-dir
+     * flag.  If a future refactor drops the line, the user is
+     * surprised when their config no longer works. */
+    const std::string usage = qasr::BuildServerUsage("qasr_server");
+    QASR_EXPECT(usage.find("--realtime-model-dir") != std::string::npos);
 }
