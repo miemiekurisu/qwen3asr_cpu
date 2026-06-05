@@ -273,6 +273,179 @@ test('soft reset: id is preserved through the helper', () => {
   assert.equal(out[1].id, 'L2');
 });
 
+// ───── countCodepoints ─────
+
+test('countCodepoints: empty string returns 0', () => {
+  assert.equal(pure.countCodepoints(''), 0);
+});
+
+test('countCodepoints: null and undefined return 0', () => {
+  assert.equal(pure.countCodepoints(null), 0);
+  assert.equal(pure.countCodepoints(undefined), 0);
+});
+
+test('countCodepoints: ASCII is one code point per char', () => {
+  assert.equal(pure.countCodepoints('hello'), 5);
+});
+
+test('countCodepoints: CJK is one code point per char', () => {
+  assert.equal(pure.countCodepoints('你好世界'), 4);
+});
+
+test('countCodepoints: emoji surrogate pair is ONE code point (not 2)', () => {
+  /* "😀" is U+1F600 GRINNING FACE — encoded in UTF-16 as the
+   * surrogate pair 0xD83D 0xDE00 (2 code units, 1 code point).
+   * .length would return 2; Array.from returns 1. */
+  assert.equal('😀'.length, 2, 'sanity: JS .length is 2 (proves the test is meaningful)');
+  assert.equal(pure.countCodepoints('😀'), 1);
+});
+
+test('countCodepoints: mixed ASCII + emoji + CJK counts code points only', () => {
+  /* "a😀中" = a (1) + 😀 (1) + 中 (1) = 3 code points
+   *         = a (1) + 😀 (2 units) + 中 (1) = 4 UTF-16 code units */
+  assert.equal('a😀中'.length, 4, 'sanity: JS .length is 4');
+  assert.equal(pure.countCodepoints('a😀中'), 3);
+});
+
+// ───── downsampleTo16k ─────
+
+test('downsampleTo16k: same rate (16000) returns the input unchanged (no copy)', () => {
+  const input = new Float32Array([0.1, 0.2, 0.3, 0.4]);
+  const out = pure.downsampleTo16k(input, 16000);
+  assert.equal(out, input, 'must return the same reference, not a copy');
+});
+
+test('downsampleTo16k: 48000 -> 16000 picks 1 of every 3 samples (center)', () => {
+  /* 6 samples @ 48k, ratio=3.  Output windows are [0..3) [3..6).
+   *  Center of [0..3) is at index 1.5 -> pick index 1.
+   *  Center of [3..6) is at index 4.5 -> pick index 4.
+   *  Use integer-valued samples (1.0, 2.0, …) to avoid Float32
+   *  precision noise (0.1 stored as ~0.10000000149…). */
+  const input = new Float32Array([1, 2, 3, 4, 5, 6]);
+  const out = pure.downsampleTo16k(input, 48000);
+  assert.equal(out.length, 2);
+  assert.equal(out[0], 2);
+  assert.equal(out[1], 5);
+});
+
+test('downsampleTo16k: 44100 -> 16000 uses non-integer ratio', () => {
+  /* ratio = 44100/16000 = 2.75625.  Pick indices (9 samples → 3 outputs):
+   *  index 0: center=1.378 -> floor=1
+   *  index 1: center=4.134 -> floor=4
+   *  index 2: center=6.890 -> floor=6
+   *  floor(9 / 2.75625) = floor(3.265) = 3. */
+  const input = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  const out = pure.downsampleTo16k(input, 44100);
+  assert.equal(out.length, 3);
+  assert.equal(out[0], 2);
+  assert.equal(out[1], 5);
+  assert.equal(out[2], 7);
+});
+
+test('downsampleTo16k: empty input returns empty Float32Array', () => {
+  const input = new Float32Array([]);
+  const out = pure.downsampleTo16k(input, 48000);
+  assert.equal(out.length, 0);
+  assert.ok(out instanceof Float32Array, 'must be a Float32Array');
+});
+
+test('downsampleTo16k: last window is partial (input length not a multiple of ratio)', () => {
+  /* 4 samples @ 48k, ratio=3.  floor(4/3) = 1 output.
+   *  Center of [0..3) = 1.5 -> pick index 1. */
+  const input = new Float32Array([1, 2, 3, 4]);
+  const out = pure.downsampleTo16k(input, 48000);
+  assert.equal(out.length, 1);
+  assert.equal(out[0], 2);
+});
+
+// ───── floatToPcm16 ─────
+
+test('floatToPcm16: zero in -> zero out', () => {
+  const input = new Float32Array([0, 0, 0]);
+  const out = pure.floatToPcm16(input);
+  assert.equal(out.length, 3);
+  for (let i = 0; i < 3; i += 1) {
+    assert.equal(out[i], 0);
+  }
+});
+
+test('floatToPcm16: -1.0 maps to -32768 (asymmetric int16 range)', () => {
+  const out = pure.floatToPcm16(new Float32Array([-1.0]));
+  assert.equal(out[0], -32768, 'asymmetric: -1.0 must hit the bottom of int16 range');
+});
+
+test('floatToPcm16: 1.0 maps to 32767 (not 32768)', () => {
+  const out = pure.floatToPcm16(new Float32Array([1.0]));
+  assert.equal(out[0], 32767, 'asymmetric: 1.0 must hit 32767, not 32768');
+});
+
+test('floatToPcm16: 0.5 maps to 16383 (Int16Array truncates 16383.5)', () => {
+  /* 0.5 * 32767 = 16383.5.  Int16Array assignment truncates the
+   * fractional part (it does NOT round), so the result is 16383,
+   * not 16384.  This is intentional PCM behaviour — clipping
+   * the half-LSB is standard. */
+  const out = pure.floatToPcm16(new Float32Array([0.5]));
+  assert.equal(out[0], 16383);
+});
+
+test('floatToPcm16: -0.5 maps to -16384 (negative half, using -32768 base)', () => {
+  /* -0.5 * 32768 = -16384, exact.  Critical: this is NOT
+   * -16383.5 (which is what -0.5 * 32767 would give).  The
+   * asymmetric range is what makes the magnitude symmetric
+   * around zero. */
+  const out = pure.floatToPcm16(new Float32Array([-0.5]));
+  assert.equal(out[0], -16384);
+});
+
+test('floatToPcm16: clamps out-of-range values to [-1, 1]', () => {
+  const input = new Float32Array([1.5, -1.5, 2.0, -2.0]);
+  const out = pure.floatToPcm16(input);
+  assert.equal(out[0], 32767, '1.5 must clamp to 1.0 -> 32767');
+  assert.equal(out[1], -32768, '-1.5 must clamp to -1.0 -> -32768');
+  assert.equal(out[2], 32767);
+  assert.equal(out[3], -32768);
+});
+
+test('floatToPcm16: empty input returns empty Int16Array', () => {
+  const out = pure.floatToPcm16(new Float32Array([]));
+  assert.equal(out.length, 0);
+  assert.ok(out instanceof Int16Array);
+});
+
+// ───── buildRealtimeExportName ─────
+
+test('buildRealtimeExportName: typical session id + txt extension', () => {
+  const name = pure.buildRealtimeExportName('rt_abc-123', 'txt', new Date('2026-06-05T12:00:00.000Z'));
+  assert.equal(name, 'qasr-realtime-rt_abc-123-2026-06-05T12-00-00-000Z.txt');
+});
+
+test('buildRealtimeExportName: sanitizes unsafe session id chars', () => {
+  /* Slashes, spaces, dots, colons in session id must collapse
+   * to single dashes so the filename is safe. */
+  const name = pure.buildRealtimeExportName('a/b c.d:e', 'txt', new Date('2026-06-05T12:00:00.000Z'));
+  assert.equal(name, 'qasr-realtime-a-b-c-d-e-2026-06-05T12-00-00-000Z.txt');
+});
+
+test('buildRealtimeExportName: empty session id falls back to "session"', () => {
+  const name = pure.buildRealtimeExportName('', 'json', new Date('2026-06-05T12:00:00.000Z'));
+  assert.equal(name, 'qasr-realtime-session-2026-06-05T12-00-00-000Z.json');
+});
+
+test('buildRealtimeExportName: null session id falls back to "session"', () => {
+  const name = pure.buildRealtimeExportName(null, 'json', new Date('2026-06-05T12:00:00.000Z'));
+  assert.equal(name, 'qasr-realtime-session-2026-06-05T12-00-00-000Z.json');
+});
+
+test('buildRealtimeExportName: timestamp is ISO with : and . replaced by -', () => {
+  /* Windows / FAT32 cannot store ":" or "." in filenames, so
+   * the timestamp has those replaced by "-".  Critical for
+   * cross-platform download. */
+  const name = pure.buildRealtimeExportName('s', 'txt', new Date('2026-01-02T03:04:05.678Z'));
+  assert.ok(!name.includes(':'), 'no colons in filename: ' + name);
+  assert.ok(name.match(/^qasr-realtime-s-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.txt$/),
+    'expected format, got: ' + name);
+});
+
 // ───── summary ─────
 
 console.log('');

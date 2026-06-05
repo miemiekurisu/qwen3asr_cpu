@@ -174,6 +174,9 @@ Status ParseCliArguments(int argc, const char * const argv[], CliOptions * optio
         }
         if (arg == "--encoder-int8") {
             options->asr.encoder_int8 = true;
+            std::fprintf(stderr,
+                "warning: --encoder-int8 is temporarily disabled (code retained, no-op); "
+                "see docs/INCIDENTS.md 2026-06-05 encoder INT8 disabled\n");
             continue;
         }
         if (arg == "--output-format") {
@@ -246,8 +249,7 @@ std::string BuildCliUsage(std::string_view program_name) {
     usage += "  --threads <n>                  CPU 线程数 (默认: 自动检测)\n";
     usage += "  --language <lang>              强制语言 (如 Chinese, English)\n";
     usage += "  --prompt <text>                提示文本 (引导识别风格)\n";
-    usage += "  --temperature <float>          采样温度 (默认: auto, 0=贪心, >0=采样)\n";
-    usage += "  --encoder-int8                 编码器 INT8 量化 (省显存, 识别质量影响很小)\n\n";
+    usage += "  --temperature <float>          采样温度 (默认: auto, 0=贪心, >0=采样)\n\n";
     usage += "高级选项 / Advanced:\n";
     usage += "  --stream                       流式分段推理\n";
     usage += "  --stream-max-new-tokens <n>    流式每段最大 token 数 (默认 32, max 128)\n";
