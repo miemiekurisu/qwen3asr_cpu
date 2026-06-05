@@ -65,7 +65,16 @@ qwen_ctx_t *MakeSourceCtx() {
     // qwen_free() can release them.  The clone contract is "the
     // clone zeros its own copy" — we verify that with rows/cols
     // sentinels, which qwen_free() doesn't touch.
-    for (int i = 0; i < QWEN_MAX_DEC_LAYERS; ++i) {
+    //
+    // IMPORTANT: the allocation count must match config.dec_layers.
+    // qwen_free() walks only the active layer range (line 561 of
+    // qwen_asr.c); buffers outside that range are leaked.  Mismatch
+    // is caught by LeakSanitizer.  The C2 review bumped the loop to
+    // QWEN_MAX_DEC_LAYERS for "thoroughness" but the test config has
+    // only 2 active dec layers, which is correct for verifying the
+    // clone contract — clone SharedPerLayer zeroing is only relevant
+    // for the active range.
+    for (int i = 0; i < ctx->config.dec_layers; ++i) {
         ctx->decoder.layers[i].prefill_qkv_prepared.f32_data = static_cast<float *>(std::calloc(64, sizeof(float)));
         ctx->decoder.layers[i].prefill_qkv_prepared.rows = 7;
         ctx->decoder.layers[i].prefill_qkv_prepared.cols = 11;
@@ -337,6 +346,13 @@ QASR_TEST(QwenCloneSharedFreeCloneFirstNoUafOnSource) {
     // the free() would actually crash, so we use calloc-allocated
     // sentinels that free() can handle.
     qwen_ctx_t *src = MakeSourceCtx();
+    // MakeSourceCtx() already calloc'd tok_embed_suffix_max and
+    // lm_head_suffix_max to 8 floats each (sentinel rows/cols for
+    // the aliasing checks).  We replace them with smaller allocs to
+    // make the test data distinct; free the originals first to keep
+    // LeakSanitizer clean.
+    std::free(src->decoder.tok_embed_suffix_max);
+    std::free(src->decoder.lm_head_suffix_max);
     src->decoder.tok_embed_suffix_max = static_cast<float *>(std::calloc(1, sizeof(float)));
     src->decoder.lm_head_suffix_max = static_cast<float *>(std::calloc(1, sizeof(float)));
     QASR_EXPECT(src->decoder.tok_embed_suffix_max != nullptr);
@@ -367,6 +383,15 @@ QASR_TEST(QwenCloneSharedFreeSourceFirstNoUafOnClone) {
     // operator is expected to drop all clones too.  This test only
     // verifies the source's own free is correct.
     qwen_ctx_t *src = MakeSourceCtx();
+    // MakeSourceCtx() already calloc'd tok_embed_suffix_max and
+    // lm_head_suffix_max to 8 floats each (so the aliasing test has
+    // real chunks to compare).  We replace them with smaller
+    // allocations here to make the test data distinct; the original
+    // 32-byte chunks must be freed explicitly to avoid LeakSanitizer
+    // noise (qwen_free on src would not free them because
+    // owns_model_data=1, and the chunk would be orphaned).
+    std::free(src->decoder.tok_embed_suffix_max);
+    std::free(src->decoder.lm_head_suffix_max);
     src->decoder.tok_embed_suffix_max = static_cast<float *>(std::calloc(1, sizeof(float)));
     src->decoder.lm_head_suffix_max = static_cast<float *>(std::calloc(1, sizeof(float)));
     qwen_ctx_t *clone = qwen_clone_shared(src);

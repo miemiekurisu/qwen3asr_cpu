@@ -769,7 +769,22 @@ int qwen_decoder_prepare_int8(void *ctx) {
     return -1;
 }
 
-void qwen_decoder_free_int8(void *ctx) { (void)ctx; }
+void qwen_decoder_free_int8(void *ctx_ptr) {
+    /* Even without oneDNN, qwen_free() still walks this code path
+     * unconditionally (qwen_asr.c:585).  If the int8 layer array was
+     * allocated (by a test, or by future code that prepares int8
+     * weights via a different path), it must be freed here to avoid
+     * leaks.  With oneDNN disabled the per-layer inner pointers are
+     * always zero (calloc'd or never populated), so a plain free()
+     * of the array is safe. */
+    qwen_ctx_t *ctx = (qwen_ctx_t *)ctx_ptr;
+    if (!ctx) return;
+    if (ctx->int8_dec_layers) {
+        free(ctx->int8_dec_layers);
+        ctx->int8_dec_layers = NULL;
+    }
+    ctx->n_int8_dec_layers = 0;
+}
 
 int qwen_encoder_prepare_int8(void *ctx) {
     (void)ctx;
@@ -778,6 +793,15 @@ int qwen_encoder_prepare_int8(void *ctx) {
     return -1;
 }
 
-void qwen_encoder_free_int8(void *ctx) { (void)ctx; }
+void qwen_encoder_free_int8(void *ctx_ptr) {
+    /* Mirror of qwen_decoder_free_int8 above. */
+    qwen_ctx_t *ctx = (qwen_ctx_t *)ctx_ptr;
+    if (!ctx) return;
+    if (ctx->int8_enc_layers) {
+        free(ctx->int8_enc_layers);
+        ctx->int8_enc_layers = NULL;
+    }
+    ctx->n_int8_enc_layers = 0;
+}
 
 #endif /* USE_ONEDNN */
