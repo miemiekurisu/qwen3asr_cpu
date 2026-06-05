@@ -54,7 +54,7 @@
 | `--language <lang>` | (auto) | 强制语言 (`Chinese` / `English` / ...) |
 | `--prompt <text>` | (无) | 提示文本 (引导识别风格) |
 | `--temperature <float>` | -1.0=auto | 采样温度; `0`=贪心, `>0`=采样 |
-| `--encoder-int8` | off | Encoder INT8 量化 (Whisper-style conv, 风险小, 收益明显) |
+| `--encoder-int8` | off | **暂禁用** (post-C8, 入口屏蔽, 参数接受但 no-op, 见 `docs/INCIDENTS.md` 2026-06-05 条目) |
 
 > ❌ **没有 `--decoder-int8`**: decoder INT8 在 C8 移除, 显著降低识别质量 (语言一致性 / code-switch / 幻觉). 见 `docs/INCIDENTS.md` 2026-06-05 条目.
 
@@ -89,7 +89,7 @@ qasr_cli --model-dir $HF/Qwen3-ASR-0.6B --audio meeting.mp3 \
 qasr_cli --model-dir $HF/Qwen3-ASR-1.7B --audio movie.mp3 \
   --output-format srt --output movie.srt
 
-# 内存紧: 只开 encoder INT8
+# 内存紧: --encoder-int8 暂禁用 (见 INCIDENTS), 实际无效果
 qasr_cli --model-dir $HF/Qwen3-ASR-0.6B --audio long.wav \
   --encoder-int8 --threads 8
 ```
@@ -126,7 +126,7 @@ qasr_cli --model-dir $HF/Qwen3-ASR-0.6B --audio long.wav \
 |---|---|---|
 | `--threads <n>` | 0=自动 | 推理线程数 (设给 OpenBLAS) |
 | `--temperature <float>` | -1.0=auto | 采样温度; `0`=贪心, `>0`=采样 |
-| `--encoder-int8` | off | Encoder INT8 (realtime clone 自动沿用) |
+| `--encoder-int8` | off | **暂禁用** (post-C8, 入口屏蔽, 参数接受但 no-op, 见 `docs/INCIDENTS.md` 2026-06-05 条目) |
 
 > ❌ **没有 `--decoder-int8` / `--realtime-decoder-int8`**: 同上, C8 移除.
 
@@ -150,7 +150,7 @@ tools/run_linux_server.sh --detach
 # 双模型: batch 1.7B, realtime 0.6B
 qasr_server --model-dir $HF/Qwen3-ASR-1.7B \
             --realtime-model-dir $HF/Qwen3-ASR-0.6B \
-            --encoder-int8
+            --encoder-int8   # 暂禁用 (见 INCIDENTS)
 ```
 
 ---

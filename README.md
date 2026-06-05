@@ -170,7 +170,7 @@ qasr_cli --model-dir /path/to/Qwen3-ASR-1.7B --audio interview.wav \
 
 ```bash
 qasr_cli --model-dir /path/to/Qwen3-ASR-0.6B --audio audio.wav \
-  --encoder-int8 \
+  --encoder-int8 \   # 暂禁用, no-op (见 INCIDENTS 2026-06-05 encoder INT8 entry)
   --threads 16
 ```
 
@@ -209,12 +209,12 @@ qasr_server --model-dir /path/to/Qwen3-ASR-0.6B \
 http://127.0.0.1:8080/
 ```
 
-启用 INT8：
+启用 INT8（encoder，**暂禁用 no-op** — 见 [`docs/INCIDENTS.md`](docs/INCIDENTS.md) 2026-06-05 encoder INT8 entry）：
 
 ```bash
 qasr_server --model-dir /path/to/Qwen3-ASR-0.6B \
   --port 8080 \
-  --encoder-int8 \
+  --encoder-int8 \   # 暂禁用, no-op
   --threads 16
 ```
 
@@ -331,7 +331,7 @@ MIT. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
 - [`docs/API.md`](docs/API.md) — 全部 HTTP 端点、错误码、SSE 事件
 - [`docs/SECURITY.md`](docs/SECURITY.md) — 信任边界、威胁清单、生产部署 checklist
 - [`docs/AUDIT_C1.md`](docs/AUDIT_C1.md) — C1 审计报告 (死代码 / UAF / OOM / god function)
-- [`docs/INCIDENTS.md`](docs/INCIDENTS.md) — 历史事故 + 修复 (150s crash / UI 状态机 / OOM 风险 / decoder-int8 移除)
+- [`docs/INCIDENTS.md`](docs/INCIDENTS.md) — 历史事故 + 修复 (150s crash / UI 状态机 / OOM 风险 / decoder-int8 移除 / encoder-int8 暂禁用 / offlineStop 5xx 静默覆盖)
 - [`docs/BLAS_COMPARISON.md`](docs/BLAS_COMPARISON.md) — OpenBLAS / Accelerate / oneDNN 对比
 
 ### 高级特性
