@@ -78,7 +78,7 @@ ctest --test-dir build/linux-openblas -R ffmpeg_argv
 
 ### 5. mic 权限劫持 (Web UI)
 
-**威胁**: 用户访问 `http://192.168.2.38:8080` (HTTP), 浏览器拒绝 mic 权限, 用户在地址栏改成 `https://...` 但 DNS 劫持到攻击者 IP。
+**威胁**: 用户访问 `http://<server-lan-ip>:8080` (HTTP), 浏览器拒绝 mic 权限, 用户在地址栏改成 `https://...` 但 DNS 劫持到攻击者 IP。
 
 **现状**: ✅ **已修**:
 - 默认 `tools/run_linux_server.sh --https` 启 HTTPS 反代。
@@ -141,7 +141,7 @@ ctest --test-dir build/linux-openblas -R ffmpeg_argv
 tools/run_linux_server.sh --detach --https
 
 # 2. bind 到 LAN IP, 不暴露 0.0.0.0 给公网
-export QASR_HOST=192.168.2.38
+export QASR_HOST=<server-lan-ip>   # 例如 192.168.x.x / 10.x.x.x
 export QASR_PORT=19991
 export QASR_HTTPS_PORT=19992
 

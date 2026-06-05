@@ -57,8 +57,8 @@ def main():
 
     # 2. use a real audio file (silero VAD doesn't fire on pure tones)
     # Take the first 4s of english_60s.wav and pad with silence at the end.
-    import wave
-    wav_path = "/home/kurisu/文档/github/qwen3asr_cpu/testfile/english_60s.wav"
+    import wave, os
+    wav_path = os.environ.get("QASR_TEST_AUDIO", "testfile/english_60s.wav")
     with wave.open(wav_path, "rb") as w:
         assert w.getframerate() == 16000, f"expected 16kHz, got {w.getframerate()}"
         nchannels = w.getnchannels()

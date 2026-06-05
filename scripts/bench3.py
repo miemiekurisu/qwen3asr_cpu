@@ -8,7 +8,22 @@ import json, urllib.request, wave, time, threading, subprocess, sys, os, re
 from pathlib import Path
 
 SR = 16000
-SNAP = "/home/kurisu/.cache/huggingface/models--Qwen--Qwen3-ASR-0.6B/snapshots/5eb144179a02acc5e5ba31e748d22b0cf3e303b0"
+# Model path: prefer $QASR_MODEL_DIR (matches server / run_linux_server.sh),
+# then $HF_HOME / $HUGGINGFACE_HUB_CACHE, then ~/.cache/huggingface. The
+# snapshot hash differs per download, so we glob for whatever's there.
+_HF_DEFAULT = os.environ.get("HUGGINGFACE_HUB_CACHE") or os.path.join(
+    os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")),
+    "models--Qwen--Qwen3-ASR-0.6B", "snapshots")
+def _resolve_model_dir():
+    if os.environ.get("QASR_MODEL_DIR"):
+        return os.environ["QASR_MODEL_DIR"]
+    snaps = Path(_HF_DEFAULT)
+    if snaps.is_dir():
+        revs = sorted(p for p in snaps.iterdir() if p.is_dir())
+        if revs:
+            return str(revs[-1])
+    return ""  # caller falls back to "model not found" with a clear error
+SNAP = _resolve_model_dir()
 TESTFILES = Path("testfile")
 BIN = "./build/linux-openblas/qasr_server"
 CLI = "./build/linux-openblas/qasr_cli"
