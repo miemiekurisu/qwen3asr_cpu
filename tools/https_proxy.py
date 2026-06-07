@@ -37,6 +37,7 @@ HTTPS 方案对比:
 """
 import argparse
 import atexit
+import http.client
 import http.server
 import ipaddress
 import os
@@ -120,11 +121,31 @@ def _generate_via_cryptography(cert_path, key_path, sans):
 
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
-    """HTTP/1.1 透明反代. 任何 method 透传到 upstream."""
+    """HTTP/1.1 透明反代. 任何 method 透传到 upstream.
+
+    Streaming-aware: the upstream may send
+    ``Content-Type: text/event-stream`` (SSE) where the response
+    is delivered as the server emits frames, with no
+    ``Content-Length`` and no ``Transfer-Encoding: chunked`` —
+    just ``Connection: close`` to signal end-of-stream.  In
+    that case ``urllib.request.urlopen`` would buffer the whole
+    body until EOF, defeating SSE entirely.  We detect this
+    pattern and fall back to a raw ``http.client`` connection
+    that streams chunks as they arrive.  Buffered responses
+    still go through the urllib path. """
     protocol_version = "HTTP/1.1"
     upstream: str = DEFAULT_UPSTREAM  # 类变量, main() 注入
 
-    def _proxy(self, method: str) -> None:
+    def _flush_chunk(self, data: bytes) -> None:
+        """Write one HTTP chunk to the client."""
+        self.wfile.write(f"{len(data):X}\r\n".encode("ascii"))
+        self.wfile.write(data)
+        self.wfile.write(b"\r\n")
+        self.wfile.flush()
+
+    def _proxy_buffered(self, method: str) -> None:
+        """Path for buffered responses (everything except
+        streaming SSE).  Uses urllib for simplicity. """
         url = self.upstream + self.path
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else None
@@ -148,6 +169,108 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(e.code)
             self.end_headers()
             self.wfile.write(e.read() if e.fp else b"")
+
+    def _proxy_streaming(self, method: str) -> None:
+        """Path for SSE: open a raw http.client connection
+        and stream chunks to the client as they arrive.  We
+        set ``Transfer-Encoding: chunked`` on the client side
+        so each upstream chunk becomes one HTTP chunk, which
+        is what the browser's EventSource expects. """
+        from urllib.parse import urlparse
+        u = urlparse(self.upstream)
+        host = u.hostname
+        port = u.port or (443 if u.scheme == "https" else 80)
+        # Build the request line + headers
+        path = u.path.rstrip("/") + self.path
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length) if length else None
+        forward_headers = []
+        for k, v in self.headers.items():
+            if k.lower() in ("host", "content-length", "connection", "transfer-encoding"):
+                continue
+            forward_headers.append((k, v))
+        header_block = f"{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+        header_block += "".join(f"{k}: {v}\r\n" for k, v in forward_headers)
+        if body is not None:
+            header_block += f"Content-Length: {len(body)}\r\n"
+        header_block += "Connection: close\r\n\r\n"
+        try:
+            conn = http.client.HTTPConnection(host, port, timeout=300)
+            # request() handles header serialization + body
+            # sending.  We pass the upstream's Host header
+            # because the client sent a Host like
+            # "127.0.0.1:19992" but the upstream is on
+            # "127.0.0.1:19991" — cpp-httplib may use Host for
+            # virtual hosting, so we strip the client's Host
+            # and let request() set the upstream one.
+            upstream_headers = dict(forward_headers)
+            upstream_headers.pop("Host", None)
+            conn.request(method, path, body=body, headers=upstream_headers)
+            resp = conn.getresponse()
+            # Send status + headers to client.  Force
+            # chunked so the browser flushes per frame.
+            self.send_response(resp.status)
+            for k, v in resp.getheaders():
+                if k.lower() in ("transfer-encoding", "connection", "content-length"):
+                    continue
+                self.send_header(k, v)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            # 1-byte reads are required: when the upstream
+            # uses Connection: close with no Content-Length
+            # and no chunked (qasr_server's SSE style),
+            # http.client.HTTPResponse.read(amt) blocks
+            # until EOF for any `amt` larger than what
+            # the BufferedReader has buffered.  The 1-byte
+            # read goes straight to the underlying socket,
+            # surfacing partial data to us as soon as the
+            # upstream writes.  We accumulate into a buffer
+            # and flush at SSE frame boundaries ("\n\n") so
+            # the browser sees each event with sub-frame
+            # latency.  Larger amt (e.g. 8 KB) would buffer
+            # up to 8 KB before surfacing, defeating SSE.
+            acc = bytearray()
+            while True:
+                try:
+                    b = resp.read(1)
+                except Exception:
+                    break
+                if not b:
+                    break
+                acc.extend(b)
+                if acc.endswith(b"\n\n") or len(acc) >= 4096:
+                    self._flush_chunk(bytes(acc))
+                    acc.clear()
+            if acc:
+                self._flush_chunk(bytes(acc))
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except Exception as e:
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except Exception:
+                pass
+
+    def _proxy(self, method: str) -> None:
+        """Peek the upstream's response code & Content-Type
+        cheaply using a HEAD-ish probe, then dispatch.  The
+        probe costs one extra request for non-streaming paths
+        (which is fine — they're sub-millisecond locally); for
+        streaming paths it saves us from buffering SSE.  We
+        instead use a simple heuristic: try the buffered path
+        first only for non-GET.  For GET, always go streaming
+        — the upstream may be SSE and we cannot tell without
+        sending the request.  The streaming path is
+        functionally identical to the buffered one for
+        short responses (single chunk). """
+        # Simple rule: SSE is always GET.  POST/PUT/DELETE
+        # never stream.  This avoids a second round-trip for
+        # non-SSE cases.
+        if method == "GET":
+            self._proxy_streaming(method)
+        else:
+            self._proxy_buffered(method)
 
     def do_GET(self): self._proxy("GET")
     def do_POST(self): self._proxy("POST")

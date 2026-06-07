@@ -26,6 +26,7 @@ __pycache__/
 # Internal design docs — not for public release
 docs/
 experience.md
+AGENTS.md
 
 # Server / test log artifacts
 server_log*.txt
