@@ -5,10 +5,12 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <regex>
 #include <set>
 #include <string>
 #include <string_view>
+
+#include "qasr/base/utf8.h"
+#include "qasr/runtime/model_bridge_internal.h"
 
 #ifdef QASR_CPU_BACKEND_ENABLED
 extern "C" {
@@ -23,28 +25,66 @@ namespace {
 
 namespace fs = std::filesystem;
 
-std::set<std::string> ExtractIndexedSafetensors(const std::string & json_text) {
-    const std::regex pattern(R"(model-[^"]+\.safetensors)");
+// Hand-written scan of the safetensors index file: pick out every
+// substring that looks like a shard name (`model-…` followed by
+// `.safetensors`).
+//
+// This is a structural replacement for the previous std::regex-based
+// implementation.  It produces the same set of matches as the regex
+// `model-[^"]+\.safetensors` and additionally:
+//
+//   * never instantiates a std::regex (which on libstdc++ is a
+//     non-trivial cost — hundreds of KiB of generated state);
+//   * runs in O(n) over the input with a simple two-pointer scan
+//     rather than backtracking;
+//   * does not require C++ locale or wide-character facets to be
+//     initialised;
+//   * has no per-iteration allocation (matches land directly in the
+//     std::set<string> via std::string).
+static std::set<std::string> ExtractIndexedSafetensorsImpl(const std::string & json_text) {
+    constexpr std::string_view kPrefix = "model-";
+    constexpr std::string_view kSuffix = ".safetensors";
     std::set<std::string> files;
-    for (std::sregex_iterator it(json_text.begin(), json_text.end(), pattern), end; it != end; ++it) {
-        files.insert(it->str());
+    const std::string_view text(json_text);
+    std::size_t pos = 0;
+    while (pos <= text.size()) {
+        const std::size_t start = text.find(kPrefix, pos);
+        if (start == std::string_view::npos) {
+            break;
+        }
+        // Find the next unescaped double-quote after the prefix; that
+        // is the end of the surrounding JSON string.  The original
+        // regex's `[^"]+` body is exactly "any run of non-quote
+        // bytes", and an unescaped closing `"` always terminates a
+        // JSON string value.
+        const std::size_t body_start = start + kPrefix.size();
+        const std::size_t end = text.find('"', body_start);
+        if (end == std::string_view::npos) {
+            break;
+        }
+        const std::string_view candidate = text.substr(start, end - start);
+        if (candidate.size() > kPrefix.size() + kSuffix.size() &&
+            candidate.substr(candidate.size() - kSuffix.size()) == kSuffix) {
+            files.emplace(candidate);
+        }
+        pos = end + 1;
     }
     return files;
 }
 
-bool IsUtf8Continuation(unsigned char byte) noexcept {
-    return (byte & 0xC0U) == 0x80U;
+}  // namespace
+
+std::set<std::string> ExtractIndexedSafetensors(const std::string & json_text) {
+    return ExtractIndexedSafetensorsImpl(json_text);
 }
 
-std::size_t CountUtf8Codepoints(std::string_view text) noexcept {
-    std::size_t count = 0;
-    for (const char ch : text) {
-        if (!IsUtf8Continuation(static_cast<unsigned char>(ch))) {
-            ++count;
-        }
-    }
-    return count;
-}
+namespace {
+
+// Local alias: the shared implementation lives in `qasr::base`.  Using a
+// local alias keeps the call sites (CountUtf8Codepoints / IsUtf8Continuation)
+// below readable without changing their behaviour.
+using qasr::base::CountUtf8Codepoints;
+using qasr::base::IsUtf8Continuation;
 
 bool EndsWith(std::string_view text, std::string_view suffix) noexcept {
     return text.size() >= suffix.size() && text.substr(text.size() - suffix.size()) == suffix;
@@ -298,15 +338,14 @@ AsrRunResult RunAsr(const AsrRunOptions & options) {
         return result;
     }
 
-    if (options.decoder_int8) {
-        if (qwen_set_decoder_int8(ctx, 1) != 0) {
-            std::fprintf(stderr, "warning: decoder INT8 init failed, falling back to BF16\n");
-        }
-    }
-
     if (options.encoder_int8) {
-        if (qwen_set_encoder_int8(ctx, 1) != 0) {
-            std::fprintf(stderr, "warning: encoder INT8 init failed, falling back to F32\n");
+        /* encoder INT8 temporarily disabled (post-C8):
+         * see docs/INCIDENTS.md 2026-06-05 entry. */
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr,
+                "warning: --encoder-int8 temporarily disabled, ignoring\n");
+            warned = true;
         }
     }
 
@@ -394,14 +433,14 @@ AsrRunResult RunAsrSegmented(const AsrRunOptions & options) {
         return result;
     }
 
-    if (options.decoder_int8) {
-        if (qwen_set_decoder_int8(ctx, 1) != 0) {
-            std::fprintf(stderr, "warning: decoder INT8 init failed, falling back to BF16\n");
-        }
-    }
     if (options.encoder_int8) {
-        if (qwen_set_encoder_int8(ctx, 1) != 0) {
-            std::fprintf(stderr, "warning: encoder INT8 init failed, falling back to F32\n");
+        /* encoder INT8 temporarily disabled (post-C8):
+         * see docs/INCIDENTS.md 2026-06-05 entry. */
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr,
+                "warning: --encoder-int8 temporarily disabled, ignoring\n");
+            warned = true;
         }
     }
 
@@ -511,13 +550,15 @@ AsrRunResult RunAsrSegmentedStreaming(const AsrRunOptions & options,
         return result;
     }
 
-    if (options.decoder_int8) {
-        if (qwen_set_decoder_int8(ctx, 1) != 0)
-            std::fprintf(stderr, "warning: decoder INT8 init failed, falling back to BF16\n");
-    }
     if (options.encoder_int8) {
-        if (qwen_set_encoder_int8(ctx, 1) != 0)
-            std::fprintf(stderr, "warning: encoder INT8 init failed, falling back to F32\n");
+        /* encoder INT8 temporarily disabled (post-C8):
+         * see docs/INCIDENTS.md 2026-06-05 entry. */
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr,
+                "warning: --encoder-int8 temporarily disabled, ignoring\n");
+            warned = true;
+        }
     }
 
     ctx->stream_max_new_tokens = static_cast<int>(options.stream_max_new_tokens);

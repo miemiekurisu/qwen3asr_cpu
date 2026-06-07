@@ -1,7 +1,8 @@
 #include "qasr/model/tokenizer.h"
 
+#include <cctype>
+#include <cstdlib>
 #include <fstream>
-#include <regex>
 #include <sstream>
 #include <unordered_map>
 
@@ -87,37 +88,101 @@ Status LoadVocabJson(const std::string & path, std::vector<std::string> * id_to_
     const std::string json_text((std::istreambuf_iterator<char>(input)),
                                  std::istreambuf_iterator<char>());
 
-    // Find max id to size the vector
-    std::regex entry_pattern(R"("([^"\\]|\\.)*"\s*:\s*(\d+))");
+    // Hand-written scan for `"<token>":<id>` entries.  Replaces the
+    // previous std::regex-based implementation.  Walks the input in
+    // O(n) time with a single pass; no regex state machine.
+    //
+    // Escape handling: a `"` is considered escaped if it is preceded
+    // by an odd number of backslashes.  This matches JSON's own
+    // backslash-escape rule and is more careful than the original
+    // implementation, which only checked the single preceding
+    // character.
+    auto is_digit = [](unsigned char c) { return std::isdigit(c) != 0; };
+
     std::int32_t max_id = -1;
     std::vector<std::pair<std::string, std::int32_t>> entries;
 
-    for (std::sregex_iterator it(json_text.begin(), json_text.end(), entry_pattern), end;
-         it != end; ++it) {
-        const std::string token_raw = (*it)[0].str();
-        // Extract the token string: everything between the first pair of quotes
-        const auto first_quote = token_raw.find('"');
-        auto second_quote = token_raw.find('"', first_quote + 1);
-        // Handle escaped quotes
-        while (second_quote != std::string::npos && second_quote > 0 &&
-               token_raw[second_quote - 1] == '\\') {
-            second_quote = token_raw.find('"', second_quote + 1);
-        }
-        if (first_quote == std::string::npos || second_quote == std::string::npos) continue;
-        const std::string token_str = token_raw.substr(first_quote + 1, second_quote - first_quote - 1);
+    std::size_t pos = 0;
+    while (pos < json_text.size()) {
+        // Find the next opening quote.
+        const std::size_t open = json_text.find('"', pos);
+        if (open == std::string::npos) break;
 
-        // Extract the id
-        const auto colon_pos = token_raw.find(':', second_quote);
-        if (colon_pos == std::string::npos) continue;
-        const std::string id_str = token_raw.substr(colon_pos + 1);
-        std::int32_t id = 0;
-        try {
-            id = static_cast<std::int32_t>(std::stol(id_str));
-        } catch (...) {
+        // Read characters until we hit the matching closing quote.
+        // Track backslash runs to detect escaped quotes.
+        std::size_t close = std::string::npos;
+        std::size_t i = open + 1;
+        std::size_t backslash_run = 0;
+        while (i < json_text.size()) {
+            const char c = json_text[i];
+            if (c == '\\') {
+                ++backslash_run;
+                ++i;
+                continue;
+            }
+            if (c == '"') {
+                if ((backslash_run & 1U) == 0U) {
+                    close = i;
+                    break;
+                }
+                // Escaped quote — consume the backslash and the quote
+                // as part of the token body.
+                backslash_run = 0;
+                ++i;
+                continue;
+            }
+            backslash_run = 0;
+            ++i;
+        }
+        if (close == std::string::npos) break;
+
+        const std::string token_str = json_text.substr(open + 1, close - open - 1);
+        std::size_t j = close + 1;
+
+        // Skip optional whitespace before ':'.
+        while (j < json_text.size() &&
+               std::isspace(static_cast<unsigned char>(json_text[j]))) {
+            ++j;
+        }
+        if (j >= json_text.size() || json_text[j] != ':') {
+            pos = j + 1;
             continue;
         }
-        entries.emplace_back(token_str, id);
-        if (id > max_id) max_id = id;
+        ++j;
+
+        // Skip optional whitespace before the id.
+        while (j < json_text.size() &&
+               std::isspace(static_cast<unsigned char>(json_text[j]))) {
+            ++j;
+        }
+        if (j >= json_text.size() || !is_digit(static_cast<unsigned char>(json_text[j]))) {
+            pos = j + 1;
+            continue;
+        }
+        // Parse the id (decimal non-negative integer).
+        std::int64_t id = 0;
+        while (j < json_text.size() &&
+               is_digit(static_cast<unsigned char>(json_text[j]))) {
+            id = id * 10 + (json_text[j] - '0');
+            if (id > 0x7FFFFFFFLL) {
+                // Overflow int32_t — skip the entry.
+                while (j < json_text.size() &&
+                       is_digit(static_cast<unsigned char>(json_text[j]))) {
+                    ++j;
+                }
+                id = -1;
+                break;
+            }
+            ++j;
+        }
+        if (id < 0) {
+            pos = j + 1;
+            continue;
+        }
+
+        entries.emplace_back(token_str, static_cast<std::int32_t>(id));
+        if (id > max_id) max_id = static_cast<std::int32_t>(id);
+        pos = j + 1;
     }
 
     if (max_id < 0) {

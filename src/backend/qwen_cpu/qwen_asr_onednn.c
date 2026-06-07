@@ -509,126 +509,6 @@ int qwen_int8_matvec(qwen_onednn_matmul_t *handle,
 }
 
 /* ========================================================================
- * Decoder INT8 Preparation
- * ======================================================================== */
-
-static void free_int8_dec_layer(qwen_int8_dec_layer_t *il) {
-    if (!il) return;
-    qwen_onednn_matmul_free(il->mm_wq);
-    qwen_onednn_matmul_free(il->mm_wk);
-    qwen_onednn_matmul_free(il->mm_wv);
-    qwen_onednn_matmul_free(il->mm_wo);
-    qwen_onednn_matmul_free(il->mm_gate_up);
-    qwen_onednn_matmul_free(il->mm_down);
-    qwen_int8_weight_free(&il->wq_int8);
-    qwen_int8_weight_free(&il->wk_int8);
-    qwen_int8_weight_free(&il->wv_int8);
-    qwen_int8_weight_free(&il->wo_int8);
-    qwen_int8_weight_free(&il->gate_up_int8);
-    qwen_int8_weight_free(&il->down_int8);
-    memset(il, 0, sizeof(*il));
-}
-
-int qwen_decoder_prepare_int8(void *ctx_ptr) {
-    qwen_ctx_t *ctx = (qwen_ctx_t *)ctx_ptr;
-    if (!ctx) return -1;
-
-    const qwen_config_t *cfg = &ctx->config;
-    const int q_dim  = cfg->dec_heads * cfg->dec_head_dim;
-    const int kv_dim = cfg->dec_kv_heads * cfg->dec_head_dim;
-    const int intermediate = cfg->dec_intermediate;
-    const int hidden = cfg->dec_hidden;
-
-    if (qwen_onednn_init() != 0) {
-        if (qwen_verbose >= 1)
-            fprintf(stderr, "decoder: INT8 preparation skipped (oneDNN init failed)\n");
-        return -1;
-    }
-
-    double start_ms = qwen_perf_now_ms();
-
-    /* Allocate int8 layer array */
-    if (ctx->int8_dec_layers) {
-        qwen_decoder_free_int8(ctx);
-    }
-    ctx->int8_dec_layers = calloc((size_t)cfg->dec_layers, sizeof(qwen_int8_dec_layer_t));
-    if (!ctx->int8_dec_layers) return -1;
-    ctx->n_int8_dec_layers = cfg->dec_layers;
-
-    size_t total_int8_bytes = 0;
-
-    for (int i = 0; i < cfg->dec_layers; i++) {
-        qwen_dec_layer_t *l = &ctx->decoder.layers[i];
-        qwen_int8_dec_layer_t *il = &((qwen_int8_dec_layer_t *)ctx->int8_dec_layers)[i];
-
-        /* Quantize all projections */
-        if (qwen_int8_quantize_bf16(&il->wq_int8, l->wq_weight_bf16,
-                                    (size_t)q_dim, (size_t)hidden) != 0) goto fail;
-        if (qwen_int8_quantize_bf16(&il->wk_int8, l->wk_weight_bf16,
-                                    (size_t)kv_dim, (size_t)hidden) != 0) goto fail;
-        if (qwen_int8_quantize_bf16(&il->wv_int8, l->wv_weight_bf16,
-                                    (size_t)kv_dim, (size_t)hidden) != 0) goto fail;
-        if (qwen_int8_quantize_bf16(&il->wo_int8, l->wo_weight_bf16,
-                                    (size_t)hidden, (size_t)q_dim) != 0) goto fail;
-        if (qwen_int8_quantize_bf16(&il->gate_up_int8, l->gate_up_fused_bf16,
-                                    (size_t)(2 * intermediate), (size_t)hidden) != 0) goto fail;
-        if (qwen_int8_quantize_bf16(&il->down_int8, l->down_weight_bf16,
-                                    (size_t)hidden, (size_t)intermediate) != 0) goto fail;
-
-        /* Create oneDNN primitives */
-        il->mm_wq = qwen_onednn_matmul_create(&il->wq_int8);
-        il->mm_wk = qwen_onednn_matmul_create(&il->wk_int8);
-        il->mm_wv = qwen_onednn_matmul_create(&il->wv_int8);
-        il->mm_wo = qwen_onednn_matmul_create(&il->wo_int8);
-        il->mm_gate_up = qwen_onednn_matmul_create(&il->gate_up_int8);
-        il->mm_down = qwen_onednn_matmul_create(&il->down_int8);
-
-        if (!il->mm_wq || !il->mm_wk || !il->mm_wv ||
-            !il->mm_wo || !il->mm_gate_up || !il->mm_down) {
-            if (qwen_verbose >= 1)
-                fprintf(stderr, "decoder: INT8 oneDNN primitive creation failed at layer %d\n", i);
-            goto fail;
-        }
-
-        total_int8_bytes += il->wq_int8.data_bytes + il->wk_int8.data_bytes +
-                            il->wv_int8.data_bytes + il->wo_int8.data_bytes +
-                            il->gate_up_int8.data_bytes + il->down_int8.data_bytes;
-
-        if (qwen_verbose >= 2) {
-            fprintf(stderr, "decoder: INT8 layer %d prepared\n", i);
-        }
-    }
-
-    double elapsed = qwen_perf_now_ms() - start_ms;
-    if (qwen_verbose >= 1) {
-        fprintf(stderr,
-                "decoder: INT8 prepared layers=%d int8_bytes=%.1f MB ms=%.1f\n",
-                cfg->dec_layers,
-                (double)total_int8_bytes / (1024.0 * 1024.0),
-                elapsed);
-    }
-
-    return 0;
-
-fail:
-    qwen_decoder_free_int8(ctx);
-    return -1;
-}
-
-void qwen_decoder_free_int8(void *ctx_ptr) {
-    qwen_ctx_t *ctx = (qwen_ctx_t *)ctx_ptr;
-    if (!ctx || !ctx->int8_dec_layers) return;
-
-    qwen_int8_dec_layer_t *layers = (qwen_int8_dec_layer_t *)ctx->int8_dec_layers;
-    for (int i = 0; i < ctx->n_int8_dec_layers; i++) {
-        free_int8_dec_layer(&layers[i]);
-    }
-    free(layers);
-    ctx->int8_dec_layers = NULL;
-    ctx->n_int8_dec_layers = 0;
-}
-
-/* ========================================================================
  * Encoder INT8 Preparation
  * ======================================================================== */
 
@@ -762,15 +642,6 @@ int qwen_int8_matvec(qwen_onednn_matmul_t *h, const float *x, int s, float *y) {
     (void)h; (void)x; (void)s; (void)y; return -1;
 }
 
-int qwen_decoder_prepare_int8(void *ctx) {
-    (void)ctx;
-    if (qwen_verbose >= 1)
-        fprintf(stderr, "decoder: INT8 not available (compiled without oneDNN)\n");
-    return -1;
-}
-
-void qwen_decoder_free_int8(void *ctx) { (void)ctx; }
-
 int qwen_encoder_prepare_int8(void *ctx) {
     (void)ctx;
     if (qwen_verbose >= 1)
@@ -778,6 +649,17 @@ int qwen_encoder_prepare_int8(void *ctx) {
     return -1;
 }
 
-void qwen_encoder_free_int8(void *ctx) { (void)ctx; }
+void qwen_encoder_free_int8(void *ctx_ptr) {
+    /* Mirror pattern: even without oneDNN, qwen_free() walks this
+     * unconditionally.  Plain free() of the calloc'd array is safe
+     * because inner pointers are zero. */
+    qwen_ctx_t *ctx = (qwen_ctx_t *)ctx_ptr;
+    if (!ctx) return;
+    if (ctx->int8_enc_layers) {
+        free(ctx->int8_enc_layers);
+        ctx->int8_enc_layers = NULL;
+    }
+    ctx->n_int8_enc_layers = 0;
+}
 
 #endif /* USE_ONEDNN */

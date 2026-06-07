@@ -106,6 +106,43 @@ h2 {
   box-shadow: var(--shadow);
 }
 
+/* Realtime panel: pin to the bottom-right of the viewport so
+ * the live transcript is ALWAYS visible.  This addresses the
+ * "识别区不显示" complaint — on a 720 px viewport, the
+ * original layout pushed the result area to y=735, off-screen.
+ * Fixed positioning takes the panel out of normal flow so its
+ * size depends only on viewport units, not the height of the
+ * rest of the page.  Width/height are explicit so flex inside
+ * works.  z-index above other panels so it draws on top if
+ * anything overlaps. */
+.panel.realtime {
+  position: fixed;
+  right: max(16px, calc((100vw - 1120px) / 2 + 16px));
+  bottom: 16px;
+  width: 380px;
+  max-height: 70vh;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+}
+.panel.realtime > .stack {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
+  gap: 10px;
+}
+/* On narrow screens (<720 px) the fixed panel would dominate.
+ * Fall back to flow layout so the offline panel isn't squashed. */
+@media (max-width: 720px) {
+  .panel.realtime {
+    position: static;
+    width: auto;
+    max-height: none;
+    margin-top: 18px;
+  }
+}
+
 .panel-head {
   margin-bottom: 18px;
 }
@@ -210,10 +247,130 @@ select {
   color: #93c5fd;
   text-decoration: underline dotted rgba(147, 197, 253, 0.6);
   text-underline-offset: 4px;
+  opacity: 0.72;
+  transition: opacity 120ms ease-out;
+}
+
+.output .partial.fading {
+  opacity: 0.32;
+}
+
+.output .partial::after {
+  content: "";
+  display: inline-block;
+  width: 0.4em;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -2px;
+  background: currentColor;
+  opacity: 0.45;
+  animation: liveCursor 1.0s steps(2, end) infinite;
+}
+
+@keyframes liveCursor {
+  0%, 49% { opacity: 0.45; }
+  50%, 100% { opacity: 0; }
 }
 
 .output .final {
   color: #fde68a;
+}
+
+/* ──────────────── Terminal waterfall ────────────────
+ * Each committed segment is a <div class="term-line done">.
+ * The "in progress" line is <div class="term-line typing">.
+ * The empty line waiting for the next segment is
+ * <div class="term-line cursor">.  All lines accumulate top-
+ * to-bottom; the user can scroll up to see history.
+ *
+ * Visibility contract: on a 720 px viewport the result area
+ * must be fully visible WITHOUT scrolling.  Previously the
+ * box was at y=735 (below the 720 px fold) because the hero
+ * + grid panels + button rows + status hint + 320px min
+ * result pushed it past the viewport.  Users concluded
+ * "识别区不显示" — the area existed, just scrolled off.
+ *
+ * Fix: position the realtime panel itself fixed to the
+ * bottom-right of the viewport, with explicit height
+ * computed from viewport.  This way the user always sees
+ * the live transcript even if the page itself is taller
+ * than the viewport (e.g. when the offline panel is
+ * expanded with upload results).  We pin to bottom-right
+ * (instead of top-right) because that's where users expect
+ * the "current state" — like a chat transcript. */
+.output.terminal {
+  height: 36vh;
+  min-height: 180px;
+  max-height: 480px;
+  overflow-y: auto;
+  font-size: 15px;
+  line-height: 1.7;
+}
+
+.term-line {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  min-height: 1.7em;
+}
+
+.term-line.done {
+  color: #e2e8f0;
+}
+
+.term-line.typing {
+  color: #fde68a;
+}
+
+.term-line.cursor {
+  color: #94a3b8;
+}
+
+.term-line .cursor-blink {
+  display: inline-block;
+  width: 0.55em;
+  height: 1em;
+  margin-left: 1px;
+  vertical-align: -2px;
+  background: currentColor;
+  opacity: 0.85;
+  animation: termBlink 1.05s steps(2, end) infinite;
+}
+
+.term-line.cursor.empty .cursor-blink {
+  margin-left: 0;
+}
+
+/* Empty-state placeholder.  Shown only when the terminal has no
+ * committed `done` lines and the cursor line is empty.  The
+ * placeholder explains the area so the user knows this is the live
+ * transcript output (otherwise the 8x15 px blinking cursor on a
+ * 320 px dark box looks like "nothing's here").  The placeholder
+ * hides as soon as any text is committed.  We use ::before on the
+ * last line rather than a sibling div so it composes naturally
+ * with the existing layout — no extra DOM, no JS hooks to remove. */
+.term-line.cursor.empty::before {
+  content: "🎤 等待语音输入…  说出第一句后这里会显示转写结果";
+  color: #64748b;
+  font-style: italic;
+  font-size: 14px;
+  margin-right: 6px;
+  /* Keep the cursor blink visible at the end so the terminal
+   * still feels alive.  The placeholder text + the cursor form
+   * one cohesive "ready" line. */
+}
+/* When the terminal has any `done` lines below, the user clearly
+ * sees this is the transcript area, so drop the placeholder to
+ * avoid clutter.  `.has-done` is added by JS when the first
+ * segment is committed. */
+.term-line.cursor.empty.has-done::before {
+  content: "（继续说话）";
+  color: #475569;
+}
+
+@keyframes termBlink {
+  0%, 49% { opacity: 0.9; }
+  50%, 100% { opacity: 0; }
 }
 
 .transcript-archive {

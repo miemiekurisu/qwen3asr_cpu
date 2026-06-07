@@ -8,11 +8,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <vector>
 
-#ifdef _WIN32
-#define popen _popen
-#define pclose _pclose
-#endif
+#include "qasr/audio/audio_convert_internal.h"
+#include "qasr/base/process_spawn.h"
 
 namespace qasr {
 namespace {
@@ -34,13 +33,26 @@ bool IsWavFile(const std::string & path) noexcept {
     return ext == ".wav" || ext == ".wave";
 }
 
+std::vector<std::string> BuildFfmpegArgv(const std::string & input_path,
+                                         const std::string & output_wav_path) {
+    return {
+        "ffmpeg",
+        "-y",
+        "-loglevel", "error",
+        "-i", input_path,
+        "-ar", "16000",
+        "-ac", "1",
+        "-c:a", "pcm_s16le",
+        output_wav_path,
+    };
+}
+
 bool FfmpegAvailable() noexcept {
-#ifdef _WIN32
-    const int rc = std::system("where ffmpeg >nul 2>&1");
-#else
-    const int rc = std::system("which ffmpeg >/dev/null 2>&1");
-#endif
-    return rc == 0;
+    // Probe by running `ffmpeg -version`.  Because we use spawnvp /
+    // posix_spawnp (no shell), this cannot accidentally invoke a
+    // different `ffmpeg` if the PATH contains a path with shell
+    // metacharacters — the search uses execvp's path semantics.
+    return SpawnAndWait({"ffmpeg", "-version"}) == 0;
 }
 
 Status ConvertToWav(const std::string & input_path,
@@ -58,18 +70,14 @@ Status ConvertToWav(const std::string & input_path,
         return Status(StatusCode::kFailedPrecondition, "ffmpeg not found in PATH");
     }
 
-    // Build ffmpeg command: convert to 16kHz mono s16le WAV
-    // -y: overwrite output, -loglevel error: suppress info
-    std::string cmd = "ffmpeg -y -loglevel error -i \"" + input_path +
-                      "\" -ar 16000 -ac 1 -c:a pcm_s16le \"" + output_wav_path + "\"";
+    // Build the ffmpeg argument vector.  Note: this is *not* a shell
+    // command.  Each element is a separate argv entry passed directly
+    // to the spawned process.  Paths that contain shell
+    // metacharacters (';', '|', '$', '`', etc.) are preserved
+    // verbatim and cannot be interpreted as commands.
+    const std::vector<std::string> args = BuildFfmpegArgv(input_path, output_wav_path);
 
-#ifdef _WIN32
-    cmd += " 2>nul";
-#else
-    cmd += " 2>/dev/null";
-#endif
-
-    const int rc = std::system(cmd.c_str());
+    const int rc = SpawnAndWait(args);
     if (rc != 0) {
         return Status(StatusCode::kInternal,
                       "ffmpeg conversion failed (exit " + std::to_string(rc) + ")");

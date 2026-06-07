@@ -1019,6 +1019,7 @@ QASR_TEST(QwenArgmaxMatvecBf16MatchesReference) {
         }
     }
 
-    const int actual = qwen_argmax_matvec_bf16(x.data(), weights_bf16.data(), in_dim, out_dim);
+    const int actual = qwen_argmax_matvec_bf16(x.data(), weights_bf16.data(), in_dim, out_dim,
+                                               nullptr, 0.0f);
     QASR_EXPECT_EQ(actual, expected);
 }

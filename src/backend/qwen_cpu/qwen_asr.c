@@ -12,6 +12,8 @@
 #include "qwen_asr_audio.h"
 #include "qwen_asr_tokenizer.h"
 #include "qwen_asr_stream.h"
+#include "qwen_asr_alloc.h"
+#include "qwen_silero_vad.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,6 +70,13 @@ void qwen_set_cancel_callback(qwen_ctx_t *ctx, qwen_cancel_cb cb, void *userdata
 void qwen_set_segment_callback(qwen_ctx_t *ctx, qwen_segment_cb cb, void *userdata) {
     ctx->segment_cb = cb;
     ctx->segment_cb_userdata = userdata;
+}
+
+void qwen_set_chunk_callback(qwen_ctx_t *ctx,
+                             qwen_stream_chunk_cb_t cb, void *userdata) {
+    if (!ctx) return;
+    ctx->chunk_cb = cb;
+    ctx->chunk_cb_userdata = userdata;
 }
 
 int qwen_was_cancelled(const qwen_ctx_t *ctx) {
@@ -349,9 +358,23 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
                                             * stream_idle_flush_min_sec of audio is
                                             * already buffered, decode the partial tail
                                             * instead of blocking until 2 s arrives. */
-    ctx->stream_idle_flush_min_sec = 0.5f;
+    ctx->stream_idle_flush_min_sec = 0.2f;
+    ctx->stream_idle_flush_max_new_tokens = 16;
     ctx->past_text_conditioning = 0;
     ctx->skip_silence = 0;
+
+    /* Optional Silero VAD.  Activated when the model file is found
+     * (env QWEN_SILERO_VAD_MODEL or next to the Qwen model dir).
+     * If ONNX runtime wasn't compiled in, or the model isn't
+     * present, the wrapper is a no-op stub and legacy timeout-based
+     * detection is used.  The streaming loop checks
+     * qwen_silero_vad_is_active() before invoking. */
+    ctx->vad = qwen_silero_vad_create(NULL);
+    if (ctx->vad && qwen_silero_vad_is_active(ctx->vad)) {
+        qwen_silero_vad_reset(ctx->vad);
+    }
+    ctx->vad_silence_run = 0;
+    ctx->vad_last_prob = -1.0f;
 
     if (qwen_verbose >= 1) fprintf(stderr, "Model loaded.\n");
     return ctx;
@@ -380,17 +403,13 @@ qwen_ctx_t *qwen_clone_shared(const qwen_ctx_t *src) {
     ctx->stream_max_new_tokens = src->stream_max_new_tokens;
     ctx->stream_idle_flush_ms = src->stream_idle_flush_ms;
     ctx->stream_idle_flush_min_sec = src->stream_idle_flush_min_sec;
+    ctx->stream_idle_flush_max_new_tokens = src->stream_idle_flush_max_new_tokens;
     ctx->past_text_conditioning = src->past_text_conditioning;
     ctx->skip_silence = src->skip_silence;
 
     /* Cloned contexts do not own INT8 resources (they are per-context).
-     * The clone starts on the BF16 path; call qwen_set_decoder_int8() if needed. */
-    ctx->decoder_int8 = 0;
-    ctx->int8_dec_layers = NULL;
-    ctx->n_int8_dec_layers = 0;
-
-    /* Encoder INT8: clone does not share (handles have mutable per-call state).
-     * Call qwen_set_encoder_int8() on the clone if needed. */
+     * Encoder INT8 clone does not share (handles have mutable per-call
+     * state).  Call qwen_set_encoder_int8() on the clone if needed. */
     ctx->encoder_int8 = 0;
     ctx->int8_enc_layers = NULL;
     ctx->n_int8_enc_layers = 0;
@@ -422,6 +441,14 @@ qwen_ctx_t *qwen_clone_shared(const qwen_ctx_t *src) {
     ctx->cancel_cb = NULL;
     ctx->cancel_cb_userdata = NULL;
     ctx->last_run_cancelled = 0;
+    /* Per-chunk callback and its scratch buffers: keep the callback registered
+     * across runs (the server reuses a single ctx for many sessions), but
+     * reset the scratch buffers so a stale pointer from a previous chunk
+     * never escapes. */
+    ctx->chunk_stable_buf = NULL;
+    ctx->chunk_stable_cap = 0;
+    ctx->chunk_tentative_buf = NULL;
+    ctx->chunk_tentative_cap = 0;
     ctx->prompt = NULL;
     ctx->force_language = NULL;
     ctx->prompt_tokens = NULL;
@@ -535,12 +562,19 @@ void qwen_free(qwen_ctx_t *ctx) {
             FREE0(l->prefill_gate_up_prepared.f32_data);
         }
         FREE0(ctx->decoder.norm);
+
+        /* Argmax early-termination tables.  qwen_clone_shared() does a
+         * shallow struct copy of decoder into the clone, so the pointer
+         * is shared with the source ctx.  Only the owner (the original
+         * ctx loaded from disk) should free these — otherwise the second
+         * clone's free double-frees the chunk the first clone already
+         * released, and the source ctx's pointer is left dangling.  See
+         * docs/INCIDENTS.md ("150s double free crash"). */
+        FREE0(ctx->decoder.tok_embed_suffix_max);
+        FREE0(ctx->decoder.lm_head_suffix_max);
     }
 
     #undef FREE0
-
-    /* INT8 decoder resources (oneDNN) */
-    qwen_decoder_free_int8(ctx);
 
     /* INT8 encoder resources (oneDNN) */
     qwen_encoder_free_int8(ctx);
@@ -574,40 +608,25 @@ void qwen_free(qwen_ctx_t *ctx) {
     free(ctx->prompt_tokens);
     free(ctx->force_prompt_tokens);
 
+    /* Per-chunk callback scratch buffers (only allocated if a callback was set) */
+    free(ctx->chunk_stable_buf);
+    free(ctx->chunk_tentative_buf);
+
     /* Close safetensors */
     if (ctx->owns_model_data && ctx->safetensors) {
         multi_safetensors_close((multi_safetensors_t *)ctx->safetensors);
     }
 
+    /* Silero VAD wrapper (NULL-safe). */
+    qwen_silero_vad_destroy(ctx->vad);
+    ctx->vad = NULL;
+
     free(ctx);
 }
 
 /* ========================================================================
- * INT8 Decoder Acceleration
+ * INT8 Encoder Acceleration
  * ======================================================================== */
-
-int qwen_set_decoder_int8(qwen_ctx_t *ctx, int enable) {
-    if (!ctx) return -1;
-
-    if (enable) {
-        if (ctx->int8_dec_layers) {
-            /* Already prepared */
-            ctx->decoder_int8 = 1;
-            return 0;
-        }
-        int rc = qwen_decoder_prepare_int8(ctx);
-        if (rc != 0) {
-            ctx->decoder_int8 = 0;
-            return -1;
-        }
-        ctx->decoder_int8 = 1;
-        return 0;
-    } else {
-        qwen_decoder_free_int8(ctx);
-        ctx->decoder_int8 = 0;
-        return 0;
-    }
-}
 
 int qwen_set_encoder_int8(qwen_ctx_t *ctx, int enable) {
     if (!ctx) return -1;
@@ -1432,29 +1451,6 @@ static int should_insert_boundary_space(int prev_ch, int next_ch) {
     return 1;
 }
 
-typedef struct {
-    qwen_token_cb downstream_cb;
-    void *downstream_userdata;
-    int maybe_prepend_space;
-    int saw_first_piece;
-} segment_emit_state_t;
-
-static void segment_emit_cb(const char *piece, void *userdata) {
-    segment_emit_state_t *st = (segment_emit_state_t *)userdata;
-    if (!st || !st->downstream_cb || !piece) return;
-
-    if (!st->saw_first_piece) {
-        st->saw_first_piece = 1;
-        if (st->maybe_prepend_space) {
-            unsigned char c0 = (unsigned char)piece[0];
-            if (c0 != '\0' && !isspace(c0) && !ispunct(c0)) {
-                st->downstream_cb(" ", st->downstream_userdata);
-            }
-        }
-    }
-    st->downstream_cb(piece, st->downstream_userdata);
-}
-
 char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples) {
     ctx->last_run_cancelled = 0;
     ctx->perf_total_ms = 0;
@@ -2034,26 +2030,6 @@ typedef struct {
     float *enc_output; /* [seq_len, dec_hidden] */
 } stream_enc_window_t;
 
-static void stream_clear_enc_cache(stream_enc_window_t *enc_cache,
-                                   int *n_enc_cache,
-                                   int *enc_cache_start,
-                                   int *enc_cached_seq_total,
-                                   int64_t *next_window_start,
-                                   int64_t new_start_sample) {
-    if (!enc_cache || !n_enc_cache || !enc_cache_start ||
-        !enc_cached_seq_total || !next_window_start) {
-        return;
-    }
-    for (int i = *enc_cache_start; i < *n_enc_cache; i++) {
-        free(enc_cache[i].enc_output);
-        enc_cache[i].enc_output = NULL;
-    }
-    *n_enc_cache = 0;
-    *enc_cache_start = 0;
-    *enc_cached_seq_total = 0;
-    *next_window_start = new_start_sample;
-}
-
 /* Re-anchor stream text state to a short committed tail so decoding can
  * continue after a hard reset without replaying the full text history. */
 static int stream_reanchor_text_state(qwen_ctx_t *ctx,
@@ -2345,36 +2321,6 @@ static void stream_bg_encoder_invalidate(stream_bg_encoder_t *bg) {
     BG_UNLOCK(bg);
 }
 
-/* Blocking collect: wait for any in-flight encoding to finish, then
- * check if the result matches the expected window.  This ensures the
- * background encoder is idle before the caller proceeds with its own
- * encoder/BLAS work, avoiding concurrent OpenBLAS contention. */
-static int stream_bg_encoder_wait_collect(stream_bg_encoder_t *bg,
-                                          int64_t expected_start,
-                                          int expected_n_samples,
-                                          float **out_enc, int *out_seq_len) {
-    if (!bg) return 0;
-    *out_enc = NULL;
-    *out_seq_len = 0;
-
-    BG_LOCK(bg);
-    while ((bg->has_work || bg->is_busy) && !bg->stop)
-        BG_WAIT(bg);
-
-    if (bg->has_result &&
-        bg->result_start_sample == expected_start &&
-        bg->result_n_samples == expected_n_samples) {
-        *out_enc = bg->result_enc;
-        *out_seq_len = bg->result_seq_len;
-        bg->result_enc = NULL;
-        bg->has_result = 0;
-        BG_UNLOCK(bg);
-        return 1;
-    }
-    BG_UNLOCK(bg);
-    return 0;
-}
-
 /* Wait for the background encoder to become idle (not busy, no pending work).
  * Does not consume the result — call collect() afterwards.
  * Used at the start of the encoding phase to ensure no concurrent
@@ -2413,7 +2359,7 @@ static void stream_bg_encoder_wait_idle(stream_bg_encoder_t *bg) {
 /* Internal streaming implementation. When live!=NULL, audio is read
  * incrementally from the live buffer; when NULL, samples/n_samples
  * provide the complete audio upfront. */
-static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
+ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                           qwen_live_audio_t *live) {
     const qwen_config_t *cfg = &ctx->config;
     int dim = cfg->dec_hidden;
@@ -2531,6 +2477,8 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     #define QWEN_STREAM_DEGEN_MIN_REPEATS 2
     #define QWEN_STREAM_RECOVERY_COOLDOWN 3
     #define QWEN_STREAM_RECOVERY_DUP_ROUNDS 4
+
+
     #define QWEN_STREAM_CROSS_CHUNK_DUP_MIN 12
     #define QWEN_STREAM_STALE_CHUNKS 4
     #define QWEN_STREAM_RESET_INTERVAL_CHUNKS 45
@@ -2574,11 +2522,12 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         return NULL;
     }
 
-    /* In non-interactive mode (no token callback) with pre-loaded audio,
-     * streaming chunks are not externally consumed and the final answer is
-     * already produced by a full refinement pass. Skip chunk-by-chunk
-     * decoding entirely. (In live mode we must still use the chunked loop.) */
-    if (!ctx->token_cb && !live) {
+    /* In non-interactive mode (no token callback AND no chunk callback) with
+     * pre-loaded audio, streaming chunks are not externally consumed and the
+     * final answer is already produced by a full refinement pass. Skip
+     * chunk-by-chunk decoding entirely.  (In live mode we must still use the
+     * chunked loop.) */
+    if (!ctx->token_cb && !ctx->chunk_cb && !live) {
         if (qwen_verbose >= 2) {
             fprintf(stderr, "Streaming: no token callback, using direct final refinement\n");
         }
@@ -2617,6 +2566,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
      * the held-back tokens get emitted.  Resets when tail changes. */
     #define QWEN_STREAM_TAIL_STABLE_PROMOTE 3
     int *prev_tail_tokens = NULL;
+    size_t prev_tail_cap = 0;
     int prev_tail_len = 0;
     int tail_stable_rounds = 0;
     /* Result text accumulator */
@@ -2692,6 +2642,101 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
          * stays buffered until the user clicks Stop / EOF is signaled. */
         int short_chunk = 0;        /* set when this round decodes a partial tail */
         int64_t short_chunk_end = 0; /* absolute sample index for the partial-tail end */
+        /* Run the VAD over any new audio that arrived since the last
+         * check, *after* the wait loop exits.  The in-loop VAD only
+         * fires on wait timeouts; for normal coalesce decodes (the
+         * `want` audio threshold met) we still need an up-to-date
+         * vad_silence_run before decoding.  If the VAD has been
+         * reporting silence for >= 5 frames (~160 ms) but the coalesce
+         * threshold is also met, upgrade this iteration to a tail-flush
+         * so the decoder can early-stop on the next check.
+         *
+         * IMPORTANT: silence_run must also advance when *no* new
+         * audio arrives.  Otherwise, after a tail-flush decode
+         * advances audio_cursor to short_chunk_end, the next loop
+         * iteration sees new_audio=0 and the silence_run counter
+         * freezes.  Treat "no new audio in a wait-loop exit" as a
+         * single silent frame using the last VAD prob — if the
+         * last VAD prob already said silence, this is a continuation
+         * of that silence; if it said speech, the absence of audio
+         * strongly suggests the user has stopped.  We use a softer
+         * bias: only increment if the last VAD sample was silence,
+         * otherwise clear the run (so a noisy mic that was
+         * borderline-speech doesn't artificially trigger early
+         * commits). */
+        if (live && ctx->vad && qwen_silero_vad_is_active(ctx->vad)) {
+            LA_LOCK(live);
+            int64_t buffered_after_loop = live->sample_offset + live->n_samples;
+            LA_UNLOCK(live);
+            int64_t new_audio = buffered_after_loop - audio_cursor;
+            if (new_audio > 0) {
+                int64_t aligned_new = (new_audio / QWEN_SILERO_VAD_CHUNK)
+                                      * QWEN_SILERO_VAD_CHUNK;
+                if (aligned_new > 0) {
+                    float tmp_buf[QWEN_SILERO_VAD_CHUNK * 8];
+                    int to_process = (int)(aligned_new < (int64_t)sizeof(tmp_buf)/sizeof(float)
+                                            ? aligned_new
+                                            : (int64_t)sizeof(tmp_buf)/sizeof(float));
+                    LA_LOCK(live);
+                    for (int i = 0; i < to_process; ++i) {
+                        int64_t gidx = audio_cursor + i;
+                        int64_t slot = (gidx - live->sample_offset + live->capacity) % live->capacity;
+                        tmp_buf[i] = live->samples[slot];
+                    }
+                    LA_UNLOCK(live);
+                    int frames = to_process / QWEN_SILERO_VAD_CHUNK;
+                    if (frames > 0) {
+                        float prob = 0.0f;
+                        qwen_silero_vad_process(ctx->vad, tmp_buf,
+                                                frames * QWEN_SILERO_VAD_CHUNK, &prob);
+                        ctx->vad_last_prob = prob;
+                        if (prob < 0.35f) {
+                            ctx->vad_silence_run++;
+                        } else {
+                            ctx->vad_silence_run = 0;
+                        }
+                    }
+                }
+            } else {
+                /* No new audio since the last check.  This is
+                 * either (a) a wait-timeout exit where the user
+                 * paused, or (b) a post-decode iteration where
+                 * audio_cursor already consumed the tail.  In both
+                 * cases, an idle stream with a non-zero silence_run
+                 * should keep advancing.  Only advance if the last
+                 * observed VAD frame was already silence — this
+                 * avoids mis-firing on a noisy mic that produces
+                 * near-constant low-amplitude "speech". */
+                if (ctx->vad_last_prob < 0.35f && ctx->vad_silence_run > 0) {
+                    ctx->vad_silence_run++;
+                } else if (ctx->vad_silence_run > 0) {
+                    /* Last VAD said speech but no new audio — the
+                     * speaker has clearly paused.  Trust the
+                     * absence of audio: reset to 1 so a single
+                     * silent wait counts toward the threshold. */
+                    ctx->vad_silence_run = 1;
+                }
+            }
+            /* If VAD says the user has stopped, force this round to
+             * be a short_chunk so we don't pull extra audio into the
+             * encoder window that we'll only have to roll back. */
+            if (!short_chunk && ctx->vad_silence_run >= 5) {
+                LA_LOCK(live);
+                int64_t available = (live->sample_offset + live->n_samples) - audio_cursor;
+                LA_UNLOCK(live);
+                if (available >= QWEN_SILERO_VAD_CHUNK) {
+                    short_chunk = 1;
+                    short_chunk_end = audio_cursor + available;
+                    if (qwen_verbose >= 2) {
+                        fprintf(stderr,
+                                "Streaming (live): VAD tail-flush at coalesce exit "
+                                "(silence_run=%d, prob=%.3f, available=%.2f s)\n",
+                                ctx->vad_silence_run, ctx->vad_last_prob,
+                                (double)available / (double)QWEN_SAMPLE_RATE);
+                    }
+                }
+            }
+        }
         if (live) {
             int64_t want = audio_cursor + chunk_samples;
             LA_LOCK(live);
@@ -2711,20 +2756,51 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 int64_t buffered_before = live->sample_offset + live->n_samples;
                 int timed_out = LA_WAIT_MS(live, idle_ms);
                 int64_t buffered_after = live->sample_offset + live->n_samples;
+                /* VAD is updated below (after this loop too) so this
+                 * block is no longer responsible for it.  Just
+                 * decide whether to break out with short_chunk. */
                 if (timed_out && buffered_after == buffered_before) {
                     int64_t available = buffered_after - audio_cursor;
-                    if (available >= idle_min) {
+                    int enough_buffered = available >= idle_min;
+                    /* VAD-driven fast path: if the VAD has been
+                     * reporting silence for >= 5 frames (~160 ms),
+                     * trigger tail-flush even if the legacy
+                     * `enough_buffered` check would otherwise gate
+                     * us.  This makes silence commits snappy
+                     * without bumping idle_min so high-confidence
+                     * streaming still works. */
+                    int vad_says_silence = (ctx->vad_silence_run >= 5);
+                    if (enough_buffered || (vad_says_silence && available >= QWEN_SILERO_VAD_CHUNK)) {
                         short_chunk = 1;
                         short_chunk_end = buffered_after;
                         if (qwen_verbose >= 2) {
                             fprintf(stderr,
                                     "Streaming (live): idle tail-flush, decoding %.2f s "
-                                    "(want %.2f s for full chunk)\n",
+                                    "(want %.2f s for full chunk)%s\n",
                                     (double)available / (double)QWEN_SAMPLE_RATE,
-                                    (double)chunk_samples / (double)QWEN_SAMPLE_RATE);
+                                    (double)chunk_samples / (double)QWEN_SAMPLE_RATE,
+                                    vad_says_silence ? " [VAD-driven]" : "");
                         }
                         break;
                     }
+                }
+                /* Heartbeat: when the user has stopped speaking, fire a
+                 * chunk callback with empty pieces so the receiver can
+                 * drive a "still listening" indicator.  Without this the
+                 * live loop would block indefinitely in LA_WAIT_MS and
+                 * the UI would freeze on the last partial line. */
+                if (timed_out && ctx->chunk_cb) {
+                    qwen_stream_chunk_t hb = {0};
+                    hb.chunk_index = chunk_idx;
+                    hb.is_first = (chunk_idx == 0);
+                    hb.is_final = 0;
+                    hb.stable_piece = "";
+                    hb.tentative_piece = "";
+                    hb.stable_token_count = 0;
+                    hb.tentative_token_count = 0;
+                    hb.audio_cursor = audio_cursor;
+                    hb.decode_ms = 0.0;
+                    ctx->chunk_cb(&hb, ctx->chunk_cb_userdata);
                 }
             }
 
@@ -2793,6 +2869,23 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
              * chunk_samples or the next iteration would skip un-arrived audio
              * once the speaker resumes. */
             audio_cursor = short_chunk_end;
+            /* Tail-flush on silence: cap how many tokens the decoder may
+             * emit.  The full default (32) lets the model "imagine" well
+             * past the end of the actual audio — for a paused speaker this
+             * produces hallucinated punctuation or extra syllables that
+             * show up as "stuck" partial text.  Reducing to a smaller
+             * "force commit" budget (default 16) makes the model finalize
+             * its current hypothesis and stop.  Set to 0 to keep using
+             * stream_max_new_tokens for this iteration. */
+            if (ctx->stream_idle_flush_max_new_tokens > 0 &&
+                max_new_tokens > ctx->stream_idle_flush_max_new_tokens) {
+                if (qwen_verbose >= 2) {
+                    fprintf(stderr,
+                            "  Tail-flush: cap max_new_tokens %d -> %d (force commit)\n",
+                            max_new_tokens, ctx->stream_idle_flush_max_new_tokens);
+                }
+                max_new_tokens = ctx->stream_idle_flush_max_new_tokens;
+            }
         } else {
             audio_cursor += chunk_samples;
         }
@@ -2800,6 +2893,19 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
 
         int is_final = live ? (live_eof && audio_cursor >= audio_n_samples)
                             : (audio_cursor >= audio_n_samples);
+
+        /* Snapshot the current stable count so we can report the *delta*
+         * (this chunk's newly committed text) to the per-chunk callback
+         * at the end of the iteration.  Without this, the callback can
+         * only see the cumulative stable text, not the per-chunk delta. */
+        int prev_chunk_n_stable_text_tokens = n_stable_text_tokens;
+
+        /* Defaults used by the per-chunk callback if this iteration
+         * early-exits (`goto chunk_end`) before parsing the text region
+         * out of raw_tokens.  A skipped chunk reports no newly committed
+         * text and no tentative tail. */
+        int text_start = 0;
+        int n_text_tokens = 0;
 
         /* Encoder path:
          * - default: cache completed local-attention windows and re-encode only
@@ -2859,9 +2965,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                                 "(all-silent window)\n",
                                 (float)audio_cursor / QWEN_SAMPLE_RATE);
                     }
-                    ctx->perf_total_ms += get_time_ms() - chunk_t0;
-                    chunk_idx++;
-                    continue;
+                    goto chunk_end;
                 }
                 window_has_speech = 0; /* reset for next window */
                 /* Fall through to encoder/decoder. */
@@ -2875,9 +2979,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                                 (float)partial_span / QWEN_SAMPLE_RATE,
                                 cur_rms);
                     }
-                    ctx->perf_total_ms += get_time_ms() - chunk_t0;
-                    chunk_idx++;
-                    continue;
+                    goto chunk_end;
                 }
 
                 /* (2) Speech onset — silence→speech transition.
@@ -2915,12 +3017,14 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                  * partial updates that the user can't see in time. */
                 int64_t decode_lag_samples = audio_n_samples - audio_cursor;
 
-                /* 3-tier lag thresholds:
-                 *   lag < 2s  → normal (onset allowed, step=enc/3≈2.67s)
-                 *   2s-4s    → moderate (onset allowed, step=enc/2≈4s)
-                 *   > 4s     → severe (suppress onset, step=enc/2≈4s) */
-                int64_t lag_severe  = 4 * (int64_t)QWEN_SAMPLE_RATE;
-                int64_t lag_moderate = 2 * (int64_t)QWEN_SAMPLE_RATE;
+                /* 4-tier lag thresholds (0.5s target step):
+                 *   lag < 0.5s → normal    (onset allowed, step=enc/16≈0.50s)
+                 *   0.5s-1s    → moderate  (onset allowed, step=enc/8 ≈1.00s)
+                 *   1s-4s      → slow      (onset allowed, step=enc/4 ≈2.00s)
+                 *   > 4s       → severe    (suppress onset,  step=enc/2 ≈4.00s) */
+                 int64_t lag_severe   = 4 * (int64_t)QWEN_SAMPLE_RATE;
+                 int64_t lag_slow     = 2 * (int64_t)QWEN_SAMPLE_RATE;
+                 int64_t lag_moderate = 1 * (int64_t)QWEN_SAMPLE_RATE;
 
                 if (is_onset && decode_lag_samples > lag_severe) {
                     /* Suppress onset decode when severely lagging. */
@@ -2946,15 +3050,17 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                     }
                     /* Fall through to encoder/decoder. */
                 } else {
-                    /* (3) Continuous speech coalescing — 3-tier step:
-                     * Normal:   enc_window/3 ≈ 2.67 s (3 decodes/window)
-                     * Moderate: enc_window/2 ≈ 4 s    (2 decodes/window)
-                     * Severe:   enc_window/2 ≈ 4 s    (2 decodes/window) */
+                    /* (3) Continuous speech coalescing — 2-tier step:
+                     * Normal:   enc_window/8  ≈ 1.00 s (8 decodes/window)
+                     * Slow:     enc_window/2  ≈ 4.00 s (2 decodes/window)
+                     * 0.5s step (enc/16) was tried but it overloaded the model
+                     * (prefill + decode cost > 500ms/call → RTF>1, lag grew).
+                     * 1.0s gives steady-state RTF~1.0 for current audio. */
                     int64_t coalesce_step;
-                    if (decode_lag_samples > lag_moderate)
+                    if (decode_lag_samples > lag_slow)
                         coalesce_step = enc_window_samples / 2;
                     else
-                        coalesce_step = enc_window_samples / 3;
+                        coalesce_step = enc_window_samples / 8;
                     if (coalesce_step < chunk_samples)
                         coalesce_step = chunk_samples;
                     int64_t prev_cursor = audio_cursor - chunk_samples;
@@ -2965,16 +3071,18 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                         if (qwen_verbose >= 2) {
                             fprintf(stderr,
                                     "  Coalesce: skip partial %.1f s "
-                                    "(next decode at %.1f s, lag=%.1f s)\n",
+                                    "(next decode at %.1f s, lag=%.1f s, step=%.1f s, cs=%lld, lag_thresh=%lld/%lld/%lld)\n",
                                     (float)partial_span / QWEN_SAMPLE_RATE,
                                     (float)(((partial_span / coalesce_step) + 1)
                                             * coalesce_step)
                                         / QWEN_SAMPLE_RATE,
-                                    (float)decode_lag_samples / QWEN_SAMPLE_RATE);
+                                    (float)decode_lag_samples / QWEN_SAMPLE_RATE,
+                                    (float)coalesce_step / QWEN_SAMPLE_RATE,
+                                    (long long)coalesce_step,
+                                    (long long)lag_moderate,
+                                    (long long)lag_slow);
                         }
-                        ctx->perf_total_ms += get_time_ms() - chunk_t0;
-                        chunk_idx++;
-                        continue;
+                        goto chunk_end;
                     }
                 }
             }
@@ -2982,17 +3090,13 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
 
         if (!use_enc_cache) {
             if (audio_cursor > INT_MAX) {
-                ctx->perf_total_ms += get_time_ms() - chunk_t0;
-                chunk_idx++;
-                continue;
+                goto chunk_end;
             }
             if (stream_encode_span(ctx, audio_samples, (int)audio_cursor,
                                    &enc_output, &enc_seq_len) != 0 ||
                 !enc_output || enc_seq_len <= 0) {
                 free(enc_output);
-                ctx->perf_total_ms += get_time_ms() - chunk_t0;
-                chunk_idx++;
-                continue;
+                goto chunk_end;
             }
             double enc_ms = get_time_ms() - t0;
             ctx->perf_encode_ms += enc_ms;
@@ -3095,9 +3199,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
 
             if (enc_failed) {
                 free(partial_enc);
-                ctx->perf_total_ms += get_time_ms() - chunk_t0;
-                chunk_idx++;
-                continue;
+                goto chunk_end;
             }
 
             /* Evict old encoder windows beyond the sliding-window limit
@@ -3151,17 +3253,13 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             enc_seq_len = enc_cached_seq_total + partial_seq;
             if (enc_seq_len <= 0) {
                 free(partial_enc);
-                ctx->perf_total_ms += get_time_ms() - chunk_t0;
-                chunk_idx++;
-                continue;
+                goto chunk_end;
             }
 
             enc_output = (float *)malloc((size_t)enc_seq_len * dim * sizeof(float));
             if (!enc_output) {
                 free(partial_enc);
-                ctx->perf_total_ms += get_time_ms() - chunk_t0;
-                chunk_idx++;
-                continue;
+                goto chunk_end;
             }
 
             int enc_off = 0;
@@ -3222,9 +3320,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         float *input_embeds = (float *)malloc((size_t)total_seq * dim * sizeof(float));
         if (!input_embeds) {
             free(enc_output);
-            ctx->perf_total_ms += get_time_ms() - chunk_t0;
-            chunk_idx++;
-            continue;
+            goto chunk_end;
         }
 
         int off = 0;
@@ -3373,9 +3469,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         /* Collect ALL generated tokens (including language, <asr_text>, etc.) */
         int *chunk_tokens = (int *)malloc((size_t)max_new_tokens * sizeof(int));
         if (!chunk_tokens) {
-            ctx->perf_total_ms += get_time_ms() - chunk_t0;
-            chunk_idx++;
-            continue;
+            goto chunk_end;
         }
         int n_chunk_tokens = 0;
 
@@ -3383,6 +3477,25 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             n_generated++;
             if (token == QWEN_TOKEN_ENDOFTEXT || token == QWEN_TOKEN_IM_END) break;
             if (qwen_should_cancel(ctx)) break;
+
+            /* VAD-driven early stop: when the speaker has paused and
+             * the VAD has reported silence for >= 5 frames (~160 ms)
+             * AND we've already emitted at least one text token,
+             * stop the decode loop.  This prevents the model from
+             * continuing to "imagine" extra text after the user
+             * finishes their sentence — the main source of late
+             * partial flicker and "gibberish" hallucinations.  Without
+             * an active VAD this is a no-op.  Fires for any decode
+             * (tail-flush OR normal coalesce) when the VAD has
+             * detected silence. */
+            if (ctx->vad_silence_run >= 5 && n_chunk_tokens >= 1) {
+                if (qwen_verbose >= 2) {
+                    fprintf(stderr,
+                            "  VAD early-stop after %d tokens (silence_run=%d, prob=%.3f)\n",
+                            n_chunk_tokens, ctx->vad_silence_run, ctx->vad_last_prob);
+                }
+                break;
+            }
 
             chunk_tokens[n_chunk_tokens++] = token;
 
@@ -3459,9 +3572,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             int *tmp_raw = (int *)realloc(raw_tokens, (size_t)raw_tokens_cap * sizeof(int));
             if (!tmp_raw) {
                 free(chunk_tokens);
-                ctx->perf_total_ms += get_time_ms() - chunk_t0;
-                chunk_idx++;
-                continue;
+                goto chunk_end;
             }
             raw_tokens = tmp_raw;
         }
@@ -3478,7 +3589,6 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         /* Parse text region from raw stream output:
          * - default: language ... <asr_text> TEXT
          * - forced language: prompt already anchors language, so generated stream is TEXT. */
-        int text_start = 0;
         if (ctx->n_force_prompt_tokens <= 0) {
             int asr_text_pos = -1;
             for (int i = 0; i < n_raw_tokens; i++) {
@@ -3491,7 +3601,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         }
         if (text_start < 0) text_start = 0;
         if (text_start > n_raw_tokens) text_start = n_raw_tokens;
-        int n_text_tokens = n_raw_tokens - text_start;
+        n_text_tokens = n_raw_tokens - text_start;
 
         /* "Fixed" frontier for this chunk:
          * - cold-start chunks: emit nothing,
@@ -3517,13 +3627,32 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             } else {
                 tail_stable_rounds = (tail_len > 0) ? 1 : 0;
             }
-            /* Save current tail for next round comparison */
+            /* Save current tail for next round comparison.
+             * The grow helper preserves `prev_tail_tokens` on allocation
+             * failure, so the subsequent memcpy is only issued when the
+             * backing storage is large enough to hold `tail_len` ints.
+             * This eliminates the heap-buffer-overflow that existed in
+             * the previous hand-written realloc branch when realloc
+             * returned NULL but the memcpy was still attempted against
+             * the (now stale, smaller) buffer. */
             if (tail_len > 0) {
-                if (tail_len > prev_tail_len) {
-                    int *tmp = (int *)realloc(prev_tail_tokens, (size_t)tail_len * sizeof(int));
-                    if (tmp) prev_tail_tokens = tmp;
+                if ((size_t)tail_len > prev_tail_cap) {
+                    size_t new_cap = 0;
+                    if (qwen_grow_buffer(
+                            (void **)&prev_tail_tokens,
+                            sizeof(int),
+                            prev_tail_cap,
+                            (size_t)tail_len,
+                            &new_cap) != 0) {
+                        prev_tail_cap = new_cap;
+                    } else if (qwen_verbose >= 1) {
+                        fprintf(stderr,
+                                "  Stream: prev_tail_tokens grow to %d failed; "
+                                "skipping stability tracking for this round\n",
+                                tail_len);
+                    }
                 }
-                if (prev_tail_tokens) {
+                if (prev_tail_tokens && (size_t)tail_len <= prev_tail_cap) {
                     memcpy(prev_tail_tokens, tail_tokens, (size_t)tail_len * sizeof(int));
                 }
             }
@@ -3873,6 +4002,123 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
 
         /* (bg encoder submission moved to before decode for overlap) */
 
+        chunk_end:
+        /* Per-chunk callback: deliver the delta of newly committed text plus
+         * the still-tentative tail.  The receiver can render a "stable line"
+         * (append-only) and a "tentative line" (replace each chunk) without
+         * any per-token bookkeeping.  Always fires (even on silent-skipped
+         * chunks that `goto chunk_end` early) so the receiver can drive a
+         * heartbeat / "still listening" indicator with no special-casing. */
+        if (ctx->chunk_cb) {
+            /* How many tokens did this chunk newly commit?  In the normal
+             * case, n_stable_text_tokens grew by some positive delta.  If
+             * a periodic_reset re-anchored the state, the count can shrink;
+             * we then report no new stable text and let the tentative line
+             * show the new tail.  The receiver is expected to maintain its
+             * own displayed stable state. */
+            int new_stable = n_stable_text_tokens - prev_chunk_n_stable_text_tokens;
+            if (new_stable < 0) new_stable = 0;
+            if (new_stable > n_stable_text_tokens) new_stable = n_stable_text_tokens;
+
+            int tentative_tokens = n_text_tokens - n_stable_text_tokens;
+            if (tentative_tokens < 0) tentative_tokens = 0;
+            if (is_final) tentative_tokens = 0;
+
+            /* Decode the new stable span. */
+            size_t stable_len = 0;
+            if (new_stable > 0) {
+                int start = n_stable_text_tokens - new_stable;
+                if (start < 0) start = 0;
+                for (int i = start; i < n_stable_text_tokens; i++) {
+                    const char *piece = qwen_tokenizer_decode(tokenizer,
+                                                              stable_text_tokens[i]);
+                    if (!piece) continue;
+                    size_t plen = strlen(piece);
+                    if (stable_len + plen + 1 > ctx->chunk_stable_cap) {
+                        size_t new_cap = ctx->chunk_stable_cap > 0
+                                       ? ctx->chunk_stable_cap : 64;
+                        while (new_cap < stable_len + plen + 1) new_cap *= 2;
+                        char *tmp = (char *)realloc(ctx->chunk_stable_buf, new_cap);
+                        if (tmp) {
+                            ctx->chunk_stable_buf = tmp;
+                            ctx->chunk_stable_cap = new_cap;
+                        } else {
+                            /* Allocation failure: bail out of building stable
+                             * text.  We'll still send an empty stable piece
+                             * so the receiver knows the chunk happened. */
+                            stable_len = 0;
+                            break;
+                        }
+                    }
+                    memcpy(ctx->chunk_stable_buf + stable_len, piece, plen);
+                    stable_len += plen;
+                }
+            }
+            if (ctx->chunk_stable_buf) ctx->chunk_stable_buf[stable_len] = '\0';
+
+            /* Trim any partial UTF-8 character at the tail.  Qwen3's
+             * BPE token boundaries don't align with UTF-8 boundaries
+             * (a Chinese character can span 1-3 BPE tokens), so when
+             * we cut at a token boundary the last few bytes may form
+             * an incomplete code point.  Truncating back to the last
+             * complete character removes the garbled tail.  Trimming
+             * is a no-op for ASCII text and for already-aligned UTF-8.
+             * For the final chunk we also trim the cumulative stable
+             * piece, which can grow to a partial char over many emits
+             * even though each emit was individually aligned. */
+            if (ctx->chunk_stable_buf) {
+                stable_len = qwen_utf8_truncate(ctx->chunk_stable_buf, stable_len);
+            }
+
+            /* Decode the tentative tail. */
+            size_t tentative_len = 0;
+            if (tentative_tokens > 0) {
+                int *tail = raw_tokens + text_start + n_stable_text_tokens;
+                for (int i = 0; i < tentative_tokens; i++) {
+                    const char *piece = qwen_tokenizer_decode(tokenizer, tail[i]);
+                    if (!piece) continue;
+                    size_t plen = strlen(piece);
+                    if (tentative_len + plen + 1 > ctx->chunk_tentative_cap) {
+                        size_t new_cap = ctx->chunk_tentative_cap > 0
+                                       ? ctx->chunk_tentative_cap : 64;
+                        while (new_cap < tentative_len + plen + 1) new_cap *= 2;
+                        char *tmp = (char *)realloc(ctx->chunk_tentative_buf, new_cap);
+                        if (tmp) {
+                            ctx->chunk_tentative_buf = tmp;
+                            ctx->chunk_tentative_cap = new_cap;
+                        } else {
+                            tentative_len = 0;
+                            break;
+                        }
+                    }
+                    memcpy(ctx->chunk_tentative_buf + tentative_len, piece, plen);
+                    tentative_len += plen;
+                }
+            }
+            if (ctx->chunk_tentative_buf) ctx->chunk_tentative_buf[tentative_len] = '\0';
+            /* Tentative tail is the most likely place for a partial
+             * character: it comes from the rollback tokens, which by
+             * definition were just emitted and may be mid-character
+             * when the decoder was cut (VAD early-stop, max_new_tokens,
+             * or recovery reset).  Trim before showing to the UI. */
+            if (ctx->chunk_tentative_buf) {
+                tentative_len = qwen_utf8_truncate(ctx->chunk_tentative_buf, tentative_len);
+            }
+
+            qwen_stream_chunk_t chunk;
+            chunk.chunk_index = chunk_idx;
+            chunk.is_first = (chunk_idx == 0);
+            chunk.is_final = is_final;
+            chunk.stable_piece = ctx->chunk_stable_buf ? ctx->chunk_stable_buf : "";
+            chunk.tentative_piece = ctx->chunk_tentative_buf
+                                        ? ctx->chunk_tentative_buf : "";
+            chunk.stable_token_count = new_stable;
+            chunk.tentative_token_count = tentative_tokens;
+            chunk.audio_cursor = audio_cursor;
+            chunk.decode_ms = get_time_ms() - chunk_t0;
+            ctx->chunk_cb(&chunk, ctx->chunk_cb_userdata);
+        }
+
         ctx->perf_total_ms += get_time_ms() - chunk_t0;
         chunk_idx++;
     }
@@ -3919,8 +4165,12 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     free(compacted_samples);
     free(local_samples);
 
-    /* Trim whitespace */
+    /* Trim whitespace and any partial UTF-8 character at the tail.
+     * Without the UTF-8 trim, a final-cut on a mid-character token
+     * leaves a garbled byte sequence in the returned text.  The trim
+     * is a no-op for inputs that end on a complete code point. */
     size_t rlen = strlen(result);
+    rlen = qwen_utf8_truncate(result, rlen);
     while (rlen > 0 && isspace((unsigned char)result[rlen - 1])) result[--rlen] = '\0';
     char *start = result;
     while (*start && isspace((unsigned char)*start)) start++;
@@ -3930,6 +4180,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
 }
 
 char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_samples) {
+    fprintf(stderr, "DEBUG: qwen_transcribe_stream called, ctx=%p, chunk_cb=%p\n", (void*)ctx, ctx ? (void*)(uintptr_t)ctx->chunk_cb : (void*)0);
     return stream_impl(ctx, samples, n_samples, NULL);
 }
 
