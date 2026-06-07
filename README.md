@@ -4,34 +4,52 @@ Qwen3-ASR 的 CPU 推理服务与命令行工具，使用 C/C++17 实现。项�
 
 支持 Qwen3-ASR 0.6B / 1.7B safetensors 模型；Windows 和 Linux 使用 OpenBLAS，macOS 使用 Accelerate。可选 oneDNN INT8 路径用于 encoder / decoder 加速。
 
+**当前版本: v1.0.0** — [Release Notes](https://github.com/miemiekurisu/qwen3asr_cpu/releases/tag/v1.0.0)
+
 > ⚠️ **本文档由 AI 根据代码编写,可能存在疏漏**。请以实际代码为准: 命令行参数以 `qasr_cli --help` / `qasr_server --help` / `qasr_cpu_bench --help` 输出为权威; HTTP API 以 `src/service/server.cc` 的路由注册为权威; 环境变量以 `src/backend/qwen_cpu/qwen_asr_perf.c` / `tools/run_linux_server.sh` 的解析为权威。
 
 ## 快速开始
 
 ### Windows
 
-推荐使用根目录的 `build.bat`：
+推荐使用根目录的 `build_all.ps1`（或 `start.bat` 包装器）：
 
 ```bat
-build.bat
+build_all.ps1                    # 一键 clean + configure + compile
+build_all.ps1 --incremental      # 增量编译（不删 build/）
+build_all.ps1 --test             # 构建后运行单元测试 (667 cases)
+build_all.ps1 --clean            # 清理 build/
+build_all.ps1 --openblas-dir <path>  # 例如 D:\dev\OpenBLAS
 ```
 
-它会转发到 `tools\build_windows_openblas.ps1`，自动导入 MSVC 构建环境、查找 OpenBLAS，然后执行 clean + configure + compile。脚本不会自动下载 OpenBLAS；如果没有从 `OPENBLAS_DIR`、已有 build cache 或常见依赖目录中找到它，请显式传 `--openblas-dir`。
-
-按需追加：
+或等价使用 `start.bat`（cmd 包装器，自动调用 `build_all.ps1`）：
 
 ```bat
-build.bat --test
-build.bat --benchmark
-build.bat --test --benchmark
-build.bat --openblas-dir <path-to-openblas>   :: 例如 C:\dev\OpenBLAS
+start.bat [--clean] [--test] [--openblas-dir <path>]
 ```
+
+脚本会：导入 MSVC 2022 构建环境 → 查找 OpenBLAS（`OPENBLAS_DIR` 或常见路径）→ cmake configure → compile → 可选测试/基准。OpenBLAS 不会自动下载。
 
 运行时需要让 OpenBLAS DLL 可见：
 
 ```powershell
-$env:PATH = "<path-to-openblas>\bin;$env:PATH"   :: 例如 C:\dev\OpenBLAS\bin
+$env:PATH = "<path-to-openblas>\bin;$env:PATH"   :: 例如 D:\dev\OpenBLAS\bin
 ```
+
+#### 启动 server (一键)
+
+编译完可以用 `tools/run_server.ps1` 一键起后台 server（HTTP + 可选 HTTPS + 状态查询），避免手动管 PID / log / 反代：
+
+```powershell
+$env:QASR_MODEL_DIR = "D:\path\to\Qwen3-ASR-0___6B"
+
+tools\run_server.ps1 --detach                  # 后台 HTTP (API/curl 用)
+tools\run_server.ps1 --detach --https          # 后台 HTTP + HTTPS (浏览器用, 推荐)
+tools\run_server.ps1 --status                  # /api/health 检查
+tools\run_server.ps1 --stop                    # 停 --detach 起的 server / proxy
+```
+
+HTTPS 反代自动生成自签 cert；想跨重启复用 cert 设 `$env:QASR_TLS_CERT_DIR` 即可。完整环境变量 + flags 见 `tools\run_server.ps1 --help`。
 
 ### Linux
 
@@ -546,7 +564,7 @@ Stop 按钮解禁可重试。
 
 #### Per-feature 模型 (`--realtime-model-dir`)
 
-`tools/run_linux_server.sh` 启动时, batch 和 realtime 可独立指定模型:
+`tools/run_linux_server.sh` / `tools/run_server.ps1` 启动时, batch 和 realtime 可独立指定模型:
 
 ```bash
 export QASR_MODEL_DIR=.../Qwen3-ASR-1.7B/...   # batch (高质量)
@@ -558,7 +576,22 @@ tools/run_linux_server.sh --detach --https
 
 #### VAD 段式批量转写
 
-`POST /api/transcriptions/async` 现在走 VAD 段式 (`kBatchVadSilenceFrames=16` = 500ms 静音, 40s 强制 cap)。28.77 min 长音频从单次全段改为 ~40 个段, 单段 RTF 0.16-0.18, 总 wall time ~ RTF 1.3-1.5x (因 VAD sweep + 段提交 overhead)。`long.mp3` (6.9 MB, 28.77 min) 端到端 ~600s 跑通。
+`POST /api/transcriptions/async` 与 realtime 模式均走 VAD 段式：
+
+- **静音 commit**: 1500ms 静音 → 自动提交当前段
+- **Softcap grace**: 15s 软截止 → 进入 800ms 宽限期 → 检测到 256ms 声学谷底即提交 → 超时强制提交 → 15.8s 硬截止
+- **Pending merge**: 短段 (< 1.8s) 暂存 1.2s，新语音到达则合并
+- **Pre-roll / Post-roll**: 500ms 前置 + 500ms 后置，保留首尾语音
+
+28.77 min 长音频从单次全段改为 ~40 个段, 单段 RTF 0.16-0.18, 总 wall time ~ RTF 1.3-1.5x (因 VAD sweep + 段提交 overhead)。`long.mp3` (6.9 MB, 28.77 min) 端到端 ~600s 跑通。
+
+#### 模型预热 (Model Warmup)
+
+Server 启动时自动运行 1 秒静音推理，触发 oneDNN JIT 编译并预热 CPU 缓存。预热同步完成后再监听 HTTP 端口，首次请求不会被 JIT 编译拖慢延迟。
+
+#### 异步全文重转录 (Async Retranscription)
+
+Stop 请求立即返回 VAD 分段结果，后台异步使用 batch 模型（1.7B）对完整音频进行全文重转录。结果就绪后自动替换原有分段文本。避免了 stop 等待数秒的问题。
 
 #### UI 状态机 4 态
 
@@ -567,7 +600,7 @@ tools/run_linux_server.sh --detach --https
 #### 测试
 
 ```bash
-# C++ 单测 (665 cases, 全部 PASS, ASAN build 654 cases)
+# C++ 单测 (667 cases, 全部 PASS, ASAN build 654 cases)
 ctest --test-dir build/linux-openblas --output-on-failure
 
 # JS 状态机纯函数 (47 cases — 6 个纯函数: 重置/确认/降采样/PCM16/字符数/导出名)
