@@ -28,9 +28,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <pthread.h>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #include "qasr/audio/frontend.h"
 
@@ -119,14 +125,22 @@ struct FeedCtx {
     std::int64_t sample_rate;
 };
 
+#ifdef _WIN32
+DWORD WINAPI FeederThread(LPVOID arg) {
+#else
 void * FeederThread(void * arg) {
+#endif
     auto * fc = static_cast<FeedCtx *>(arg);
     std::size_t fed = 0;
     while (fed < fc->total) {
         std::size_t n = fc->chunk;
         if (n > fc->total - fed) n = fc->total - fed;
 
+#ifdef _WIN32
+        EnterCriticalSection(&fc->la->mutex);
+#else
         pthread_mutex_lock(&fc->la->mutex);
+#endif
         std::int64_t need = fc->la->n_samples + static_cast<std::int64_t>(n);
         if (need > fc->la->capacity) {
             std::int64_t new_cap = fc->la->capacity > 0 ? fc->la->capacity
@@ -145,16 +159,34 @@ void * FeederThread(void * arg) {
                         fc->data + fed, n * sizeof(float));
             fc->la->n_samples += static_cast<std::int64_t>(n);
         }
+#ifdef _WIN32
+        WakeConditionVariable(&fc->la->cond);
+        LeaveCriticalSection(&fc->la->mutex);
+#else
         pthread_cond_signal(&fc->la->cond);
         pthread_mutex_unlock(&fc->la->mutex);
+#endif
 
         fed += n;
     }
-    pthread_mutex_lock(&fc->la->mutex);
+#ifdef _WIN32
+        EnterCriticalSection(&fc->la->mutex);
+#else
+        pthread_mutex_lock(&fc->la->mutex);
+#endif
     fc->la->eof = 1;
-    pthread_cond_signal(&fc->la->cond);
-    pthread_mutex_unlock(&fc->la->mutex);
+#ifdef _WIN32
+        WakeConditionVariable(&fc->la->cond);
+        LeaveCriticalSection(&fc->la->mutex);
+#else
+        pthread_cond_signal(&fc->la->cond);
+        pthread_mutex_unlock(&fc->la->mutex);
+#endif
+#ifdef _WIN32
+    return 0;
+#else
     return nullptr;
+#endif
 }
 
 }  // namespace
@@ -232,8 +264,13 @@ int main(int argc, char ** argv) {
     for (int r = 0; r < opts.rounds; ++r) {
         // Reset live audio state for each round.
         qwen_live_audio_t live{};
+#ifdef _WIN32
+        InitializeCriticalSection(&live.mutex);
+        InitializeConditionVariable(&live.cond);
+#else
         pthread_mutex_init(&live.mutex, nullptr);
         pthread_cond_init(&live.cond, nullptr);
+#endif
         live.samples = nullptr;
         live.sample_offset = 0;
         live.n_samples = 0;
@@ -242,22 +279,35 @@ int main(int argc, char ** argv) {
         live.decoded_cursor = 0;
 
         FeedCtx fc{&live, audio_16k.data(), audio_16k.size(), chunk_samples, 16000};
+#ifdef _WIN32
+        HANDLE feeder = CreateThread(nullptr, 0, FeederThread, &fc, 0, nullptr);
+#else
         pthread_t feeder;
         pthread_create(&feeder, nullptr, FeederThread, &fc);
+#endif
 
         total_tokens_holder = 0;
         auto t0 = std::chrono::steady_clock::now();
         char * result = qwen_transcribe_stream_live(ctx, &live);
         auto t1 = std::chrono::steady_clock::now();
+#ifdef _WIN32
+        WaitForSingleObject(feeder, INFINITE);
+        CloseHandle(feeder);
+#else
         pthread_join(feeder, nullptr);
+#endif
         double wall_ms =
             std::chrono::duration<double, std::milli>(t1 - t0).count();
         if (result) std::free(result);
 
         // Tear down live state.
         if (live.samples) std::free(live.samples);
+#ifdef _WIN32
+        DeleteCriticalSection(&live.mutex);
+#else
         pthread_mutex_destroy(&live.mutex);
         pthread_cond_destroy(&live.cond);
+#endif
 
         double rtf = audio_sec / (wall_ms / 1000.0);
         std::fprintf(stderr,

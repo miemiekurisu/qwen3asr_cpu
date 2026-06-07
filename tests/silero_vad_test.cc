@@ -189,7 +189,7 @@ QASR_TEST(SileroVadConcurrentReset) {
     fill_sine(audio, 440.0f, 16000, 0.5f);
 
     /* Thread 0: repeatedly process audio */
-    std::thread proc([&, v, &mu]() {
+    std::thread proc([&, v]() {
         for (int i = 0; i < rounds; ++i) {
             float prob = -1.0f;
             {

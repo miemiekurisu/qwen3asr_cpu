@@ -13,6 +13,9 @@
 #  ifndef WIN32_LEAN_AND_MEAN
 #    define WIN32_LEAN_AND_MEAN
 #  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
 #  include <windows.h>
 #else
 #  include <fcntl.h>
@@ -212,7 +215,7 @@ Status SafeTensorIndex::Build(const MappedFile & file, SafeTensorIndex * out) {
     // above.  Reject corrupt shards where header_size + 8 would overflow
     // (uint64_t) or exceed the mapped file.  The 100 MiB upper bound keeps
     // accidental JSON-parser blow-up bounded for benign-but-misformed files.
-    if (header_size > std::numeric_limits<std::uint64_t>::max() - 8 ||
+    if (header_size > (std::numeric_limits<std::uint64_t>::max)() - 8 ||
         header_size + 8 > static_cast<std::uint64_t>(file.size()) ||
         header_size > 100ULL * 1024ULL * 1024ULL) {
         return Status(StatusCode::kInvalidArgument, "invalid safetensors header size");
