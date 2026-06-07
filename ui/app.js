@@ -46,7 +46,6 @@ let realtimeState = {
   mediaStream: null,
   sessionId: "",
   sendTimer: null,
-  pollTimer: null,
   sending: false,
   pending: [],
   sampleRate: 0,
@@ -128,6 +127,15 @@ function makeTermLine(state, text) {
   div.className = "term-line " + state;
   if (state === "cursor" && !text) {
     div.classList.add("empty");
+    /* If the terminal already has done lines above this cursor,
+     * the placeholder text should be terse ("continue speaking")
+     * rather than the long "waiting for first input" message —
+     * the user knows this is the transcript area by then.  Cheap
+     * O(n) scan; n is the number of committed segments which is
+     * small in practice. */
+    if (realtimeArchive.lines.some((l) => l.state === "done")) {
+      div.classList.add("has-done");
+    }
     const c = document.createElement("span");
     c.className = "cursor-blink";
     div.appendChild(c);
@@ -164,6 +172,68 @@ function applyTranscriptRender(element, data, fallback) {
     ? data.segments.filter((s) => typeof s === "string" && s)
     : [];
 
+  /* New segment(s) committed by the server?  When the server pushes
+   * multiple commits in a single SSE event (fast speech, or
+   * condition-variable wakeup coalescing), segments[] may jump by
+   * N>1 at once.  Animate ONLY the last one via the typewriter (so
+   * the user sees live transcription) but render the EARLIER ones
+   * as instant `done` lines (no typewriter for them — they were
+   * already "spoken" before this event arrived).  Without this,
+   * middle segments were silently dropped on screen, making the UI
+   * show fewer done lines than the server has in segments_text.
+   *
+   * IMPORTANT: process new segments BEFORE the finalize check.  The
+   * server's final flush (triggered by /stop) commits a final segment
+   * at the same time as data.finalized=true.  If the finalize check
+   * runs first, it returns early and the final segment is dropped
+   * on screen — symptom: "stop button shows 终稿已出 but result is
+   * empty".  Symptom reproduced in browser E2E test, session 12,
+   * 4.86s push + immediate stop, server returned segments=1 /
+   * finalized=true, but the UI never displayed the text.
+   *
+   * Order: (1) render any new segments, (2) freeze on finalize.
+   *
+   * On finalize, skip the typewriter — show the full text immediately.
+   * Without this, animateNewSegment() starts a typewriter (showing
+   * the first char 'T' synchronously) and the finalize check below
+   * immediately clearInterval()s it, leaving the user with just the
+   * first character.  Symptom: "result shows only T".
+   *
+   * Order: (1) render any new segments (typewriter if streaming,
+   * instant if finalized), (2) freeze on finalize. */
+  if (segments.length > realtimeArchive.lastSegmentCount) {
+    const newCount = segments.length - realtimeArchive.lastSegmentCount;
+    if (newCount === 1) {
+      /* Single new segment: animate it (or render final if stopping). */
+      const newText = segments[segments.length - 1];
+      if (newText) {
+        if (data?.finalized) {
+          renderFinalizedSegment(element, newText);
+        } else {
+          animateNewSegment(element, newText);
+        }
+      }
+    } else {
+      /* Multiple new segments in one event (SSE batch).  Render all
+       * but the last one as instant done lines (no typewriter — they
+       * were committed before this event, the user is catching up),
+       * then animate the last one if streaming, or render it final. */
+      for (let i = realtimeArchive.lastSegmentCount; i < segments.length - 1; i++) {
+        const t = segments[i];
+        if (t) renderFinalizedSegment(element, t);
+      }
+      const newText = segments[segments.length - 1];
+      if (newText) {
+        if (data?.finalized) {
+          renderFinalizedSegment(element, newText);
+        } else {
+          animateNewSegment(element, newText);
+        }
+      }
+    }
+    realtimeArchive.lastSegmentCount = segments.length;
+  }
+
   /* On finalize, freeze the cursor line (no more typewriter) but keep
    * the lines as-is so the user can read the final transcript. */
   if (data?.finalized) {
@@ -172,19 +242,7 @@ function applyTranscriptRender(element, data, fallback) {
       realtimeArchive.typewriterTimer = null;
     }
     realtimeArchive.finalized = true;
-    realtimeArchive.lastSegmentCount = segments.length;
     return;
-  }
-
-  /* New segment committed by the server?  Animate the new text into
-   * the live line via the typewriter, then commit it to a `done`
-   * line and start a fresh `cursor` line. */
-  if (segments.length > realtimeArchive.lastSegmentCount) {
-    const newText = segments[segments.length - 1];
-    if (newText) {
-      animateNewSegment(element, newText);
-    }
-    realtimeArchive.lastSegmentCount = segments.length;
   }
 
   /* Auto-scroll to keep the live line in view. */
@@ -260,6 +318,40 @@ function animateNewSegment(element, text) {
   /* Show the first character immediately so the user doesn't wait
    * one tick to see anything. */
   tick();
+}
+
+/* Like animateNewSegment but skips the typewriter and renders the
+ * full text immediately.  Used when the session is finalized: the
+ * user has clicked Stop, the final text is available, and the slow
+ * typewriter reveal is pure friction (would be cut off after 1
+ * char by the finalize freeze).  Also creates a fresh cursor line
+ * underneath, matching the post-typewriter state. */
+function renderFinalizedSegment(element, text) {
+  /* Stop any in-flight typewriter (e.g. from a prior render that
+   * raced with finalize) so we don't end up with two timers. */
+  if (realtimeArchive.typewriterTimer !== null) {
+    clearInterval(realtimeArchive.typewriterTimer);
+    realtimeArchive.typewriterTimer = null;
+  }
+  /* Find the bottom-most line.  Promote the cursor line to a
+   * done line carrying the full text.  If there's no cursor (we
+   * were mid-typing from a previous render, or the array is
+   * empty), append a fresh done line. */
+  const lastLine = realtimeArchive.lines[realtimeArchive.lines.length - 1];
+  if (lastLine && lastLine.state === "cursor") {
+    const blink = lastLine.el.querySelector(".cursor-blink");
+    if (blink) blink.remove();
+    lastLine.el.classList.remove("cursor", "empty");
+    lastLine.el.classList.add("done");
+    lastLine.state = "done";
+    lastLine.text = text;
+    lastLine.el.textContent = text;
+  } else {
+    const doneLine = makeTermLine("done", text);
+    element.appendChild(doneLine);
+    realtimeArchive.lines.push({ state: "done", el: doneLine, text });
+  }
+  element.scrollTop = element.scrollHeight;
 }
 
 function hasOfflineJob() {
@@ -680,6 +772,14 @@ async function flushRealtimeChunk(force) {
     const lag = (wallElapsed - decodedDur).toFixed(1);
     const infMs = data.inference_ms !== undefined ? data.inference_ms.toFixed(0) : "-";
     const decodeLabel = data.decoded ? "已解码" : "待下轮";
+    /* Cache the server-side max_peak for updateAudioMeter to read
+     * without issuing a separate /audio_diag fetch.  Both fields
+     * are piggybacked on /status now. */
+    if (typeof data.max_ingress_peak === "number") {
+      realtimeState.maxSrvPeak = data.max_ingress_peak;
+    } else if (typeof data.max_peak === "number") {
+      realtimeState.maxSrvPeak = data.max_peak;
+    }
     realtimeStatus.textContent = `音频 ${audioDur}s / 已解码 ${decodedDur}s / 耗时 ${wallElapsed}s / 滞后 ${lag}s / 推理 ${infMs}ms / ${decodeLabel} | mic 峰 ${(realtimeState.prePeak||0).toFixed(3)} → 16k 峰 ${(realtimeState.postPeak||0).toFixed(3)}`;
   } catch (error) {
     realtimeStatus.textContent = `失败：${error.message}`;
@@ -688,15 +788,32 @@ async function flushRealtimeChunk(force) {
   }
 }
 
-async function pollRealtimeStatus() {
-  if (!realtimeState.sessionId || realtimeState.sending) {
+/* Subscribe to /api/realtime/stream (Server-Sent Events) for the
+ * active session.  The server pushes one full snapshot on connect,
+ * then a compact "update" event every time the ASR worker commits a
+ * new segment.  This replaces the previous 300ms /status poll loop
+ * (saves ~3.3 req/s) and lets the UI update instantly when a
+ * segment is committed, instead of waiting up to 300ms.
+ *
+ * Lifecycle:
+ *   - Called from startRealtimeCapture after sessionId is set
+ *   - Auto-closes when server sends data: [DONE] (finalize)
+ *   - Manually closed in stopRealtimeCapture before sending /stop
+ *   - The EventSource is stored in realtimeState.sse so the stop
+ *     path can call .close() on it.
+ */
+function openSseStream(sessionId) {
+  if (!realtimeState || realtimeState.sessionId !== sessionId) {
     return;
   }
-  try {
-    const response = await fetch(`/api/realtime/status?session_id=${encodeURIComponent(realtimeState.sessionId)}`);
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.error?.message || "查询实时状态失败");
+  /* Update the meter/display from a snapshot.  Used both for the
+   * initial SSE snapshot and for incremental updates. */
+  const applyUpdate = (data) => {
+    if (!realtimeState || realtimeState.sessionId !== sessionId) return;
+    if (typeof data.max_ingress_peak === "number") {
+      realtimeState.maxSrvPeak = data.max_ingress_peak;
+    } else if (typeof data.max_peak === "number") {
+      realtimeState.maxSrvPeak = data.max_peak;
     }
     renderTranscript(realtimeResult, data, "尚无结果");
     syncRealtimeArchive(data);
@@ -707,9 +824,89 @@ async function pollRealtimeStatus() {
     const infMs = data.inference_ms !== undefined ? data.inference_ms.toFixed(0) : "-";
     const decodeLabel = data.decoded ? "已解码" : "待下轮";
     realtimeStatus.textContent = `音频 ${audioDur}s / 已解码 ${decodedDur}s / 耗时 ${wallElapsed}s / 滞后 ${lag}s / 推理 ${infMs}ms / ${decodeLabel} | mic 峰 ${(realtimeState.prePeak||0).toFixed(3)} → 16k 峰 ${(realtimeState.postPeak||0).toFixed(3)}`;
-  } catch (error) {
-    realtimeStatus.textContent = `失败：${error.message}`;
+  };
+
+  let es;
+  try {
+    es = new EventSource(`/api/realtime/stream?session_id=${encodeURIComponent(sessionId)}`);
+  } catch (err) {
+    realtimeStatus.textContent = `SSE 失败：${err.message}`;
+    return;
   }
+  realtimeState.sse = es;
+  /* Maintain a mirror of segments_text in the client so the
+   * "update" events (which only carry the latest segment) can be
+   * merged into a full snapshot for renderTranscript. */
+  realtimeState.sseSegments = [];
+  realtimeState.sseLastFull = null;
+
+  es.onmessage = (ev) => {
+    if (!realtimeState || realtimeState.sessionId !== sessionId) return;
+    if (ev.data === "[DONE]") {
+      es.close();
+      if (realtimeState) realtimeState.sse = null;
+      return;
+    }
+    let data;
+    try { data = JSON.parse(ev.data); } catch { return; }
+    if (data.type === "update") {
+      /* Merge: take the last full snapshot and append the new
+       * segments to its segments array.  The server sends a
+       * `new_segments` array containing ALL segments committed
+       * since the last SSE event (could be 0, 1, or many — fast
+       * speech can produce 2-3 commits between SSE wakeups).
+       * Previously we only pushed the latest text, so middle
+       * segments were dropped on the client (symptom: "fast
+       * speech loses words"). */
+      if (!realtimeState.sseLastFull) return;
+      if (Array.isArray(data.new_segments) && data.new_segments.length > 0) {
+        for (const seg of data.new_segments) {
+          if (typeof seg === "string" && seg.length > 0) {
+            realtimeState.sseSegments.push(seg);
+          }
+        }
+      }
+      const latestText = realtimeState.sseSegments.length > 0
+        ? realtimeState.sseSegments[realtimeState.sseSegments.length - 1]
+        : "";
+      const merged = Object.assign({}, realtimeState.sseLastFull, {
+         sample_count: data.total_samples,
+         decoded_samples: data.decoded_samples,
+         inference_ms: data.last_inference_ms,
+         last_decode_ran: data.last_decode_ran,
+         max_ingress_peak: data.max_ingress_peak,
+         last_ingress_peak: data.last_ingress_peak,
+         ingress_chunks: data.ingress_chunks,
+         segments: realtimeState.sseSegments.slice(),
+         text: data.text || latestText,
+         stable_text: data.stable_text || latestText,
+         partial_text: data.partial_text || "",
+         live_stable_text: data.live_stable_text || "",
+         live_partial_text: data.live_partial_text || "",
+         live_text: data.live_text || "",
+         display_text: data.display_text || "",
+       });
+       applyUpdate(merged);
+      if (data.finalized) {
+        /* The next message from the server is data: [DONE]; the
+         * onmessage handler will close the connection. */
+      }
+    } else {
+      /* Initial full snapshot. */
+      realtimeState.sseLastFull = data;
+      const segs = Array.isArray(data.segments) ? data.segments.slice() : [];
+      realtimeState.sseSegments = segs;
+      applyUpdate(data);
+    }
+  };
+  es.onerror = () => {
+    /* EventSource auto-reconnects; we don't need to do anything
+     * here.  On finalize, the server sends [DONE] and we close
+     * explicitly.  If the connection is lost before [DONE], the
+     * next reconnect attempt will pick up where we left off (the
+     * server is stateless w.r.t. SSE — it always sends the current
+     * snapshot on connect). */
+  };
 }
 
 async function startRealtimeCapture() {
@@ -757,8 +954,10 @@ async function startRealtimeCapture() {
       mediaStream,
       sessionId: sessionData.session_id,
       sendTimer: window.setInterval(() => flushRealtimeChunk(false), 400),
-      pollTimer: window.setInterval(() => pollRealtimeStatus(), 150),
-      meterTimer: window.setInterval(() => updateAudioMeter(), 100),
+      /* SSE replaces the previous 300ms /status poll.  See
+       * openSseStream.  Saves ~3.3 req/s per session. */
+      sse: null,
+      meterTimer: window.setInterval(() => updateAudioMeter(), 200),
       sending: false,
       pending: [],
       prePeak: 0,
@@ -779,6 +978,11 @@ async function startRealtimeCapture() {
      * "old info preserved, new info appends" rule), stop the
      * typewriter, and append a fresh cursor for the new session. */
     softResetRealtimeArchive(sessionData.session_id);
+    /* Open the SSE stream AFTER realtimeState.sessionId is set so
+     * the onmessage handler can verify the session still matches
+     * before touching UI state.  This drives all segment updates
+     * and the meter display — no more /status polling. */
+    openSseStream(sessionData.session_id);
 
     processor.onaudioprocess = (event) => {
       const channel = event.inputBuffer.getChannelData(0);
@@ -819,20 +1023,14 @@ async function startRealtimeCapture() {
       meterPost.textContent = post.toFixed(3);
       meterPre.style.color = pre > 0.01 ? "#0a0" : "#c00";
       meterPost.style.color = post > 0.01 ? "#0a0" : "#c00";
-      /* Poll the server-side ingress diag endpoint.  Use a fire-and-
-       * forget fetch; failure is fine (server may have restarted).
-       * max_peak 是全程最大, 不会因为末尾静音就掉到 0. */
-      if (realtimeState.sessionId) {
-        fetch(`/api/realtime/audio_diag?session_id=${encodeURIComponent(realtimeState.sessionId)}`)
-          .then(r => r.json())
-          .then(d => {
-            const p = typeof d.max_peak === "number" ? d.max_peak : d.peak;
-            if (typeof p === "number") {
-              meterSrv.textContent = p.toFixed(3);
-              meterSrv.style.color = p > 0.01 ? "#0a0" : "#c00";
-            }
-          })
-          .catch(() => {});
+      /* The server-side max_peak is now piggybacked on every
+       * /api/realtime/status response (pollRealtimeStatus).  No more
+       * separate /audio_diag fetch — saves ~10 req/s.  We update
+       * meterSrv from the latest poll result via realtimeState.maxSrvPeak. */
+      const srv = realtimeState.maxSrvPeak;
+      if (typeof srv === "number") {
+        meterSrv.textContent = srv.toFixed(3);
+        meterSrv.style.color = srv > 0.01 ? "#0a0" : "#c00";
       }
     }
 
@@ -895,7 +1093,16 @@ async function stopRealtimeCapture() {
    * whole "disconnect + fetch" block in a single try/finally. */
   try {
     window.clearInterval(realtimeState.sendTimer);
-    window.clearInterval(realtimeState.pollTimer);
+    /* Close the SSE stream so the server breaks out of its
+     * wait_for and we don't keep an idle connection open.  Do
+     * this before sending /stop — the server's wait predicate
+     * checks `finalized` OR new segment count, but it doesn't
+     * know about the client going away.  EventSource.close()
+     * sends a request to the server to close. */
+    if (realtimeState.sse) {
+      try { realtimeState.sse.close(); } catch {}
+      realtimeState.sse = null;
+    }
     await flushRealtimeChunk(true);
 
     realtimeState.processor.disconnect();
@@ -927,7 +1134,6 @@ async function stopRealtimeCapture() {
       mediaStream: null,
       sessionId: "",
       sendTimer: null,
-      pollTimer: null,
       sending: false,
       pending: [],
       sampleRate: 0,

@@ -268,8 +268,13 @@ do_stop() {
 # ─────────────── 状态 ───────────────
 do_status() {
     local http="http://127.0.0.1:$PORT/api/health"
-    local code
-    code="$(curl -s --max-time 3 -o /dev/null -w '%{http_code}' "$http" 2>/dev/null || echo "000")"
+    local code=""
+    # Retry up to 3 times for resilience during startup
+    for attempt in 1 2 3; do
+        code="$(curl -s --max-time 3 -o /dev/null -w '%{http_code}' "$http" 2>/dev/null || echo "000")"
+        if [[ "$code" == "200" ]]; then break; fi
+        sleep 1
+    done
     if [[ "$code" == "200" ]]; then
         log_ok "HTTP  $http  $(curl -s "$http" | head -c 80)"
     else
@@ -278,7 +283,12 @@ do_status() {
 
     if [[ -f "$PROXY_PID" ]] && kill -0 "$(cat "$PROXY_PID" 2>/dev/null)" 2>/dev/null; then
         local https="https://127.0.0.1:$HTTPS_PORT/api/health"
-        code="$(curl -sk --max-time 3 -o /dev/null -w '%{http_code}' "$https" 2>/dev/null || echo "000")"
+        code=""
+        for attempt in 1 2 3; do
+            code="$(curl -sk --max-time 3 -o /dev/null -w '%{http_code}' "$https" 2>/dev/null || echo "000")"
+            if [[ "$code" == "200" ]]; then break; fi
+            sleep 1
+        done
         if [[ "$code" == "200" ]]; then
             log_ok "HTTPS $https  $(curl -sk "$https" | head -c 80)"
         else
@@ -410,6 +420,7 @@ do_start() {
 
         log_info "等 1-3s 让模型加载..."
         sleep 3
+        do_status
         do_status
         echo
         log_info "停止: $(basename "$0") --stop"

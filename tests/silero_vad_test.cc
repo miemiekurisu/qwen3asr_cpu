@@ -3,10 +3,13 @@
  * exercised too: it must report prob=1.0 always. */
 #include "qwen_silero_vad.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include "tests/test_registry.h"
@@ -127,5 +130,89 @@ QASR_TEST(SileroVadResetClearsState) {
     std::vector<float> silent(QWEN_SILERO_VAD_CHUNK * 16, 0.0f);
     qwen_silero_vad_process(v, silent.data(), (int)silent.size(), &p);
     QASR_EXPECT(p < 0.4f);
+    qwen_silero_vad_destroy(v);
+}
+
+QASR_TEST(SileroVadConcurrentAccess) {
+    /* Regression test: multiple sessions (threads) share the same
+     * VAD instance.  Without a mutex the VAD's shared LSTM / context
+     * buffers race and produce corrupted probabilities.  This test
+     * verifies that mutex-protected concurrent access is safe.
+     *
+     * See docs/INCIDENTS.md 2026-06-05 VAD shared + mutex. */
+    qwen_silero_vad_t *v = qwen_silero_vad_create(nullptr);
+    QASR_EXPECT(v != nullptr);
+    const int num_threads = 4;
+    const int iters_per_thread = 20;
+    std::mutex mu;
+    std::atomic<int> errors{0};
+    std::vector<std::thread> threads;
+
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&, t]() {
+            std::vector<float> audio(QWEN_SILERO_VAD_CHUNK * 4);
+            fill_sine(audio, 400.0f + t * 100.0f, 16000, 0.3f + t * 0.1f);
+            for (int i = 0; i < iters_per_thread; ++i) {
+                float prob = -1.0f;
+                {
+                    std::lock_guard<std::mutex> lock(mu);
+                    if (qwen_silero_vad_process(v, audio.data(),
+                            (int)audio.size(), &prob) != 0) {
+                        errors.fetch_add(1);
+                    }
+                }
+                /* Verify the probability is valid (in [0, 1]).
+                 * A corrupted VAD might return NaN or -1.0. */
+                if (prob < 0.0f || prob > 1.0f) {
+                    errors.fetch_add(1);
+                }
+            }
+        });
+    }
+
+    for (auto &th : threads) th.join();
+    /* All threads should have completed without errors. */
+    QASR_EXPECT_EQ(errors.load(), 0);
+    qwen_silero_vad_destroy(v);
+}
+
+QASR_TEST(SileroVadConcurrentReset) {
+    /* Regression test: one thread processes VAD while another resets.
+     * Without a mutex the reset can zero out the LSTM state mid-
+     * process, producing garbage probabilities. */
+    qwen_silero_vad_t *v = qwen_silero_vad_create(nullptr);
+    QASR_EXPECT(v != nullptr);
+    std::mutex mu;
+    std::atomic<int> errors{0};
+    const int rounds = 50;
+    std::vector<float> audio(QWEN_SILERO_VAD_CHUNK * 4);
+    fill_sine(audio, 440.0f, 16000, 0.5f);
+
+    /* Thread 0: repeatedly process audio */
+    std::thread proc([&, v, &mu]() {
+        for (int i = 0; i < rounds; ++i) {
+            float prob = -1.0f;
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                if (qwen_silero_vad_process(v, audio.data(),
+                        (int)audio.size(), &prob) != 0) {
+                    errors.fetch_add(1);
+                }
+            }
+            if (prob < 0.0f || prob > 1.0f) errors.fetch_add(1);
+        }
+    });
+
+    /* Thread 1: repeatedly reset */
+    std::thread rst([&, v]() {
+        for (int i = 0; i < rounds; ++i) {
+            std::lock_guard<std::mutex> lock(mu);
+            qwen_silero_vad_reset(v);
+        }
+    });
+
+    proc.join();
+    rst.join();
+    QASR_EXPECT_EQ(errors.load(), 0);
     qwen_silero_vad_destroy(v);
 }
