@@ -5,21 +5,22 @@
 #include <initializer_list>
 #include <limits>
 
+#include "qasr/base/utf8.h"
+
 namespace qasr {
 namespace {
 
 constexpr std::size_t kNoPendingUnstable = std::numeric_limits<std::size_t>::max();
 constexpr std::size_t kForcedTailGuardCodepoints = 4;
 constexpr std::size_t kForcedTailMinCodepoints = 8;
-constexpr std::size_t kRecentSegmentLimit = 2;
+constexpr std::size_t kRecentSegmentLimit = 1000;
 constexpr std::size_t kSoftClauseMinCodepoints = 8;
 constexpr std::size_t kSoftClauseTailCodepoints = 6;
 constexpr std::size_t kSoftSegmentCodepoints = 32;
 constexpr std::size_t kHardSegmentCodepoints = 64;
 
-bool IsUtf8Continuation(unsigned char byte) {
-    return (byte & 0xC0U) == 0x80U;
-}
+using qasr::base::CountUtf8Codepoints;
+using qasr::base::IsUtf8Continuation;
 
 std::size_t SnapUtf8Boundary(std::string_view text, std::size_t size) {
     if (size >= text.size()) {
@@ -87,17 +88,6 @@ std::string TrimAsciiWordTail(std::string_view text) {
         return {};
     }
     return std::string(text.substr(0, end));
-}
-
-std::size_t CountUtf8Codepoints(std::string_view text) {
-    std::size_t count = 0;
-    for (const char ch : text) {
-        const unsigned char byte = static_cast<unsigned char>(ch);
-        if (!IsUtf8Continuation(byte)) {
-            ++count;
-        }
-    }
-    return count;
 }
 
 std::string DropLastUtf8Codepoints(std::string_view text, std::size_t count) {
@@ -315,13 +305,36 @@ std::string ForceFreezePrefix(std::string_view text) {
 RealtimeTextUpdate BuildRealtimeTextUpdate(
     const RealtimeTextState & state,
     std::string_view latest_text,
-    bool committed) {
+    bool committed,
+    std::string_view lcp_with_previous,
+    CommitStrategy commit_strategy) {
     RealtimeTextUpdate update;
     update.committed = committed;
     update.stable_text = state.stable_text;
     if (StartsWith(latest_text, state.stable_text)) {
-        update.partial_text = std::string(latest_text.substr(state.stable_text.size()));
+        const std::size_t stable_size = state.stable_text.size();
+        const std::string_view after_stable = latest_text.substr(stable_size);
+        if (commit_strategy == CommitStrategy::kConsensus2x) {
+            const std::size_t lcp_size = lcp_with_previous.size();
+            const std::size_t agreed_end = lcp_size > stable_size ? lcp_size : stable_size;
+            if (agreed_end > stable_size) {
+                update.partial_text = std::string(latest_text.substr(
+                    stable_size, agreed_end - stable_size));
+            }
+            if (agreed_end < latest_text.size()) {
+                update.tentative_text = std::string(latest_text.substr(agreed_end));
+            }
+        } else {
+            update.partial_text = std::string(after_stable);
+        }
         update.text = state.stable_text + update.partial_text;
+    } else if (commit_strategy == CommitStrategy::kConsensus2x &&
+               StartsWith(state.stable_text, latest_text)) {
+        update.partial_text.clear();
+        if (!latest_text.empty()) {
+            update.tentative_text = std::string(latest_text);
+        }
+        update.text = state.stable_text;
     } else {
         update.stable_text.clear();
         update.partial_text = std::string(latest_text);
@@ -408,7 +421,8 @@ Status AdvanceRealtimeTextState(
         state->last_text = state->stable_text;
         state->last_decode_samples = total_samples;
         state->unstable_since_samples = kNoPendingUnstable;
-        *update = BuildRealtimeTextUpdate(*state, state->stable_text, committed);
+        *update = BuildRealtimeTextUpdate(*state, state->stable_text, committed,
+                                         state->stable_text, config.commit_strategy);
         update->partial_text.clear();
         update->text = update->stable_text;
         return OkStatus();
@@ -419,7 +433,8 @@ Status AdvanceRealtimeTextState(
         state->last_text = std::string(latest_text);
         state->last_decode_samples = total_samples;
         state->unstable_since_samples = latest_text.empty() ? kNoPendingUnstable : total_samples;
-        *update = BuildRealtimeTextUpdate(*state, latest_text, false);
+        *update = BuildRealtimeTextUpdate(*state, latest_text, false, latest_text,
+                                         config.commit_strategy);
         return OkStatus();
     }
 
@@ -459,7 +474,8 @@ Status AdvanceRealtimeTextState(
         state->unstable_since_samples = kNoPendingUnstable;
     }
 
-    *update = BuildRealtimeTextUpdate(*state, latest_text, committed);
+    *update = BuildRealtimeTextUpdate(*state, latest_text, committed, common_prefix,
+                                     config.commit_strategy);
     return OkStatus();
 }
 
@@ -472,12 +488,38 @@ Status AdvanceRealtimeDisplayState(
         return Status(StatusCode::kInvalidArgument, "state and snapshot must not be null");
     }
 
-    if (StartsWith(text_update.stable_text, state->last_stable_text)) {
-        state->live_stable_text += std::string(text_update.stable_text.substr(state->last_stable_text.size()));
-        state->last_stable_text = text_update.stable_text;
-    } else if (state->last_stable_text.empty()) {
+    /* Update live_stable_text to match the C layer's current view.
+     *
+     * Three cases:
+     *  1. First chunk (last_stable_text empty) → take the new text
+     *     as the initial stable.
+     *  2. Extension (new stable extends old with the same prefix) →
+     *     append only the new tail.  This is the common incremental
+     *     growth case where the model adds tokens to its already-
+     *     committed prefix.
+     *  3. Revision (new stable does NOT extend old) → the C layer
+     *     detected the model changed its mind about already-committed
+     *     tokens (e.g. it initially decoded "试一哈" then re-decoded
+     *     the prefix and settled on "一次").  Take the new text as
+     *     the source of truth so the UI shows the latest (correct)
+     *     interpretation rather than the stale rejected text.  The
+     *     user briefly sees the wrong text but the most-recent decode
+     *     is more accurate than a frozen older one. */
+    if (state->last_stable_text.empty()) {
         state->last_stable_text = text_update.stable_text;
         state->live_stable_text = text_update.stable_text;
+    } else if (text_update.stable_text.size() >= state->last_stable_text.size() &&
+               text_update.stable_text.compare(0, state->last_stable_text.size(),
+                                                state->last_stable_text) == 0) {
+        state->live_stable_text += text_update.stable_text.substr(state->last_stable_text.size());
+        state->last_stable_text = text_update.stable_text;
+    } else if (!text_update.stable_text.empty()) {
+        /* Revision: the C layer's stable_text now reflects the
+         * model's revised interpretation.  Replace live_stable so
+         * the user sees the latest (correct) text rather than the
+         * stale (rejected) version. */
+        state->live_stable_text = text_update.stable_text;
+        state->last_stable_text = text_update.stable_text;
     }
 
     state->live_partial_text = text_update.partial_text;

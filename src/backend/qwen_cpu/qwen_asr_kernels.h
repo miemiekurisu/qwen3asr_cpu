@@ -206,9 +206,27 @@ void qwen_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals
                             int seq, int n_heads, int head_dim);
 
 /* Streaming argmax: finds argmax(W_bf16 @ x) without materializing full logits.
- * Returns the index of the row with highest dot product. */
+ * Returns the index of the row with highest dot product.
+ *
+ * Optional early termination (CPU-agnostic, provably correct):
+ *   suffix_max[r] = max over rows r..N-1 of max(|W[row][k]|).
+ *   L1_x = sum_k |x[k]|.
+ *   Once best_val >= L1_x * suffix_max[r+1] for some processed r, all
+ *   unprocessed rows are bounded above by that product, so the answer
+ *   is provably current best. Pass suffix_max=NULL to disable.
+ * Memory: caller owns suffix_max; init via qwen_compute_suffix_max_bf16(). */
 int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
-                             int in_dim, int out_dim);
+                             int in_dim, int out_dim,
+                             const float *suffix_max, float L1_x);
+
+/* Build suffix_max[r] = max over rows r..N-1 of max(|W_bf16[row][k]|).
+ * Pure C, no SIMD — runs on any CPU (ARM/Atom/etc). Out_dim × float.
+ * Returns NULL on alloc failure. */
+float *qwen_compute_suffix_max_bf16(const uint16_t *W_bf16,
+                                     int n_rows, int in_dim);
+
+/* L1 norm: sum_k |x[k]|. Pure C scalar with optional AVX2 fast-path. */
+float qwen_l1_norm_f32(const float *x, int n);
 
 /* ========================================================================
  * Threading

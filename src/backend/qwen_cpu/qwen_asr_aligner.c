@@ -542,7 +542,8 @@ qwen_align_result_t *qwen_forced_align(qwen_ctx_t *ctx,
         float *h = hidden + (size_t)pos * dim;
         /* Apply lm_head [classify_num, hidden] -> argmax */
         int class_id = qwen_argmax_matvec_bf16(h, ctx->decoder.lm_head_bf16,
-                                                dim, classify_num);
+                                                dim, classify_num,
+                                                ctx->decoder.lm_head_suffix_max, 0.0f);
         raw_timestamps[i] = class_id;
     }
     free(ts_positions);

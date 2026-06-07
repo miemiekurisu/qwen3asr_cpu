@@ -1,5 +1,12 @@
-$base = "http://127.0.0.1:8082"
-$wavPath = "D:\workspace\github\qwen-asr-provider\testfile\long.wav"
+# Test streaming upload (long audio) via raw HTTP chunked upload.
+#
+# Env vars (override at top of script or in caller scope):
+#   $env:QASR_TEST_SERVER  default http://127.0.0.1:19991  (qasr_server --port default)
+#   $env:QASR_TEST_AUDIO   default testfile/english_60s.wav
+$base = $env:QASR_TEST_SERVER
+if (-not $base) { $base = "http://127.0.0.1:19991" }
+$wavPath = $env:QASR_TEST_AUDIO
+if (-not $wavPath) { $wavPath = "testfile/english_60s.wav" }
 
 # Read WAV file
 $bytes = [System.IO.File]::ReadAllBytes($wavPath)

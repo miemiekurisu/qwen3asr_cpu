@@ -1,0 +1,28 @@
+{
+  "name": "qwen3asr_cpu",
+  "version": "0.9.5",
+  "description": "Qwen3-ASR 的 CPU 推理服务与命令行工具，使用 C/C++17 实现。项目提供本地离线转写、字幕输出、HTTP API、内置 Web UI，以及面向 Windows / Linux / macOS 的 CPU 构建路径。",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/miemiekurisu/qwen3asr_cpu.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/miemiekurisu/qwen3asr_cpu/issues"
+  },
+  "homepage": "https://github.com/miemiekurisu/qwen3asr_cpu#readme",
+  "devDependencies": {
+    "jsdom": "^29.1.1"
+  }
+}
