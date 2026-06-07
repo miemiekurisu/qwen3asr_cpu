@@ -3096,6 +3096,47 @@ int RunServer(const ServerConfig & config) {
     SharedAsrModel *const realtime_model =
         share_model ? batch_model : realtime_model_storage.get();
 
+    /* Warmup: run a dummy inference on each loaded model to trigger
+     * oneDNN JIT compilation and warm CPU caches.  Uses a clone so
+     * we don't hold the SharedAsrModel mutex while inferring.
+     * Runs synchronously before the HTTP server starts listening, so
+     * the first real request is not penalised. */
+    {
+        auto do_warmup = [&](SharedAsrModel * model, const char * label) {
+            qwen_ctx_t * ctx = model->CreateRealtimeClone();
+            if (!ctx) {
+                if (qwen_verbose >= 1) {
+                    std::fprintf(stderr, "warmup: %s clone failed, skipping\n", label);
+                }
+                return;
+            }
+            /* 1 s of silence at 16 kHz — minimal but enough to trigger
+             * full encoder → decoder pipeline and oneDNN JIT compile. */
+            const int n_samples = 16000;
+            std::vector<float> silence(n_samples, 0.0f);
+            ctx->stream_max_new_tokens = 0;
+            ctx->stream_chunk_sec = 0.0f;
+            ctx->segment_sec = 0.0f;
+            ctx->search_sec = 0.0f;
+            ctx->past_text_conditioning = 0;
+
+            const auto t0 = std::chrono::steady_clock::now();
+            char * raw = qwen_transcribe_audio(ctx, silence.data(), n_samples);
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            std::free(raw);
+            qwen_free(ctx);
+            if (qwen_verbose >= 1) {
+                std::fprintf(stderr, "warmup: %s completed in %.0f ms\n", label, ms);
+            }
+        };
+
+        do_warmup(batch_model, "batch");
+        if (!share_model) {
+            do_warmup(realtime_model, "realtime");
+        }
+    }
+
     const std::string served_model_id = ResolveServedModelId(config.model_dir);
     const fs::path ui_dir(config.ui_dir);
     const RealtimePolicyConfig realtime_policy;
@@ -3305,20 +3346,31 @@ int RunServer(const ServerConfig & config) {
                                                                  "ich" in "ichthyosaurus")
                                                                  that the VAD often misses. */
     constexpr int kVadPostRollMs = 500;                  /* post-roll: include up to
-                                                                 300 ms of audio AFTER the
-                                                                 last VAD-said-speech frame,
-                                                                so trailing phoneme decay is
-                                                                preserved.  ASR gets
-                                                                [speech_start - 250 ms,
-                                                                 last_speech + 300 ms]. */
-    constexpr int kVadSegmentMaxSamples = 15 * 16000;     /* 15 s soft cap (was 10s→20s→15s).
-                                                                 Compromise: larger context than 10s
-                                                                 reduces boundary word-eating, but
-                                                                 inference time is only 1.5x vs 10s
-                                                                 (not 2x as 20s was).  Accuracy for
-                                                                 the final text is handled by a
-                                                                 post-stop full-audio retranscription
-                                                                 (see FinalizeRealtimeSession). */
+                                                                  300 ms of audio AFTER the
+                                                                  last VAD-said-speech frame,
+                                                                 so trailing phoneme decay is
+                                                                 preserved.  ASR gets
+                                                                 [speech_start - 250 ms,
+                                                                  last_speech + 300 ms]. */
+   /* Soft-cap with grace: when buffer reaches the soft deadline, enter
+     * a grace period (up to 800ms) to look for a short acoustic valley.
+     * If a valley of >= 256ms silence appears, emit at the valley.
+     * If grace expires, emit forced.  If hard cap reached, emit hard.
+     * This avoids cutting directly inside active speech.
+     *
+     * Phase 1 (safe): keep soft deadline at 15s, only add grace.
+     * Phase 2 (low-latency 0.6B): soft deadline 8s, hard cap 10s. */
+    constexpr int kVadSegmentSoftDeadlineSamples = 15 * 16000;
+    constexpr int kVadSegmentSoftGraceMs = 800;
+    constexpr int kVadSegmentHardCapSamples =
+        kVadSegmentSoftDeadlineSamples +
+        (kVadSegmentSoftGraceMs * 16000 / 1000);  /* 15.8s */
+    /* Short acoustic valley after soft deadline.
+     * 256ms = 8 VAD frames at 32ms.
+     * Intentionally shorter than kVadSegmentSilenceMs=1500ms.
+     * This is not a full pause — just enough to avoid cutting mid-speech. */
+    constexpr int kVadSoftcapValleySilenceMs = 256;
+    /* NOTE: merge_grace / overlap prepending was REMOVED after
     /* NOTE: merge_grace / overlap prepending was REMOVED after
      * testing showed the ASR re-transcribes the prepended tail with
      * slightly different text than the original (same audio, different
@@ -3387,13 +3439,25 @@ int RunServer(const ServerConfig & config) {
 
         /* State: current accumulating segment. */
         std::vector<float> segment_buffer;
-        segment_buffer.reserve(kVadSegmentMaxSamples * 2);
+        segment_buffer.reserve(kVadSegmentHardCapSamples * 2);
         PreRollBuffer preroll(preroll_samples);
         int64_t consumed_samples = 0;
         int silence_run_ms = 0;
         bool segment_active = false;
         int speech_start_offset = -1;   /* sample offset in segment_buffer of first VAD-said-speech frame; -1 = none yet */
         int last_speech_offset = -1;    /* sample offset in segment_buffer of last VAD-said-speech frame; -1 = none yet */
+
+        /* State: softcap grace — entered when buffer exceeds soft deadline.
+           * Waits for a short acoustic valley before emitting, to avoid
+           * cutting mid-speech.  Max grace = kVadSegmentSoftGraceMs. */
+        bool softcap_grace_active = false;
+        std::int64_t softcap_grace_start_ms = 0;
+        int softcap_grace_enter_silence_ms = 0;
+
+        auto steady_ms = []() -> std::int64_t {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        };
 
         /* State: pending short segment (a sub-min_emit segment held in
          * case more speech arrives within kVadShortMergeGapMs). */
@@ -3429,6 +3493,16 @@ int RunServer(const ServerConfig & config) {
             return true;
         };
 
+        /* Helper: check if reason is a forced-emit (soft-cap or eof) where
+          * we should emit even if VAD never saw speech. */
+        auto is_forced_emit_reason = [](const char * reason) -> bool {
+            return std::strcmp(reason, "softcap_valley") == 0 ||
+                   std::strcmp(reason, "softcap_forced") == 0 ||
+                   std::strcmp(reason, "softcap_hard") == 0 ||
+                   std::strcmp(reason, "eof") == 0 ||
+                   std::strcmp(reason, "eof_stop") == 0;
+        };
+
         /* Helper: build & push an AudioSegment from segment_buffer,
          * with pre-roll prepended (from preroll ring buffer) and
          * trailing silence trimmed to last_speech + post_roll. */
@@ -3438,6 +3512,11 @@ int RunServer(const ServerConfig & config) {
                 segment_active = false;
                 speech_start_offset = -1;
                 last_speech_offset = -1;
+
+                softcap_grace_active = false;
+                softcap_grace_start_ms = 0;
+                softcap_grace_enter_silence_ms = 0;
+
                 return true;
             }
             std::vector<float> emit_samples;
@@ -3468,9 +3547,7 @@ int RunServer(const ServerConfig & config) {
                                         segment_buffer.begin() + start_offset,
                                         segment_buffer.begin() + end_offset);
                 }
-            } else if (std::strcmp(reason, "10s_soft_cap") == 0 ||
-                       std::strcmp(reason, "eof") == 0 ||
-                       std::strcmp(reason, "eof_stop") == 0) {
+            } else if (is_forced_emit_reason(reason)) {
                 /* Soft-cap or stop: even if VAD never saw speech, emit
                  * whatever audio we have.  The ASR may still produce
                  * text (e.g. low-volume speech the VAD missed, or the
@@ -3486,6 +3563,11 @@ int RunServer(const ServerConfig & config) {
                 segment_active = false;
                 speech_start_offset = -1;
                 last_speech_offset = -1;
+
+                softcap_grace_active = false;
+                softcap_grace_start_ms = 0;
+                softcap_grace_enter_silence_ms = 0;
+
                 return true;
             }
             if (qwen_verbose >= 1) {
@@ -3506,11 +3588,16 @@ int RunServer(const ServerConfig & config) {
                 return false;
             }
             segment_buffer.clear();
-            segment_buffer.reserve(kVadSegmentMaxSamples * 2);
+            segment_buffer.reserve(kVadSegmentHardCapSamples * 2);
             silence_run_ms = 0;
             segment_active = false;
             speech_start_offset = -1;
             last_speech_offset = -1;
+
+            softcap_grace_active = false;
+            softcap_grace_start_ms = 0;
+            softcap_grace_enter_silence_ms = 0;
+
             return true;
         };
 
@@ -3850,7 +3937,7 @@ int RunServer(const ServerConfig & config) {
             const bool silence_elapsed = segment_active && silence_run_ms >= kVadSegmentSilenceMs;
             const bool buf_long_enough = buf_samples >= kVadSegmentMinEmitSamples;
             const bool buf_min_valid = buf_samples >= kVadSegmentMinValidSamples;
-            const bool buf_soft_cap = buf_samples >= kVadSegmentMaxSamples;
+            const bool buf_soft_deadline = buf_samples >= kVadSegmentSoftDeadlineSamples;
 
             /* Commit / save-as-pending decision. */
             if (silence_elapsed && buf_long_enough && pending_buffer.empty()) {
@@ -3864,7 +3951,7 @@ int RunServer(const ServerConfig & config) {
                 if (!emit_segment_buffer("vad_silence")) {
                     break;
                 }
-            } else if (silence_elapsed && buf_min_valid && pending_buffer.empty()) {
+           } else if (silence_elapsed && buf_min_valid && pending_buffer.empty()) {
                 /* Short segment (>= min_valid, < min_emit), no pending
                  * yet: save as pending for possible merge. */
                 pending_buffer = std::move(segment_buffer);
@@ -3878,28 +3965,96 @@ int RunServer(const ServerConfig & config) {
                         (double)pending_buffer.size() / 16000.0, kVadShortMergeGapMs);
                 }
                 segment_buffer.clear();
-                segment_buffer.reserve(kVadSegmentMaxSamples * 2);
+                segment_buffer.reserve(kVadSegmentHardCapSamples * 2);
                 silence_run_ms = 0;
                 segment_active = false;
                 speech_start_offset = -1;
                 last_speech_offset = -1;
-            } else if (buf_soft_cap) {
-                /* 10s soft cap: force commit regardless of silence. */
-                if (qwen_verbose >= 1) {
-                    std::fprintf(stderr,
-                        "VAD-facade: 10s soft cap reached, forcing commit (buf=%.2fs)\n",
-                        (double)buf_samples / 16000.0);
-                }
-                /* If we have a pending, emit it first to preserve order. */
-                if (!pending_buffer.empty()) {
-                    if (!emit_buffer(&pending_buffer, pending_last_speech_offset, "pending_pre_softcap")) {
-                        break;
+
+                softcap_grace_active = false;
+                softcap_grace_start_ms = 0;
+                softcap_grace_enter_silence_ms = 0;
+
+            } else if (buf_soft_deadline) {
+                /* Soft-cap grace: buffer reached soft deadline.
+                 * Enter grace period — wait for a short acoustic valley
+                 * (>= kVadSoftcapValleySilenceMs) or grace expiry or hard cap. */
+                {
+                    const int64_t now_ms = steady_ms();
+                    const bool buf_hard_cap = buf_samples >= kVadSegmentHardCapSamples;
+
+                    if (!softcap_grace_active) {
+                        softcap_grace_active = true;
+                        softcap_grace_start_ms = now_ms;
+                        softcap_grace_enter_silence_ms = silence_run_ms;
+
+                        if (qwen_verbose >= 1) {
+                            std::fprintf(stderr,
+                                "VAD-facade: softcap grace enter buf=%.2fs "
+                                "silence_run=%dms grace=%dms hard=%.2fs\n",
+                                (double)buf_samples / 16000.0,
+                                silence_run_ms,
+                                kVadSegmentSoftGraceMs,
+                                (double)kVadSegmentHardCapSamples / 16000.0);
+                        }
+
+                        RT_LOG("VadFacadeLoop sid=%s softcap_grace_enter buf=%.2fs silence=%d",
+                               session->id.c_str(),
+                               (double)buf_samples / 16000.0,
+                               silence_run_ms);
                     }
-                    pending_last_speech_offset = -1;
-                    pending_expire_at_ms = 0;
-                }
-                if (!emit_segment_buffer("10s_soft_cap")) {
-                    break;
+
+                    const int64_t grace_wait_ms = now_ms - softcap_grace_start_ms;
+
+                    /* Low-risk cut: after soft deadline, a short non-speech
+                     * valley is enough to avoid cutting directly inside active
+                     * speech.  We do NOT wait for the full 1500ms vad_silence. */
+                    const bool valley_cut =
+                        segment_active && silence_run_ms >= kVadSoftcapValleySilenceMs;
+
+                    const bool grace_expired =
+                        grace_wait_ms >= kVadSegmentSoftGraceMs;
+
+                    const bool should_emit_softcap =
+                        valley_cut || grace_expired || buf_hard_cap;
+
+                    if (should_emit_softcap) {
+                        const char * reason =
+                            valley_cut ? "softcap_valley"
+                                : (buf_hard_cap ? "softcap_hard" : "softcap_forced");
+
+                        if (qwen_verbose >= 1) {
+                            std::fprintf(stderr,
+                                "VAD-facade: softcap emit reason=%s buf=%.2fs "
+                                "grace_wait=%lldms silence_run=%dms\n",
+                                reason,
+                                (double)buf_samples / 16000.0,
+                                (long long)grace_wait_ms,
+                                silence_run_ms);
+                        }
+
+                        RT_LOG("VadFacadeLoop sid=%s softcap_emit reason=%s buf=%.2fs "
+                               "grace_wait=%lld silence=%d queue=%zu",
+                               session->id.c_str(),
+                               reason,
+                               (double)buf_samples / 16000.0,
+                               (long long)grace_wait_ms,
+                               silence_run_ms,
+                               queue->Size());
+
+                        /* If we have a pending, emit it first to preserve order. */
+                        if (!pending_buffer.empty()) {
+                            if (!emit_buffer(&pending_buffer, pending_last_speech_offset, "pending_pre_softcap")) {
+                                break;
+                            }
+                            pending_last_speech_offset = -1;
+                            pending_expire_at_ms = 0;
+                        }
+
+                        if (!emit_segment_buffer(reason)) {
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -4365,92 +4520,114 @@ int RunServer(const ServerConfig & config) {
         RT_LOG("FinalizeRealtimeSession sid=%s join returned", session_id.c_str());
 
        {
+              std::lock_guard<std::mutex> lock(session->mu);
+              session->live_worker.reset();
+              session->finalized = true;
+          }
+          metrics.realtime_finalizations.fetch_add(1);
+
+          /* Snapshot VAD-segmented results immediately so the stop
+            * handler can return without blocking on retranscription.
+            * Full-audio retranscription runs asynchronously below. */
+         {
              std::lock_guard<std::mutex> lock(session->mu);
-             session->live_worker.reset();
-             session->finalized = true;
+             snapshot->id       = session_id;
+             snapshot->model    = session->model;
+             snapshot->language = session->language;
+             snapshot->total_samples   = session->total_samples;
+             snapshot->decoded_samples = session->decoded_samples;
+             snapshot->retained_sample_count  = session->full_audio.size()
+                                                 - session->retained_sample_offset;
+             snapshot->retained_sample_offset = session->retained_sample_offset;
+             snapshot->segments_text  = session->segments_text;
+             snapshot->text           = session->text;
+             snapshot->stable_text    = session->stable_text;
+             snapshot->partial_text   = session->partial_text;
+             snapshot->last_inference_ms  = session->last_inference_ms;
+             snapshot->last_decode_ran    = session->last_decode_ran;
+             snapshot->finalized        = true;
+             snapshot->error            = session->error;
+             snapshot->last_ingress_peak   = session->last_ingress_peak;
+             snapshot->last_ingress_rms    = session->last_ingress_rms;
+             snapshot->max_ingress_peak    = session->max_ingress_peak;
+             snapshot->ingress_chunks      = session->ingress_chunks;
          }
-         metrics.realtime_finalizations.fetch_add(1);
+         if (!snapshot->error.empty()) {
+             return Status(StatusCode::kInternal, snapshot->error);
+         }
 
-         /* Post-stop full-audio retranscription: use the larger batch
-           * model (1.7B) to retranscribe the complete audio.  The
-           * bigger model has more capacity for long audio and produces
-           * correct word order that the 0.6B realtime model misses. */
-          {
-              qwen_ctx_t * reconcile_ctx = batch_model->CreateRealtimeClone();
-             if (reconcile_ctx && session->full_audio.size() > 1024) {
-                 reconcile_ctx->segment_sec = 0.0f;
-                 reconcile_ctx->search_sec = 0.0f;
-                 reconcile_ctx->past_text_conditioning = 0;
-                 reconcile_ctx->stream_chunk_sec = 0.0f;
-                 reconcile_ctx->stream_max_new_tokens = 0;
-                 if (!session->language.empty()) {
-                     qwen_set_force_language(reconcile_ctx, session->language.c_str());
+         /* Post-stop full-audio retranscription runs on a detached
+           * background thread.  It uses the larger batch model to
+           * retranscribe the complete audio for higher quality.
+           * Result updates session->text when ready — the session
+           * shared_ptr keeps the object alive. */
+         {
+             std::shared_ptr<RealtimeSession> ssn = session;
+             std::string sid = session_id;
+             std::string lang = session->language;
+             std::vector<float> audioCopy = session->full_audio;
+             std::string vadText;
+             {
+                 std::lock_guard<std::mutex> lock(session->mu);
+                 for (const auto & s : session->segments_text) {
+                     if (!vadText.empty()) vadText += " ";
+                     vadText += s;
                  }
-                 qwen_set_prompt(reconcile_ctx, nullptr);
-
-                 char * raw = qwen_transcribe_audio(reconcile_ctx,
-                     session->full_audio.data(),
-                     static_cast<int>(session->full_audio.size()));
-                 if (raw) {
-                     std::string full_text(raw);
-                     std::free(raw);
-                     /* Trim trailing whitespace. */
-                     while (!full_text.empty() &&
-                            (full_text.back() == ' ' || full_text.back() == '\n' || full_text.back() == '\t')) {
-                         full_text.pop_back();
+             }
+      std::thread([ssn, sid, lang, bm = batch_model, audioCopy = std::move(audioCopy),
+                           vadText = std::move(vadText)]() mutable {
+                  qwen_ctx_t * reconcile_ctx = bm->CreateRealtimeClone();
+                 if (reconcile_ctx && audioCopy.size() > 1024) {
+                     reconcile_ctx->segment_sec = 0.0f;
+                     reconcile_ctx->search_sec = 0.0f;
+                     reconcile_ctx->past_text_conditioning = 0;
+                     reconcile_ctx->stream_chunk_sec = 0.0f;
+                     reconcile_ctx->stream_max_new_tokens = 0;
+                     if (!lang.empty()) {
+                         qwen_set_force_language(reconcile_ctx, lang.c_str());
                      }
-                     std::string vad_text;
-                     {
-                         std::lock_guard<std::mutex> lock(session->mu);
-                         for (const auto & s : session->segments_text) {
-                             if (!vad_text.empty()) vad_text += " ";
-                             vad_text += s;
+                     qwen_set_prompt(reconcile_ctx, nullptr);
+
+                     char * raw = qwen_transcribe_audio(reconcile_ctx,
+                         audioCopy.data(),
+                         static_cast<int>(audioCopy.size()));
+                     if (raw) {
+                         std::string full_text(raw);
+                         std::free(raw);
+                         while (!full_text.empty() &&
+                                (full_text.back() == ' ' || full_text.back() == '\n' || full_text.back() == '\t')) {
+                             full_text.pop_back();
+                         }
+                         if (!full_text.empty() &&
+                             full_text.size() >= vadText.size() * 0.9) {
+                             if (qwen_verbose >= 1) {
+                                 std::fprintf(stderr,
+                                     "RECONCILE sid=%s: replacing VAD text (%zd chars) "
+                                     "with retranscribed (%zd chars)\n",
+                                     sid.c_str(), vadText.size(), full_text.size());
+                             }
+                             std::lock_guard<std::mutex> lock(ssn->mu);
+                             ssn->segments_text.clear();
+                             ssn->segments_text.push_back(full_text);
+                             ssn->text = full_text;
+                             ssn->stable_text = full_text;
+                             ssn->sse_cv.notify_all();
+                         } else if (!full_text.empty() && qwen_verbose >= 1) {
+                             std::fprintf(stderr,
+                                 "RECONCILE sid=%s: retranscribed (%zd) shorter than "
+                                 "VAD (%zd), keeping VAD text\n",
+                                 sid.c_str(), full_text.size(), vadText.size());
                          }
                      }
-                     /* Only replace when the full-audio decode is not
-                       * significantly shorter than the VAD-segmented
-                       * text.  A shorter result means the model hit its
-                       * context limit and dropped content.  Keep VAD
-                       * segments in that case since they captured more. */
-                      if (!full_text.empty() &&
-                          full_text.size() >= vad_text.size() * 0.9) {
-                          if (qwen_verbose >= 1) {
-                              std::fprintf(stderr,
-                                  "RECONCILE sid=%s: replacing VAD text (%zd chars) "
-                                  "with retranscribed (%zd chars)\n",
-                                  session_id.c_str(),
-                                  vad_text.size(), full_text.size());
-                          }
-                          {
-                              std::lock_guard<std::mutex> lock(session->mu);
-                              session->segments_text.clear();
-                              session->segments_text.push_back(full_text);
-                              session->text = full_text;
-                              session->stable_text = full_text;
-                          }
-                      } else if (!full_text.empty() && qwen_verbose >= 1) {
-                          std::fprintf(stderr,
-                              "RECONCILE sid=%s: retranscribed (%zd) shorter than "
-                              "VAD (%zd), keeping VAD text\n",
-                              session_id.c_str(),
-                              full_text.size(), vad_text.size());
-                      }
+                     qwen_free(reconcile_ctx);
+                 } else if (reconcile_ctx) {
+                     qwen_free(reconcile_ctx);
                  }
-                 qwen_free(reconcile_ctx);
-             } else if (reconcile_ctx) {
-                 qwen_free(reconcile_ctx);
-             }
+             }).detach();
          }
 
-         Status status = SnapshotRealtimeSessionState(session, false, snapshot);
-        if (!status.ok()) {
-            return status;
-        }
-        if (!snapshot->error.empty()) {
-            return Status(StatusCode::kInternal, snapshot->error);
-        }
-        return OkStatus();
-    };
+         return OkStatus();
+     };
 
     server.Get("/", [&](const HttpRequest &, HttpResponse & response) {
         ServeStaticTextFile(response, ui_dir / "index.html", "text/html; charset=utf-8", "index.html");
@@ -5358,7 +5535,7 @@ int RunServer(const ServerConfig & config) {
         while (true) {
             #if defined(_WIN32)
                 DWORD bytes_read = 0;
-                if (!ReadFile((HANDLE)capture->read_fd, buffer.data(),
+                if (!ReadFile(capture->read_handle, buffer.data(),
                               static_cast<DWORD>(buffer.size()), &bytes_read, NULL) ||
                     bytes_read == 0) {
                     break;
