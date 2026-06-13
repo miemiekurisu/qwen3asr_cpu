@@ -359,7 +359,9 @@ do_start() {
     log_info "ui:      $UI_DIR"
 
     check_port_free "$PORT"     "server"  || exit 1
-    [[ $USE_HTTPS -eq 1 ]] && check_port_free "$HTTPS_PORT" "proxy" || exit 1
+    if [[ $USE_HTTPS -eq 1 ]]; then
+        check_port_free "$HTTPS_PORT" "proxy" || exit 1
+    fi
     log_info "host:    $HOST"
     log_info "port:    $PORT  (HTTP)"
     [[ $USE_HTTPS -eq 1 ]] && log_info "         $HTTPS_PORT  (HTTPS, --https)"
