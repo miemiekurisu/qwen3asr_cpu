@@ -260,8 +260,8 @@ function animateNewSegment(element, text) {
   /* Find the bottom-most line.  If it's the cursor (blinking,
    * empty), promote it to a typing line — the user has spoken and
    * we're filling in the text.  If a previous segment's typing
-   * animation was somehow interrupted mid-stream, fall through and
-   * just append a fresh typing line. */
+   * animation was interrupted mid-stream, complete it with the
+   * full text from the segments array before starting the new line. */
   let typingEntry = null;
   const lastLine = realtimeArchive.lines[realtimeArchive.lines.length - 1];
   if (lastLine && lastLine.state === "cursor") {
@@ -275,6 +275,33 @@ function animateNewSegment(element, text) {
     lastLine.state = "typing";
     lastLine.el.textContent = "";
     typingEntry = lastLine;
+  } else if (lastLine && lastLine.state === "typing") {
+    /* Previous segment's typewriter was interrupted before it
+     * finished.  Complete it with the full text from the segments
+     * array so the user sees the complete text instead of a
+     * truncated fragment.  Then create a fresh cursor line for
+     * the new segment. */
+    const fullText = realtimeState.sseSegments
+      ? realtimeState.sseSegments[realtimeState.sseSegments.length - 2] || lastLine.text || ""
+      : lastLine.text || "";
+    lastLine.el.textContent = fullText;
+    lastLine.text = fullText;
+    lastLine.el.classList.remove("typing");
+    lastLine.el.classList.add("done");
+    lastLine.state = "done";
+    /* Now create a fresh cursor line for the new segment. */
+    const cursorLine = makeTermLine("cursor", "");
+    element.appendChild(cursorLine);
+    realtimeArchive.lines.push({ state: "cursor", el: cursorLine, text: "" });
+    /* Promote the cursor to typing for this segment. */
+    const blink2 = cursorLine.querySelector(".cursor-blink");
+    if (blink2) blink2.remove();
+    cursorLine.classList.remove("cursor", "empty");
+    cursorLine.classList.add("typing");
+    cursorLine.textContent = "";
+    realtimeArchive.lines[realtimeArchive.lines.length - 1] =
+      { state: "typing", el: cursorLine, text: "" };
+    typingEntry = realtimeArchive.lines[realtimeArchive.lines.length - 1];
   } else {
     /* No cursor to convert (we were mid-typing, or somehow there
      * was no cursor).  Append a fresh typing line. */
