@@ -1416,6 +1416,28 @@ struct AudioSegment {
     std::vector<float> samples;     /* raw float PCM, 16 kHz mono */
     std::string commit_reason;      /* "vad_silence" | "10s_soft_cap" | "eof" */
     bool is_eof_terminator = false; /* poison pill: consumer should exit */
+
+    /* Phase 2A: observability fields — help diagnose missing text. */
+    std::uint64_t seq = 0;          /* per-session monotonic sequence number */
+    bool first_segment = false;     /* true for the first segment of this session */
+    std::string endpoint_mode;      /* "legacy" | "cap_only" */
+    int64_t total_samples_at_push = 0; /* cumulative samples consumed at push time */
+    double queued_audio_sec = 0.0;  /* audio duration of this segment */
+
+    /* Phase 2A: boundary context fields — reserved for Phase 3. */
+    int left_context_samples = 0;
+    int right_context_samples = 0;
+    int boundary_overlap_samples = 0;
+    bool truncated_left = false;
+    bool truncated_right = false;
+
+    /* Phase 2A: ASR performance fields — filled by ASR worker after decode. */
+    double asr_total_ms = 0.0;
+    double asr_encode_ms = 0.0;
+    double asr_decode_ms = 0.0;
+    int asr_tokens = 0;
+    bool asr_empty = false;
+    std::string asr_text;
 };
 
 class SegmentQueue {
@@ -1549,6 +1571,21 @@ private:
     std::size_t filled_;
 };
 
+/* ========================================================================
+ * RAII wrapper for per-session Silero VAD instance.
+ * Each realtime session owns its own VAD so that LSTM hidden state is
+ * not shared across sessions — no cross-session pollution.
+ * ======================================================================== */
+struct QwenVadDeleter {
+    void operator()(qwen_silero_vad_t * vad) const noexcept {
+        if (vad) {
+            qwen_silero_vad_destroy(vad);
+        }
+    }
+};
+
+using QwenVadPtr = std::unique_ptr<qwen_silero_vad_t, QwenVadDeleter>;
+
 /* The realtime session's worker is now a 2-thread producer-consumer
  * pair instead of the old single-thread "VAD+ASR tight loop".  Each
  * session has its own pair, fully isolated from other sessions.
@@ -1564,6 +1601,20 @@ struct RealtimeLiveWorker {
     std::thread vad_thread;         /* producer: VAD facade */
     std::thread asr_thread;         /* consumer: ASR worker */
     std::atomic<bool> stop_requested{false};  /* set by /api/realtime/stop */
+
+    /* Per-session VAD instance.  Owned by the worker; only the VAD
+     * facade thread accesses it.  If session_vad is null, the facade
+     * falls back to the shared model VAD (protected by vad_mu). */
+    QwenVadPtr session_vad;
+    bool session_vad_active = false;
+    bool session_vad_fallback_shared = false;
+
+    /* Phase 2A: segment sequencing and dump observability. */
+    std::atomic<uint64_t> next_segment_seq{0};
+    std::atomic<bool> first_segment_queued{false};
+    std::atomic<bool> first_segment_emitted{false};
+    std::atomic<uint64_t> dumped_segment_count{0};
+    std::atomic<uint64_t> dumped_sample_count{0};
     /* Cumulative count of samples the VAD has consumed since session
      * start.  Updated by the VAD on every consume (both the main
      * poll loop and the stop_drain path).  The snapshot reads this
@@ -1588,6 +1639,135 @@ struct ServerMetrics {
     std::atomic<std::uint64_t> realtime_finalizations{0};
     std::atomic<std::uint64_t> host_capture_sessions_started{0};
 };
+
+/* ========================================================================
+ * Phase 2A: Realtime segment dump configuration.
+ * Debug-only; disabled by default in production.
+ * ======================================================================== */
+struct DumpConfig {
+    bool enabled = false;
+    std::string dir;
+    uint64_t max_segments = 200;
+    uint64_t max_seconds = 600;
+
+    static DumpConfig FromEnv() {
+        DumpConfig cfg;
+        cfg.enabled = getenv("QASR_DUMP_REALTIME_SEGMENTS") != nullptr &&
+                      atoi(getenv("QASR_DUMP_REALTIME_SEGMENTS")) != 0;
+        if (cfg.enabled) {
+            const char * dir = getenv("QASR_DUMP_REALTIME_DIR");
+            cfg.dir = dir ? dir : "./realtime_dumps";
+            const char * ms = getenv("QASR_DUMP_REALTIME_MAX_SEGMENTS");
+            if (ms) cfg.max_segments = std::max(1u, std::min(10000u, (unsigned int)std::stoul(ms)));
+            const char * mcs = getenv("QASR_DUMP_REALTIME_MAX_SECONDS");
+            if (mcs) cfg.max_seconds = std::max(1u, std::min(3600u, (unsigned int)std::stoul(mcs)));
+        }
+        return cfg;
+    }
+};
+
+/* Write float PCM to a 16-bit mono WAV file at 16 kHz.
+ * Returns Status::ok() on success, or an error status. */
+Status WriteFloatMono16kWav(const fs::path & path,
+                            const float * samples, int n_samples) {
+    if (!samples || n_samples <= 0) return OkStatus();
+
+    /* WAV header: 44 bytes RIFF/WAVE, PCM 16-bit mono 16000 Hz */
+    const int data_bytes = n_samples * 2;
+    const int file_size = 44 + data_bytes;
+    const int byte_rate = 16000 * 2;  /* sample_rate * channels * bits/8 */
+    const int block_align = 2;  /* channels * bits/8 */
+
+    std::vector<char> header(44);
+    /* RIFF header */
+    header[0] = 'R'; header[1] = 'I'; header[2] = 'F'; header[3] = 'F';
+    std::memcpy(&header[4], &file_size, 4);  /* file_size - 8, little-endian */
+    header[8] = 'W'; header[9] = 'A'; header[10] = 'V'; header[11] = 'E';
+    /* fmt chunk */
+    header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
+    const int fmt_size = 16;
+    std::memcpy(&header[16], &fmt_size, 4);
+    std::int16_t audio_format = 1;  /* PCM */
+    std::int16_t num_channels = 1;
+    std::int32_t sample_rate = 16000;
+    std::memcpy(&header[20], &audio_format, 2);
+    std::memcpy(&header[22], &num_channels, 2);
+    std::memcpy(&header[24], &sample_rate, 4);
+    std::memcpy(&header[28], &byte_rate, 4);
+    std::memcpy(&header[32], &block_align, 2);
+    std::int16_t bits_per_sample = 16;
+    std::memcpy(&header[34], &bits_per_sample, 2);
+    /* data chunk */
+    header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
+    std::memcpy(&header[40], &data_bytes, 4);
+
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs) return Status(StatusCode::kInternal, "cannot open WAV file: " + path.string());
+
+    ofs.write(header.data(), header.size());
+
+    /* Write PCM16 samples */
+    std::vector<int16_t> pcm(n_samples);
+    for (int i = 0; i < n_samples; ++i) {
+        float v = samples[i];
+        if (v < -1.0f) v = -1.0f;
+        if (v > 1.0f) v = 1.0f;
+        pcm[i] = static_cast<int16_t>(v * 32767.0f);
+    }
+    ofs.write(reinterpret_cast<const char *>(pcm.data()), data_bytes);
+
+    if (!ofs) return Status(StatusCode::kInternal, "WAV write failed: " + path.string());
+    return OkStatus();
+}
+
+/* ========================================================================
+ * Phase 2B: Cap-only endpoint mode + latency guardrail policy.
+ * ======================================================================== */
+enum class EndpointMode {
+    kLegacy,
+    kCapOnly,
+};
+
+enum class SegmentEndpointKind {
+    kFirst,
+    kNormal,
+};
+
+struct CapOnlyEndpointPolicy {
+    /* Existing parameters — MUST remain unchanged in Phase 2. */
+    int stable_silence_ms = 1500;
+    int min_emit_ms = 1800;
+    int pending_merge_ms = 1200;
+
+    /* New cap parameters.  First cap protects against long first-segment
+     * wait during continuous speech.  Normal cap protects subsequent
+     * segments.  Grace + valley avoid mid-speech cutting. */
+    int first_latency_cap_ms = 6000;
+    int normal_latency_cap_ms = 15000;
+    int cap_grace_ms = 800;
+    int cap_valley_silence_ms = 256;
+
+    static CapOnlyEndpointPolicy FromEnv() {
+        CapOnlyEndpointPolicy p;
+        const char * fl = getenv("QASR_FIRST_LATENCY_CAP_MS");
+        if (fl) p.first_latency_cap_ms = std::max(1000, std::stoi(fl));
+        const char * nl = getenv("QASR_NORMAL_LATENCY_CAP_MS");
+        if (nl) p.normal_latency_cap_ms = std::max(3000, std::stoi(nl));
+        const char * gr = getenv("QASR_LATENCY_CAP_GRACE_MS");
+        if (gr) p.cap_grace_ms = std::max(100, std::stoi(gr));
+        const char * vl = getenv("QASR_LATENCY_CAP_VALLEY_MS");
+        if (vl) p.cap_valley_silence_ms = std::max(64, std::stoi(vl));
+        return p;
+    }
+};
+
+static EndpointMode ParseEndpointMode() {
+    const char * env = getenv("QASR_ENDPOINT_MODE");
+    if (env && std::strcmp(env, "cap_only") == 0) {
+        return EndpointMode::kCapOnly;
+    }
+    return EndpointMode::kLegacy;
+}
 
 struct HostCaptureSession {
     std::string id;
@@ -2168,7 +2348,22 @@ void JoinRealtimeLiveWorker(RealtimeLiveWorker * worker) {
         }
     }
 
-    /* Step 5: free the live audio buffer.  Both threads have exited
+     /* Step 5: destroy per-session VAD now that both threads have
+     * exited.  The VAD is only accessed by the VAD facade thread;
+     * after join, it's safe to destroy.  unique_ptr will call
+     * qwen_silero_vad_destroy. */
+    if (worker->session_vad) {
+        if (qwen_verbose >= 1) {
+            std::fprintf(stderr, "[rt t=%.0fms] JoinRealtimeLiveWorker destroy session_vad worker=%p\n",
+                         std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count(),
+                         (void*)worker);
+        }
+        worker->session_vad.reset();
+    }
+
+    /* Step 6: free the live audio buffer.  Both threads have exited
      * so no one is reading from it anymore. */
     if (worker->live_ready) {
         DestroyManualLiveAudio(&worker->live);
@@ -3140,6 +3335,25 @@ int RunServer(const ServerConfig & config) {
     const std::string served_model_id = ResolveServedModelId(config.model_dir);
     const fs::path ui_dir(config.ui_dir);
     const RealtimePolicyConfig realtime_policy;
+    /* Phase 2A: segment dump config — parsed once at startup. */
+    const DumpConfig dump_config = DumpConfig::FromEnv();
+    if (dump_config.enabled && qwen_verbose >= 1) {
+        std::fprintf(stderr, "Phase 2A: segment dump ENABLED dir=%s max_seg=%lu max_sec=%lu\n",
+                     dump_config.dir.c_str(),
+                     static_cast<unsigned long>(dump_config.max_segments),
+                     static_cast<unsigned long>(dump_config.max_seconds));
+    }
+    /* Phase 2B: endpoint mode + cap policy — parsed once at startup. */
+    const EndpointMode endpoint_mode = ParseEndpointMode();
+    const CapOnlyEndpointPolicy cap_policy = CapOnlyEndpointPolicy::FromEnv();
+    if (qwen_verbose >= 1) {
+        std::fprintf(stderr, "Phase 2B: endpoint_mode=%s first_cap=%dms normal_cap=%dms grace=%dms valley=%dms\n",
+                     endpoint_mode == EndpointMode::kCapOnly ? "cap_only" : "legacy",
+                     cap_policy.first_latency_cap_ms,
+                     cap_policy.normal_latency_cap_ms,
+                     cap_policy.cap_grace_ms,
+                     cap_policy.cap_valley_silence_ms);
+    }
     const auto server_start = std::chrono::steady_clock::now();
     ServerMetrics metrics;
     std::atomic<std::uint64_t> session_counter{1};
@@ -3415,23 +3629,44 @@ int RunServer(const ServerConfig & config) {
      * of the producer-consumer rewrite.
      * ================================================================== */
     auto VadFacadeLoop = [&](qwen_live_audio_t * live,
-                             const std::shared_ptr<RealtimeSession> & session,
-                             qwen_silero_vad_t * vad,
-                             std::mutex * vad_mutex,
-                             std::atomic<bool> * stop_requested,
-                             SegmentQueue * queue,
-                             std::atomic<int64_t> * cumulative_decoded_samples) {
-        RT_LOG("VadFacadeLoop sid=%s enter vad=%p", session->id.c_str(), (void*)vad);
+                              const std::shared_ptr<RealtimeSession> & session,
+                              RealtimeLiveWorker * worker,
+                              std::mutex * vad_mu_ptr,
+                              std::atomic<bool> * stop_requested,
+                              SegmentQueue * queue,
+                              std::atomic<int64_t> * cumulative_decoded_samples,
+                              const DumpConfig & dump_cfg,
+                              EndpointMode ep_mode,
+                              const CapOnlyEndpointPolicy & cap_pol) {
+        /* Section 6.1: Select VAD pointer inside VadFacadeLoop.
+         * Per-session VAD: no mutex needed (only this thread accesses it).
+         * Shared fallback VAD: protected by vad_mu. */
+        qwen_silero_vad_t * vad = nullptr;
+        std::mutex * vad_mutex = nullptr;
+        if (!worker->session_vad_fallback_shared && worker->session_vad_active &&
+            worker->session_vad) {
+            vad = worker->session_vad.get();
+        } else {
+            vad = realtime_model->vad();
+            vad_mutex = vad_mu_ptr;
+        }
+
+        (void)dump_cfg; /* Used in ASR worker, not VAD loop. */
+        RT_LOG("VadFacadeLoop sid=%s enter vad=%p mutex_guarded=%d",
+               session->id.c_str(), (void*)vad, vad_mutex ? 1 : 0);
         const bool vad_active = qwen_silero_vad_is_active(vad);
         if (qwen_verbose >= 2) {
-            std::fprintf(stderr, "VAD-facade: Silero VAD %s (ctx->vad, mutex-guarded)\n",
-                         vad_active ? "active" : "inactive (will use timer only)");
+            std::fprintf(stderr, "VAD-facade: Silero VAD %s (%s)\n",
+                         vad_active ? "active" : "inactive (will use timer only)",
+                         vad_mutex ? "shared (mutex-guarded)" : "per-session (no mutex)");
         }
-        /* NOTE: do NOT reset the VAD here.  qwen_load() (qwen_asr.c:373-374)
-         * already reset it once at context creation.  Calling reset() again
-         * clears the LSTM hidden state, which means the first few frames of
-         * the first segment get classified as non-speech regardless of
-         * signal energy.  The C-level reset is sufficient. */
+        /* NOTE: do NOT reset the VAD here.  For per-session VAD:
+         * StartRealtimeLiveWorker already called qwen_silero_vad_reset()
+         * at creation time.  For shared fallback VAD: qwen_load()
+         * (qwen_asr.c:373-374) already reset it.  Calling reset() again
+         * in VadFacadeLoop clears the LSTM hidden state, which means the
+         * first few frames of the first segment get classified as
+         * non-speech regardless of signal energy. */
 
         /* Convert ms-level config to sample counts. */
         const int preroll_samples = (kVadPreRollMs * 16000) / 1000;
@@ -3447,23 +3682,36 @@ int RunServer(const ServerConfig & config) {
         int speech_start_offset = -1;   /* sample offset in segment_buffer of first VAD-said-speech frame; -1 = none yet */
         int last_speech_offset = -1;    /* sample offset in segment_buffer of last VAD-said-speech frame; -1 = none yet */
 
-        /* State: softcap grace — entered when buffer exceeds soft deadline.
+      /* State: softcap grace — entered when buffer exceeds soft deadline.
            * Waits for a short acoustic valley before emitting, to avoid
            * cutting mid-speech.  Max grace = kVadSegmentSoftGraceMs. */
-        bool softcap_grace_active = false;
-        std::int64_t softcap_grace_start_ms = 0;
-        int softcap_grace_enter_silence_ms = 0;
+         bool softcap_grace_active = false;
+         std::int64_t softcap_grace_start_ms = 0;
+         int softcap_grace_enter_silence_ms = 0;
+
+         /* Phase 2B: cap-only latency guardrail state. */
+         bool cap_grace_active = false;
+         std::int64_t cap_grace_start_ms = 0;
+        SegmentEndpointKind active_endpoint_kind = SegmentEndpointKind::kNormal;
+          bool active_endpoint_locked = false; /* Guard flag — set at speech start, cleared after cap emit. */
 
         auto steady_ms = []() -> std::int64_t {
             return std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
         };
 
-        /* State: pending short segment (a sub-min_emit segment held in
-         * case more speech arrives within kVadShortMergeGapMs). */
-        std::vector<float> pending_buffer;
-        int pending_last_speech_offset = -1;
-        int64_t pending_expire_at_ms = 0;
+                    /* State: pending short segment (a sub-min_emit segment held in
+                      * case more speech arrives within kVadShortMergeGapMs). */
+                    std::vector<float> pending_buffer;
+                    int pending_last_speech_offset = -1;
+                    int64_t pending_expire_at_ms = 0;
+
+                    /* Track first emit for per-session VAD observability. */
+                    bool first_emit_logged = false;
+
+                    /* Track total VAD frames processed for first-20 logging
+                     * and first-speech detection.  Reset per VadFacadeLoop. */
+                    int total_vad_frames = 0;
 
         /* Helper: build & push an AudioSegment from a vector of samples.
          * Trims trailing audio to last_speech_off + post_roll (if last_speech_off >= 0). */
@@ -3478,6 +3726,13 @@ int RunServer(const ServerConfig & config) {
             seg.commit_reason = reason;
             seg.is_eof_terminator = false;
             seg.samples.assign(src->begin(), src->begin() + end_offset);
+            if (!first_emit_logged) {
+                RT_LOG("VAD-first-emit sid=%s reason=%s audio=%.2fs silence=%dms",
+                       session->id.c_str(), reason,
+                       (double)seg.samples.size() / 16000.0,
+                       silence_run_ms);
+                first_emit_logged = true;
+            }
             if (qwen_verbose >= 1) {
                 std::fprintf(stderr, "VAD-facade: emit %.2fs reason=%s\n",
                              (double)seg.samples.size() / 16000.0, reason);
@@ -3576,16 +3831,33 @@ int RunServer(const ServerConfig & config) {
                     (double)emit_samples.size() / 16000.0, reason,
                     kVadPreRollMs, kVadPostRollMs);
             }
-            RT_LOG("VadFacadeLoop sid=%s emit reason=%s n=%zu",
-                   session->id.c_str(), reason, emit_samples.size());
+          RT_LOG("VadFacadeLoop sid=%s emit reason=%s n=%zu",
+                    session->id.c_str(), reason, emit_samples.size());
+            if (!first_emit_logged) {
+                RT_LOG("VAD-first-emit sid=%s reason=%s audio=%.2fs silence=%dms",
+                       session->id.c_str(), reason,
+                       (double)emit_samples.size() / 16000.0,
+                       silence_run_ms);
+                first_emit_logged = true;
+            }
             AudioSegment seg;
             seg.samples = std::move(emit_samples);
             seg.commit_reason = reason;
             seg.is_eof_terminator = false;
+            /* Phase 2A: fill observability fields. */
+            seg.seq = worker->next_segment_seq.fetch_add(1, std::memory_order_relaxed);
+            seg.first_segment = !worker->first_segment_queued.load(std::memory_order_relaxed);
+            seg.endpoint_mode = ep_mode == EndpointMode::kCapOnly ? "cap_only" : "legacy";
+            seg.total_samples_at_push = worker->cumulative_decoded_samples.load(std::memory_order_relaxed);
+            seg.queued_audio_sec = static_cast<double>(seg.samples.size()) / 16000.0;
             const bool pushed = queue->Push(std::move(seg));
             if (!pushed) {
                 RT_LOG("VadFacadeLoop sid=%s queue closed, exiting", session->id.c_str());
                 return false;
+            }
+            /* Phase 2B §6.8: mark first_segment_queued after successful push. */
+            if (seg.first_segment) {
+                worker->first_segment_queued.store(true, std::memory_order_release);
             }
             segment_buffer.clear();
             segment_buffer.reserve(kVadSegmentHardCapSamples * 2);
@@ -3674,22 +3946,44 @@ int RunServer(const ServerConfig & config) {
                         int64_t aligned_start = (tail_start / frame_drain) * frame_drain;
                         int64_t total = static_cast<int64_t>(segment_buffer.size());
                         for (int64_t off = aligned_start + frame_drain; off <= total; off += frame_drain) {
-                            float prob = 0.0f;
-                            if (vad_mutex) {
+                            float prob = 1.0f;  /* fail-open: treat as speech on error */
+                            if (vad == nullptr || !qwen_silero_vad_is_active(vad)) {
+                                /* VAD not active — fail-open */
+                            } else if (vad_mutex) {
                                 std::lock_guard<std::mutex> lock(*vad_mutex);
-                                qwen_silero_vad_process(vad,
+                                if (qwen_silero_vad_process(vad,
                                     segment_buffer.data() + (off - frame_drain),
-                                    frame_drain, &prob);
+                                    frame_drain, &prob) != 0) {
+                                    prob = 1.0f;  /* fail-open */
+                                    if (qwen_verbose >= 1) {
+                                        RT_LOG("VAD-process-failed sid=%s rc=-1 drain",
+                                               session->id.c_str());
+                                    }
+                                }
                             } else {
-                                qwen_silero_vad_process(vad,
+                                if (qwen_silero_vad_process(vad,
                                     segment_buffer.data() + (off - frame_drain),
-                                    frame_drain, &prob);
+                                    frame_drain, &prob) != 0) {
+                                    prob = 1.0f;  /* fail-open */
+                                    if (qwen_verbose >= 1) {
+                                        RT_LOG("VAD-process-failed sid=%s rc=-1 drain",
+                                               session->id.c_str());
+                                    }
+                                }
                             }
+                            total_vad_frames++;
                             if (prob >= kVadSpeechProbThreshold) {
                                 segment_active = true;
                                 silence_run_ms = 0;
                                 if (speech_start_offset < 0) {
                                     speech_start_offset = static_cast<int>(off - frame_drain);
+                                    /* Phase 2B §6.5: lock endpoint kind at speech start. */
+                                    const bool is_first =
+                                        !worker->first_segment_queued.load(std::memory_order_relaxed);
+                                    active_endpoint_kind = is_first
+                                        ? SegmentEndpointKind::kFirst
+                                        : SegmentEndpointKind::kNormal;
+                                    active_endpoint_locked = true;
                                 }
                                 last_speech_offset = static_cast<int>(off);
                             } else {
@@ -3866,25 +4160,66 @@ int RunServer(const ServerConfig & config) {
                     int64_t total = static_cast<int64_t>(segment_buffer.size());
                     int frames_processed = 0;
                     float last_prob = 0.0f;
+                    /* Track first-speech frame for per-session VAD
+                     * observability.  Only emitted once per VadFacadeLoop. */
+                    int first_speech_frame = -1;
+                    int64_t first_speech_abs_sample = -1;
                     for (int64_t off = aligned_start + frame; off <= total; off += frame) {
-                        float prob = 0.0f;
-                        if (vad_mutex) {
+                        float prob = 1.0f;  /* fail-open: treat as speech on error */
+                        if (vad == nullptr || !qwen_silero_vad_is_active(vad)) {
+                            /* VAD not active — fail-open */
+                        } else if (vad_mutex) {
                             std::lock_guard<std::mutex> lock(*vad_mutex);
-                            qwen_silero_vad_process(vad,
+                            if (qwen_silero_vad_process(vad,
                                 segment_buffer.data() + (off - frame),
-                                frame, &prob);
+                                frame, &prob) != 0) {
+                                prob = 1.0f;  /* fail-open */
+                                if (qwen_verbose >= 1) {
+                                    RT_LOG("VAD-process-failed sid=%s rc=-1",
+                                           session->id.c_str());
+                                }
+                            }
                         } else {
-                            qwen_silero_vad_process(vad,
+                            if (qwen_silero_vad_process(vad,
                                 segment_buffer.data() + (off - frame),
-                                frame, &prob);
+                                frame, &prob) != 0) {
+                                prob = 1.0f;  /* fail-open */
+                                if (qwen_verbose >= 1) {
+                                    RT_LOG("VAD-process-failed sid=%s rc=-1",
+                                           session->id.c_str());
+                                }
+                            }
                         }
                         last_prob = prob;
                         frames_processed++;
+                        total_vad_frames++;
+                        /* First 20 frames VAD prob logging (document 10.2).
+                         * Only in verbose mode to avoid log spam. */
+                        if (total_vad_frames <= 20 && qwen_verbose >= 2) {
+                            std::fprintf(stderr,
+                                "VAD-frame sid=%s idx=%d prob=%.3f speech=%s\n",
+                                session->id.c_str(),
+                                total_vad_frames - 1,
+                                prob,
+                                prob >= kVadSpeechProbThreshold ? "true" : "false");
+                        }
                         if (prob >= kVadSpeechProbThreshold) {
                             segment_active = true;
                             silence_run_ms = 0;
                             if (speech_start_offset < 0) {
                                 speech_start_offset = static_cast<int>(off - frame);
+                                /* First speech frame detected in this
+                                 * VadFacadeLoop — log it for debugging. */
+                                first_speech_frame = frames_processed;
+                                first_speech_abs_sample = consumed_samples + (off - frame);
+                                /* Phase 2B §6.5: lock endpoint kind at speech
+                                 * start so cap logic uses correct threshold. */
+                                const bool is_first =
+                                    !worker->first_segment_queued.load(std::memory_order_relaxed);
+                                active_endpoint_kind = is_first
+                                    ? SegmentEndpointKind::kFirst
+                                    : SegmentEndpointKind::kNormal;
+                                active_endpoint_locked = true;
                             }
                             last_speech_offset = static_cast<int>(off);
                         } else {
@@ -3892,6 +4227,13 @@ int RunServer(const ServerConfig & config) {
                                 silence_run_ms += kVadVadFrameMs;
                             }
                         }
+                    }
+                    if (first_speech_frame >= 0 && qwen_verbose >= 1) {
+                        RT_LOG("VAD-first-speech sid=%s frame=%d abs_sample=%lld prob=%.3f",
+                               session->id.c_str(),
+                               first_speech_frame,
+                               (long long)first_speech_abs_sample,
+                               last_prob);
                     }
                     if (qwen_verbose >= 2 && frames_processed > 0) {
                         std::fprintf(stderr,
@@ -3975,10 +4317,58 @@ int RunServer(const ServerConfig & config) {
                 softcap_grace_start_ms = 0;
                 softcap_grace_enter_silence_ms = 0;
 
-            } else if (buf_soft_deadline) {
-                /* Soft-cap grace: buffer reached soft deadline.
-                 * Enter grace period — wait for a short acoustic valley
-                 * (>= kVadSoftcapValleySilenceMs) or grace expiry or hard cap. */
+        } else if (ep_mode == EndpointMode::kCapOnly) {
+                 /* Phase 2B: cap-only latency guardrail.
+                  * Only active when QASR_ENDPOINT_MODE=cap_only.
+                  * Does not change vad_silence / min_emit / pending behavior. */
+                 const int cap_ms = active_endpoint_kind == SegmentEndpointKind::kFirst
+                     ? cap_pol.first_latency_cap_ms
+                     : cap_pol.normal_latency_cap_ms;
+                 const int cap_samples = cap_ms * 16000 / 1000;
+                 const bool latency_cap_reached =
+                     segment_active && buf_samples >= cap_samples;
+
+                 if (latency_cap_reached && !cap_grace_active) {
+                     cap_grace_active = true;
+                     cap_grace_start_ms = steady_ms();
+                     if (qwen_verbose >= 1) {
+                         std::fprintf(stderr,
+                             "VAD-facade: cap_only grace enter buf=%.2fs cap=%dms kind=%s\n",
+                             (double)buf_samples / 16000.0,
+                             cap_ms,
+                             active_endpoint_kind == SegmentEndpointKind::kFirst ? "first" : "normal");
+                     }
+                 }
+
+                 if (cap_grace_active) {
+                     const int64_t now_ms_val = steady_ms();
+                     const bool cap_valley =
+                         segment_active && silence_run_ms >= cap_pol.cap_valley_silence_ms;
+                     const bool cap_grace_expired =
+                         now_ms_val - cap_grace_start_ms >= cap_pol.cap_grace_ms;
+
+                     if (cap_valley || cap_grace_expired) {
+                         const char * cap_reason = cap_valley
+                             ? "latency_cap_valley"
+                             : "latency_cap_forced";
+                         if (qwen_verbose >= 1) {
+                             std::fprintf(stderr,
+                                 "VAD-facade: cap_only emit reason=%s buf=%.2fs\n",
+                                 cap_reason, (double)buf_samples / 16000.0);
+                         }
+                         if (!emit_segment_buffer(cap_reason)) {
+                             break;
+                         }
+                         cap_grace_active = false;
+                         cap_grace_start_ms = 0;
+                         active_endpoint_locked = false;
+                         continue;
+                     }
+                 }
+             } else if (buf_soft_deadline) {
+                 /* Soft-cap grace: buffer reached soft deadline.
+                  * Enter grace period — wait for a short acoustic valley
+                  * (>= kVadSoftcapValleySilenceMs) or grace expiry or hard cap. */
                 {
                     const int64_t now_ms = steady_ms();
                     const bool buf_hard_cap = buf_samples >= kVadSegmentHardCapSamples;
@@ -4091,10 +4481,11 @@ int RunServer(const ServerConfig & config) {
      * On exit, marks the session as finalized and frees the live_ctx
      * clone.  The HTTP /stop handler waits on this thread via join.
      * ================================================================== */
-    auto AsrWorkerLoop = [&](qwen_ctx_t * live_ctx,
-                             const std::shared_ptr<RealtimeSession> & session,
-                             const std::string & forced_language,
-                             SegmentQueue * queue) {
+  auto AsrWorkerLoop = [&](qwen_ctx_t * live_ctx,
+                              const std::shared_ptr<RealtimeSession> & session,
+                              const std::string & forced_language,
+                              SegmentQueue * queue,
+                              const DumpConfig & dump_cfg) {
         RT_LOG("AsrWorkerLoop sid=%s enter", session->id.c_str());
         qwen_verbose = realtime_model->verbosity();
 
@@ -4135,6 +4526,16 @@ int RunServer(const ServerConfig & config) {
                 break;
             }
             const int n_samples = static_cast<int>(seg.samples.size());
+            /* Phase 2A: ASR worker logging with seq/reason/forced_language. */
+            RT_LOG("ASR-worker sid=%s seq=%lu reason=%s audio=%.2fs lang=%s forced=%s first=%d",
+                   session->id.c_str(),
+                   static_cast<unsigned long>(seg.seq),
+                   seg.commit_reason.c_str(),
+                   (double)n_samples / 16000.0,
+                   session->language.c_str(),
+                   forced_language.c_str(),
+                   seg.first_segment ? 1 : 0);
+
             if (qwen_verbose >= 1) {
                 std::fprintf(stderr,
                              "ASR-worker: decoding segment #%d (%.2fs, reason=%s, total_buf=%.2fs)\n",
@@ -4146,29 +4547,104 @@ int RunServer(const ServerConfig & config) {
                    session->id.c_str(), n_samples, seg.commit_reason.c_str());
             char * raw = qwen_transcribe_audio(live_ctx, seg.samples.data(), n_samples);
             RT_LOG("AsrWorkerLoop sid=%s qwen_transcribe_audio RETURNED", session->id.c_str());
+
+           /* Phase 2A: ASR result logging. */
+            RT_LOG("ASR-worker-result sid=%s seq=%lu text_empty=%d total=%.0fms enc=%.0fms dec=%.0fms tokens=%d",
+                   session->id.c_str(),
+                   static_cast<unsigned long>(seg.seq),
+                   raw ? 0 : 1,
+                   live_ctx->perf_total_ms,
+                   live_ctx->perf_encode_ms,
+                   live_ctx->perf_decode_ms,
+                   live_ctx->perf_text_tokens);
+
+            /* Extract text from raw (if any) before dump. */
+            std::string asr_text;
             if (raw != nullptr) {
-                std::string text(raw);
+                asr_text.assign(raw);
                 std::free(raw);
-                while (!text.empty() &&
-                       (text.back() == ' ' || text.back() == '\n' || text.back() == '\t')) {
-                    text.pop_back();
+                while (!asr_text.empty() &&
+                       (asr_text.back() == ' ' || asr_text.back() == '\n' || asr_text.back() == '\t')) {
+                    asr_text.pop_back();
                 }
+            }
+
+            /* Phase 2A: dump segment as WAV + JSON if enabled.
+             * Dump is done in ASR worker (not VAD thread) to avoid
+             * blocking real-time ingest. */
+            if (dump_cfg.enabled && !asr_text.empty()) {
+                RealtimeLiveWorker * wrk = session->live_worker.get();
+                const uint64_t dumped = wrk->dumped_segment_count.fetch_add(1, std::memory_order_relaxed);
+                const uint64_t dumped_samples = wrk->dumped_sample_count.fetch_add(
+                    static_cast<uint64_t>(n_samples), std::memory_order_relaxed);
+                const double total_sec = static_cast<double>(dumped_samples) / 16000.0;
+                if (dumped < dump_cfg.max_segments && total_sec < static_cast<double>(dump_cfg.max_seconds)) {
+                    const fs::path dump_dir(dump_cfg.dir);
+                    fs::create_directories(dump_dir);
+                    /* Build filename: sid_12_seq_000003_vad_silence.wav */
+                    char name_buf[256];
+                    std::snprintf(name_buf, sizeof(name_buf),
+                                  "sid_%s_seq_%06lu_%s.wav",
+                                  session->id.c_str(),
+                                  static_cast<unsigned long>(seg.seq),
+                                  seg.commit_reason.c_str());
+                    const std::string wav_name(name_buf);
+                    std::snprintf(name_buf, sizeof(name_buf),
+                                  "sid_%s_seq_%06lu_%s.json",
+                                  session->id.c_str(),
+                                  static_cast<unsigned long>(seg.seq),
+                                  seg.commit_reason.c_str());
+                    const std::string json_name(name_buf);
+                    /* Dump WAV — failure is non-fatal. */
+                    WriteFloatMono16kWav(dump_dir / wav_name,
+                                         seg.samples.data(), n_samples);
+                    /* Build JSON metadata with ASR perf + text. */
+                    Json meta = Json::object();
+                    meta["sid"] = session->id;
+                    meta["seq"] = static_cast<std::int64_t>(seg.seq);
+                    meta["reason"] = seg.commit_reason;
+                    meta["endpoint_mode"] = seg.endpoint_mode;
+                    meta["first_segment"] = seg.first_segment;
+                    meta["audio_sec"] = seg.queued_audio_sec;
+                    meta["sample_count"] = static_cast<std::int64_t>(n_samples);
+                    meta["language"] = session->language;
+                    meta["forced_language"] = forced_language;
+                    meta["total_samples_at_push"] = seg.total_samples_at_push;
+                    meta["left_context_ms"] = 0;
+                    meta["right_context_ms"] = 0;
+                    meta["boundary_overlap_ms"] = 0;
+                    meta["truncated_left"] = false;
+                    meta["truncated_right"] = false;
+                    meta["asr_total_ms"] = live_ctx->perf_total_ms;
+                    meta["asr_encode_ms"] = live_ctx->perf_encode_ms;
+                    meta["asr_decode_ms"] = live_ctx->perf_decode_ms;
+                    meta["asr_tokens"] = live_ctx->perf_text_tokens;
+                    meta["asr_empty"] = false;
+                    meta["asr_text"] = asr_text;
+                    std::ofstream jf(dump_dir / json_name);
+                    if (jf) {
+                        jf << meta.dump() << std::endl;
+                    }
+                }
+            }
+
+           if (!asr_text.empty()) {
                 if (qwen_verbose >= 1) {
                     std::fprintf(stderr,
                                  "ASR-worker: segment #%d text=%s\n",
-                                 (int)session->segments_text.size() + 1, text.c_str());
+                                 (int)session->segments_text.size() + 1, asr_text.c_str());
                 }
                 std::lock_guard<std::mutex> lock(session->mu);
-                if (!text.empty()) {
-                    session->segments_text.push_back(text);
+                if (!asr_text.empty()) {
+                    session->segments_text.push_back(asr_text);
                     RealtimeTextUpdate update;
                     update.committed = true;
-                    update.stable_text = text;
+                    update.stable_text = asr_text;
                     update.partial_text.clear();
-                    update.text = text;
-                    session->stable_text = text;
-                    session->text_state.stable_text = text;
-                    session->text_state.last_text = text;
+                    update.text = asr_text;
+                    session->stable_text = asr_text;
+                    session->text_state.stable_text = asr_text;
+                    session->text_state.last_text = asr_text;
                     session->text_state.last_decode_samples = session->total_samples;
                     session->text_state.unstable_since_samples = session->total_samples;
                     session->last_inference_ms = live_ctx->perf_total_ms;
@@ -4234,20 +4710,63 @@ int RunServer(const ServerConfig & config) {
             live_ctx->decode_temperature = temperature;
         }
         const std::string forced_language = session->language;
-        qwen_silero_vad_t * session_vad = realtime_model->vad();
+         /* Per-session VAD: each session owns its own Silero VAD instance
+         * so LSTM hidden state is not shared across sessions.  This
+         * prevents cross-session state pollution and makes first-sentence
+         * boundary detection stable.  Controlled by QASR_PER_SESSION_VAD
+         * (default=1).  Fallback: if create fails, use shared VAD. */
+      const bool use_per_session_vad = getenv("QASR_PER_SESSION_VAD") == nullptr ||
+                                          atoi(getenv("QASR_PER_SESSION_VAD")) != 0;
+         if (use_per_session_vad) {
+             auto steady_ms = []() -> double {
+                 return std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now().time_since_epoch()).count();
+             };
+             const double vad_create_t0 = steady_ms();
+             QwenVadPtr local_vad(qwen_silero_vad_create(nullptr));
+             const double vad_create_t1 = steady_ms();
 
-        /* Thread 1: VAD FACADE (producer).  Reads live audio, runs
+             bool local_vad_active = local_vad && qwen_silero_vad_is_active(local_vad.get());
+             if (local_vad_active) {
+                 const int rc = qwen_silero_vad_reset(local_vad.get());
+                 if (rc != 0) {
+                     RT_LOG("StartRealtimeLiveWorker sid=%s session VAD reset failed; falling back to shared VAD",
+                            session->id.c_str());
+                     local_vad.reset();
+                     local_vad_active = false;
+                 }
+             }
+
+             if (local_vad_active) {
+                 RT_LOG("VAD-session sid=%s create active=1 cost=%.1fms fallback_shared=0",
+                        session->id.c_str(), vad_create_t1 - vad_create_t0);
+                 worker->session_vad = std::move(local_vad);
+                 worker->session_vad_active = true;
+                 worker->session_vad_fallback_shared = false;
+             } else {
+                 RT_LOG("VAD-session sid=%s create active=0 cost=%.1fms fallback_shared=1",
+                        session->id.c_str(), vad_create_t1 - vad_create_t0);
+                 worker->session_vad_fallback_shared = true;
+             }
+         } else {
+             worker->session_vad_fallback_shared = true;
+         }
+
+       /* Thread 1: VAD FACADE (producer).  Reads live audio, runs
          * VAD, pushes AudioSegments into worker->segment_queue. */
         worker->vad_thread = std::thread([
             session,
             worker_ptr = worker.get(),
-            session_vad,
             &vad_mu,
-            &VadFacadeLoop]() {
+            &VadFacadeLoop,
+            &dump_config,
+            endpoint_mode,
+            &cap_policy]() {
             RT_LOG("vad-thread sid=%s BEGIN", session->id.c_str());
-            VadFacadeLoop(&worker_ptr->live, session, session_vad, &vad_mu,
+            VadFacadeLoop(&worker_ptr->live, session, worker_ptr, &vad_mu,
                           &worker_ptr->stop_requested, &worker_ptr->segment_queue,
-                          &worker_ptr->cumulative_decoded_samples);
+                          &worker_ptr->cumulative_decoded_samples,
+                          dump_config, endpoint_mode, cap_policy);
             RT_LOG("vad-thread sid=%s END", session->id.c_str());
         });
 
@@ -4257,13 +4776,15 @@ int RunServer(const ServerConfig & config) {
             session,
             live_ctx,
             forced_language,
-            &AsrWorkerLoop]() {
+            worker_ptr = worker.get(),
+            &AsrWorkerLoop,
+            &dump_config]() {
             RT_LOG("asr-thread sid=%s BEGIN", session->id.c_str());
             /* The AsrWorkerLoop owns live_ctx and will qwen_free()
              * it on exit.  It also takes its SegmentQueue via the
-             * session->live_worker pointer. */
+             * worker pointer. */
             AsrWorkerLoop(live_ctx, session, forced_language,
-                          &session->live_worker->segment_queue);
+                          &worker_ptr->segment_queue, dump_config);
             RT_LOG("asr-thread sid=%s END", session->id.c_str());
         });
 
