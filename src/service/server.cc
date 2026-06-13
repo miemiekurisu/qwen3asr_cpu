@@ -1441,44 +1441,80 @@ struct AudioSegment {
 };
 
 class SegmentQueue {
-public:
-    /* Producer: enqueue a segment.  Blocks if the queue is at capacity
-     * (backpressure).  Returns false if the queue was closed before
-     * the segment could be pushed — the caller should drop the segment
-     * and treat the producer as terminated. */
-    bool Push(AudioSegment seg) {
-        {
-            std::unique_lock<std::mutex> lock(mu_);
-            cv_not_full_.wait(lock, [this] {
-                return closed_ || queue_.size() < kMaxDepth;
-            });
-            if (closed_) {
-                return false;
-            }
-            queue_.push_back(std::move(seg));
-        }
-        cv_not_empty_.notify_one();
-        return true;
-    }
+ public:
+     /* Producer: enqueue a segment.  Blocks if the queue is at capacity
+      * (backpressure).  Returns false if the queue was closed before
+      * the segment could be pushed — the caller should drop the segment
+      * and treat the producer as terminated. */
+     bool Push(AudioSegment seg) {
+         const auto wait_start = std::chrono::steady_clock::now();
+         {
+             std::unique_lock<std::mutex> lock(mu_);
+             cv_not_full_.wait(lock, [this] {
+                 return closed_ || queue_.size() < kMaxDepth;
+             });
+             const auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - wait_start).count();
+             if (wait_ms > 0) {
+                 stats_.wait_full_count.fetch_add(1, std::memory_order_relaxed);
+                 stats_.wait_full_ms_total.fetch_add(wait_ms, std::memory_order_relaxed);
+                 /* Atomic max update. */
+                 uint64_t cur = stats_.wait_full_ms_max.load(std::memory_order_relaxed);
+                 while (static_cast<uint64_t>(wait_ms) > cur &&
+                        !stats_.wait_full_ms_max.compare_exchange_weak(cur,
+                                                                       wait_ms,
+                                                                       std::memory_order_relaxed)) {}
+             }
+             if (closed_) {
+                 stats_.push_failed_closed.fetch_add(1, std::memory_order_relaxed);
+                 return false;
+             }
+             const std::size_t new_depth = queue_.size() + 1;
+             uint64_t cur = stats_.max_depth_seen.load(std::memory_order_relaxed);
+             while (new_depth > cur &&
+                    !stats_.max_depth_seen.compare_exchange_weak(cur,
+                                                                  static_cast<uint64_t>(new_depth),
+                                                                  std::memory_order_relaxed)) {}
+             queue_.push_back(std::move(seg));
+             stats_.push_total.fetch_add(1, std::memory_order_relaxed);
+         }
+         cv_not_empty_.notify_one();
+         return true;
+     }
 
-    /* Consumer: dequeue a segment.  Blocks while the queue is empty.
-     * Returns true if a segment was popped.  Returns false ONLY when
-     * the queue is closed AND empty (i.e., the consumer should exit). */
-    bool Pop(AudioSegment * out) {
-        std::unique_lock<std::mutex> lock(mu_);
-        cv_not_empty_.wait(lock, [this] {
-            return closed_ || !queue_.empty();
-        });
-        if (queue_.empty()) {
-            /* closed_ must be true here (predicate guarantees it) */
-            return false;
-        }
-        *out = std::move(queue_.front());
-        queue_.pop_front();
-        lock.unlock();
-        cv_not_full_.notify_one();
-        return true;
-    }
+     /* Consumer: dequeue a segment.  Blocks while the queue is empty.
+      * Returns true if a segment was popped.  Returns false ONLY when
+      * the queue is closed AND empty (i.e., the consumer should exit). */
+     bool Pop(AudioSegment * out) {
+         std::unique_lock<std::mutex> lock(mu_);
+         cv_not_empty_.wait(lock, [this] {
+             return closed_ || !queue_.empty();
+         });
+         if (queue_.empty()) {
+             /* closed_ must be true here (predicate guarantees it) */
+             return false;
+         }
+         *out = std::move(queue_.front());
+         queue_.pop_front();
+         stats_.pop_total.fetch_add(1, std::memory_order_relaxed);
+         lock.unlock();
+         cv_not_full_.notify_one();
+         return true;
+     }
+
+     /* Phase 2.1 §3.6: log queue stats for diagnostic output. */
+     void LogStats(const char * sid) const {
+         std::fprintf(stderr,
+             "SEGQ-stats sid=%s push_total=%lu pop_total=%lu push_failed_closed=%lu "
+             "wait_full_count=%lu wait_full_max=%lums max_depth_seen=%lu\n",
+             sid,
+             static_cast<unsigned long>(stats_.push_total.load(std::memory_order_relaxed)),
+             static_cast<unsigned long>(stats_.pop_total.load(std::memory_order_relaxed)),
+             static_cast<unsigned long>(stats_.push_failed_closed.load(std::memory_order_relaxed)),
+             static_cast<unsigned long>(stats_.wait_full_count.load(std::memory_order_relaxed)),
+             static_cast<unsigned long>(stats_.wait_full_ms_max.load(std::memory_order_relaxed)),
+             static_cast<unsigned long>(stats_.max_depth_seen.load(std::memory_order_relaxed)));
+     }
 
     /* Mark the queue as closed.  After this call:
      *   - Push() returns false immediately
@@ -1505,12 +1541,23 @@ public:
      * kicks in beyond this. */
     static constexpr std::size_t kMaxDepth = 8;
 
-private:
+  private:
+    struct SegmentQueueStats {
+        std::atomic<uint64_t> push_total{0};
+        std::atomic<uint64_t> push_failed_closed{0};
+        std::atomic<uint64_t> pop_total{0};
+        std::atomic<uint64_t> wait_full_count{0};
+        std::atomic<uint64_t> wait_full_ms_total{0};
+        std::atomic<uint64_t> wait_full_ms_max{0};
+        std::atomic<uint64_t> max_depth_seen{0};
+    };
+
     mutable std::mutex mu_;
     std::condition_variable cv_not_empty_;
     std::condition_variable cv_not_full_;
     std::deque<AudioSegment> queue_;
     bool closed_ = false;
+    SegmentQueueStats stats_;
 };
 
 /* ========================================================================
@@ -3700,6 +3747,18 @@ int RunServer(const ServerConfig & config) {
                 std::chrono::steady_clock::now().time_since_epoch()).count();
         };
 
+         /* Phase 2.1 §3.4: fill Phase 2A observability fields on any
+          * AudioSegment before push.  Shared by emit_buffer and
+          * emit_segment_buffer to ensure all segments have consistent
+          * seq/first_segment/endpoint_mode metadata. */
+        auto FillSegmentObservability = [&](AudioSegment * seg) {
+            seg->seq = worker->next_segment_seq.fetch_add(1, std::memory_order_relaxed);
+            seg->first_segment = !worker->first_segment_queued.load(std::memory_order_relaxed);
+            seg->endpoint_mode = ep_mode == EndpointMode::kCapOnly ? "cap_only" : "legacy";
+            seg->total_samples_at_push = worker->cumulative_decoded_samples.load(std::memory_order_relaxed);
+            seg->queued_audio_sec = static_cast<double>(seg->samples.size()) / 16000.0;
+        };
+
                     /* State: pending short segment (a sub-min_emit segment held in
                       * case more speech arrives within kVadShortMergeGapMs). */
                     std::vector<float> pending_buffer;
@@ -3726,6 +3785,9 @@ int RunServer(const ServerConfig & config) {
             seg.commit_reason = reason;
             seg.is_eof_terminator = false;
             seg.samples.assign(src->begin(), src->begin() + end_offset);
+            FillSegmentObservability(&seg);
+            const bool was_first = seg.first_segment;
+            const uint64_t seq = seg.seq;
             if (!first_emit_logged) {
                 RT_LOG("VAD-first-emit sid=%s reason=%s audio=%.2fs silence=%dms",
                        session->id.c_str(), reason,
@@ -3734,15 +3796,20 @@ int RunServer(const ServerConfig & config) {
                 first_emit_logged = true;
             }
             if (qwen_verbose >= 1) {
-                std::fprintf(stderr, "VAD-facade: emit %.2fs reason=%s\n",
+                std::fprintf(stderr, "VAD-facade: emit seq=%lu %.2fs reason=%s\n",
+                             static_cast<unsigned long>(seq),
                              (double)seg.samples.size() / 16000.0, reason);
             }
-            RT_LOG("VadFacadeLoop sid=%s emit reason=%s n=%zu",
-                   session->id.c_str(), reason, seg.samples.size());
+            RT_LOG("VadFacadeLoop sid=%s emit seq=%lu reason=%s n=%zu",
+                   session->id.c_str(), static_cast<unsigned long>(seq), reason, seg.samples.size());
             const bool pushed = queue->Push(std::move(seg));
             if (!pushed) {
-                RT_LOG("VadFacadeLoop sid=%s queue closed, exiting", session->id.c_str());
+                RT_LOG("VAD-push-failed sid=%s seq=%lu reason=%s queue_closed=1",
+                       session->id.c_str(), static_cast<unsigned long>(seq), reason);
                 return false;
+            }
+            if (was_first) {
+                worker->first_segment_queued.store(true, std::memory_order_release);
             }
             src->clear();
             return true;
@@ -3831,9 +3898,7 @@ int RunServer(const ServerConfig & config) {
                     (double)emit_samples.size() / 16000.0, reason,
                     kVadPreRollMs, kVadPostRollMs);
             }
-          RT_LOG("VadFacadeLoop sid=%s emit reason=%s n=%zu",
-                    session->id.c_str(), reason, emit_samples.size());
-            if (!first_emit_logged) {
+          if (!first_emit_logged) {
                 RT_LOG("VAD-first-emit sid=%s reason=%s audio=%.2fs silence=%dms",
                        session->id.c_str(), reason,
                        (double)emit_samples.size() / 16000.0,
@@ -3844,19 +3909,18 @@ int RunServer(const ServerConfig & config) {
             seg.samples = std::move(emit_samples);
             seg.commit_reason = reason;
             seg.is_eof_terminator = false;
-            /* Phase 2A: fill observability fields. */
-            seg.seq = worker->next_segment_seq.fetch_add(1, std::memory_order_relaxed);
-            seg.first_segment = !worker->first_segment_queued.load(std::memory_order_relaxed);
-            seg.endpoint_mode = ep_mode == EndpointMode::kCapOnly ? "cap_only" : "legacy";
-            seg.total_samples_at_push = worker->cumulative_decoded_samples.load(std::memory_order_relaxed);
-            seg.queued_audio_sec = static_cast<double>(seg.samples.size()) / 16000.0;
+            FillSegmentObservability(&seg);
+            const bool was_first = seg.first_segment;
+            const uint64_t seg_seq = seg.seq;
+            RT_LOG("VadFacadeLoop sid=%s emit seq=%lu reason=%s n=%zu",
+                   session->id.c_str(), static_cast<unsigned long>(seg_seq), reason, seg.samples.size());
             const bool pushed = queue->Push(std::move(seg));
             if (!pushed) {
-                RT_LOG("VadFacadeLoop sid=%s queue closed, exiting", session->id.c_str());
+                RT_LOG("VAD-push-failed sid=%s seq=%lu reason=%s queue_closed=1",
+                       session->id.c_str(), static_cast<unsigned long>(seg_seq), reason);
                 return false;
             }
-            /* Phase 2B §6.8: mark first_segment_queued after successful push. */
-            if (seg.first_segment) {
+            if (was_first) {
                 worker->first_segment_queued.store(true, std::memory_order_release);
             }
             segment_buffer.clear();
@@ -4341,29 +4405,40 @@ int RunServer(const ServerConfig & config) {
                  }
 
                  if (cap_grace_active) {
-                     const int64_t now_ms_val = steady_ms();
-                     const bool cap_valley =
-                         segment_active && silence_run_ms >= cap_pol.cap_valley_silence_ms;
-                     const bool cap_grace_expired =
-                         now_ms_val - cap_grace_start_ms >= cap_pol.cap_grace_ms;
+                      const int64_t now_ms_val = steady_ms();
+                      const bool cap_valley =
+                          segment_active && silence_run_ms >= cap_pol.cap_valley_silence_ms;
+                      const bool cap_grace_expired =
+                          now_ms_val - cap_grace_start_ms >= cap_pol.cap_grace_ms;
 
-                     if (cap_valley || cap_grace_expired) {
-                         const char * cap_reason = cap_valley
-                             ? "latency_cap_valley"
-                             : "latency_cap_forced";
-                         if (qwen_verbose >= 1) {
-                             std::fprintf(stderr,
-                                 "VAD-facade: cap_only emit reason=%s buf=%.2fs\n",
-                                 cap_reason, (double)buf_samples / 16000.0);
-                         }
-                         if (!emit_segment_buffer(cap_reason)) {
-                             break;
-                         }
-                         cap_grace_active = false;
-                         cap_grace_start_ms = 0;
-                         active_endpoint_locked = false;
-                         continue;
-                     }
+                      if (cap_valley || cap_grace_expired) {
+                          const char * cap_reason = cap_valley
+                              ? "latency_cap_valley"
+                              : "latency_cap_forced";
+                          /* Phase 2.1 §3.5: flush pending before cap emit to
+                           * maintain segment order consistency, matching softcap. */
+                          if (!pending_buffer.empty()) {
+                              if (!emit_buffer(&pending_buffer,
+                                               pending_last_speech_offset,
+                                               "pending_pre_latency_cap")) {
+                                  break;
+                              }
+                              pending_last_speech_offset = -1;
+                              pending_expire_at_ms = 0;
+                          }
+                          if (qwen_verbose >= 1) {
+                              std::fprintf(stderr,
+                                  "VAD-facade: cap_only emit reason=%s buf=%.2fs\n",
+                                  cap_reason, (double)buf_samples / 16000.0);
+                          }
+                          if (!emit_segment_buffer(cap_reason)) {
+                              break;
+                          }
+                          cap_grace_active = false;
+                          cap_grace_start_ms = 0;
+                          active_endpoint_locked = false;
+                          continue;
+                      }
                  }
              } else if (buf_soft_deadline) {
                  /* Soft-cap grace: buffer reached soft deadline.
@@ -4548,17 +4623,8 @@ int RunServer(const ServerConfig & config) {
             char * raw = qwen_transcribe_audio(live_ctx, seg.samples.data(), n_samples);
             RT_LOG("AsrWorkerLoop sid=%s qwen_transcribe_audio RETURNED", session->id.c_str());
 
-           /* Phase 2A: ASR result logging. */
-            RT_LOG("ASR-worker-result sid=%s seq=%lu text_empty=%d total=%.0fms enc=%.0fms dec=%.0fms tokens=%d",
-                   session->id.c_str(),
-                   static_cast<unsigned long>(seg.seq),
-                   raw ? 0 : 1,
-                   live_ctx->perf_total_ms,
-                   live_ctx->perf_encode_ms,
-                   live_ctx->perf_decode_ms,
-                   live_ctx->perf_text_tokens);
-
-            /* Extract text from raw (if any) before dump. */
+            /* Phase 2.1 §3.2: separate raw_null and text_empty. */
+            const bool raw_null = raw == nullptr;
             std::string asr_text;
             if (raw != nullptr) {
                 asr_text.assign(raw);
@@ -4568,11 +4634,22 @@ int RunServer(const ServerConfig & config) {
                     asr_text.pop_back();
                 }
             }
+            const bool text_empty = asr_text.empty();
 
-            /* Phase 2A: dump segment as WAV + JSON if enabled.
-             * Dump is done in ASR worker (not VAD thread) to avoid
-             * blocking real-time ingest. */
-            if (dump_cfg.enabled && !asr_text.empty()) {
+            RT_LOG("ASR-worker-result sid=%s seq=%lu raw_null=%d text_empty=%d total=%.0fms enc=%.0fms dec=%.0fms tokens=%d",
+                   session->id.c_str(),
+                   static_cast<unsigned long>(seg.seq),
+                   raw_null ? 1 : 0,
+                   text_empty ? 1 : 0,
+                   live_ctx->perf_total_ms,
+                   live_ctx->perf_encode_ms,
+                   live_ctx->perf_decode_ms,
+                   live_ctx->perf_text_tokens);
+
+            /* Phase 2.1 §3.1: dump ALL segments, including empty-text ones.
+             * This eliminates the blind spot where ASR empty segments have
+             * no WAV/JSON evidence, making missing-sentence diagnosis impossible. */
+            if (dump_cfg.enabled) {
                 RealtimeLiveWorker * wrk = session->live_worker.get();
                 const uint64_t dumped = wrk->dumped_segment_count.fetch_add(1, std::memory_order_relaxed);
                 const uint64_t dumped_samples = wrk->dumped_sample_count.fetch_add(
@@ -4581,7 +4658,6 @@ int RunServer(const ServerConfig & config) {
                 if (dumped < dump_cfg.max_segments && total_sec < static_cast<double>(dump_cfg.max_seconds)) {
                     const fs::path dump_dir(dump_cfg.dir);
                     fs::create_directories(dump_dir);
-                    /* Build filename: sid_12_seq_000003_vad_silence.wav */
                     char name_buf[256];
                     std::snprintf(name_buf, sizeof(name_buf),
                                   "sid_%s_seq_%06lu_%s.wav",
@@ -4595,10 +4671,8 @@ int RunServer(const ServerConfig & config) {
                                   static_cast<unsigned long>(seg.seq),
                                   seg.commit_reason.c_str());
                     const std::string json_name(name_buf);
-                    /* Dump WAV — failure is non-fatal. */
                     WriteFloatMono16kWav(dump_dir / wav_name,
                                          seg.samples.data(), n_samples);
-                    /* Build JSON metadata with ASR perf + text. */
                     Json meta = Json::object();
                     meta["sid"] = session->id;
                     meta["seq"] = static_cast<std::int64_t>(seg.seq);
@@ -4609,6 +4683,10 @@ int RunServer(const ServerConfig & config) {
                     meta["sample_count"] = static_cast<std::int64_t>(n_samples);
                     meta["language"] = session->language;
                     meta["forced_language"] = forced_language;
+                    meta["raw_null"] = raw_null;
+                    meta["text_empty"] = text_empty;
+                    meta["asr_empty"] = text_empty;
+                    meta["asr_text"] = asr_text;
                     meta["total_samples_at_push"] = seg.total_samples_at_push;
                     meta["left_context_ms"] = 0;
                     meta["right_context_ms"] = 0;
@@ -4619,8 +4697,6 @@ int RunServer(const ServerConfig & config) {
                     meta["asr_encode_ms"] = live_ctx->perf_encode_ms;
                     meta["asr_decode_ms"] = live_ctx->perf_decode_ms;
                     meta["asr_tokens"] = live_ctx->perf_text_tokens;
-                    meta["asr_empty"] = false;
-                    meta["asr_text"] = asr_text;
                     std::ofstream jf(dump_dir / json_name);
                     if (jf) {
                         jf << meta.dump() << std::endl;
@@ -5038,6 +5114,8 @@ int RunServer(const ServerConfig & config) {
         }
         RT_LOG("FinalizeRealtimeSession sid=%s about to join worker=%p", session_id.c_str(), (void*)worker);
         JoinRealtimeLiveWorker(worker);
+        /* Phase 2.1 §3.6: log queue stats after join. */
+        worker->segment_queue.LogStats(session_id.c_str());
         RT_LOG("FinalizeRealtimeSession sid=%s join returned", session_id.c_str());
 
        {
@@ -5096,55 +5174,64 @@ int RunServer(const ServerConfig & config) {
                  }
              }
       std::thread([ssn, sid, lang, bm = batch_model, audioCopy = std::move(audioCopy),
-                           vadText = std::move(vadText)]() mutable {
-                  qwen_ctx_t * reconcile_ctx = bm->CreateRealtimeClone();
-                 if (reconcile_ctx && audioCopy.size() > 1024) {
-                     reconcile_ctx->segment_sec = 0.0f;
-                     reconcile_ctx->search_sec = 0.0f;
-                     reconcile_ctx->past_text_conditioning = 0;
-                     reconcile_ctx->stream_chunk_sec = 0.0f;
-                     reconcile_ctx->stream_max_new_tokens = 0;
-                     if (!lang.empty()) {
-                         qwen_set_force_language(reconcile_ctx, lang.c_str());
-                     }
-                     qwen_set_prompt(reconcile_ctx, nullptr);
+                            vadText = std::move(vadText)]() mutable {
+                   qwen_ctx_t * reconcile_ctx = bm->CreateRealtimeClone();
+                  if (reconcile_ctx && audioCopy.size() > 1024) {
+                      reconcile_ctx->segment_sec = 0.0f;
+                      reconcile_ctx->search_sec = 0.0f;
+                      reconcile_ctx->past_text_conditioning = 0;
+                      reconcile_ctx->stream_chunk_sec = 0.0f;
+                      reconcile_ctx->stream_max_new_tokens = 0;
+                      if (!lang.empty()) {
+                          qwen_set_force_language(reconcile_ctx, lang.c_str());
+                      }
+                      qwen_set_prompt(reconcile_ctx, nullptr);
 
-                     char * raw = qwen_transcribe_audio(reconcile_ctx,
-                         audioCopy.data(),
-                         static_cast<int>(audioCopy.size()));
-                     if (raw) {
-                         std::string full_text(raw);
-                         std::free(raw);
-                         while (!full_text.empty() &&
-                                (full_text.back() == ' ' || full_text.back() == '\n' || full_text.back() == '\t')) {
-                             full_text.pop_back();
-                         }
-                         if (!full_text.empty() &&
-                             full_text.size() >= vadText.size() * 0.9) {
-                             if (qwen_verbose >= 1) {
-                                 std::fprintf(stderr,
-                                     "RECONCILE sid=%s: replacing VAD text (%zd chars) "
-                                     "with retranscribed (%zd chars)\n",
-                                     sid.c_str(), vadText.size(), full_text.size());
-                             }
-                             std::lock_guard<std::mutex> lock(ssn->mu);
-                             ssn->segments_text.clear();
-                             ssn->segments_text.push_back(full_text);
-                             ssn->text = full_text;
-                             ssn->stable_text = full_text;
-                             ssn->sse_cv.notify_all();
-                         } else if (!full_text.empty() && qwen_verbose >= 1) {
-                             std::fprintf(stderr,
-                                 "RECONCILE sid=%s: retranscribed (%zd) shorter than "
-                                 "VAD (%zd), keeping VAD text\n",
-                                 sid.c_str(), full_text.size(), vadText.size());
-                         }
-                     }
-                     qwen_free(reconcile_ctx);
-                 } else if (reconcile_ctx) {
-                     qwen_free(reconcile_ctx);
-                 }
-             }).detach();
+                      char * raw = qwen_transcribe_audio(reconcile_ctx,
+                          audioCopy.data(),
+                          static_cast<int>(audioCopy.size()));
+                      if (raw) {
+                          std::string full_text(raw);
+                          std::free(raw);
+                          while (!full_text.empty() &&
+                                 (full_text.back() == ' ' || full_text.back() == '\n' || full_text.back() == '\t')) {
+                              full_text.pop_back();
+                          }
+                          const bool should_replace = !full_text.empty() &&
+                              full_text.size() >= vadText.size() * 0.9;
+                          RT_LOG("RECONCILE sid=%s vad_len=%zd full_len=%zd replace=%d "
+                                 "forced_lang=%s full_audio_sec=%.2f",
+                                 sid.c_str(),
+                                 vadText.size(),
+                                 full_text.size(),
+                                 should_replace ? 1 : 0,
+                                 lang.empty() ? "<auto>" : lang.c_str(),
+                                 static_cast<double>(audioCopy.size()) / 16000.0);
+                          if (should_replace) {
+                              if (qwen_verbose >= 1) {
+                                  std::fprintf(stderr,
+                                      "RECONCILE sid=%s: replacing VAD text (%zd chars) "
+                                      "with retranscribed (%zd chars)\n",
+                                      sid.c_str(), vadText.size(), full_text.size());
+                              }
+                              std::lock_guard<std::mutex> lock(ssn->mu);
+                              ssn->segments_text.clear();
+                              ssn->segments_text.push_back(full_text);
+                              ssn->text = full_text;
+                              ssn->stable_text = full_text;
+                              ssn->sse_cv.notify_all();
+                          } else if (!full_text.empty() && qwen_verbose >= 1) {
+                              std::fprintf(stderr,
+                                  "RECONCILE sid=%s: retranscribed (%zd) shorter than "
+                                  "VAD (%zd), keeping VAD text\n",
+                                  sid.c_str(), full_text.size(), vadText.size());
+                          }
+                      }
+                      qwen_free(reconcile_ctx);
+                  } else if (reconcile_ctx) {
+                      qwen_free(reconcile_ctx);
+                  }
+              }).detach();
          }
 
          return OkStatus();
