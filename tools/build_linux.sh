@@ -74,6 +74,17 @@ PYTHON_BIN="${QASR_PYTHON:-}"
 
 JOBS="${QASR_JOBS:-}"
 MODEL_DIR_OVERRIDE=""
+
+# ─────────────── 架构检测 ───────────────
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64)  ONNXRUNTIME_ARCH="x64" ;;
+    aarch64) ONNXRUNTIME_ARCH="aarch64" ;;
+    *)
+        ONNXRUNTIME_ARCH="x64"
+        log_warn "未知架构 $ARCH, ONNX Runtime 默认用 x64 (可能不兼容)"
+        ;;
+esac
 APT_MIRROR="${QASR_APT_MIRROR:-}"
 
 DO_CLEAN=1            # 默认 clean
@@ -476,11 +487,11 @@ probe_onnxruntime() {
 }
 
 copy_local_onnxruntime_to_deps() {
-    # 复用 $PROJECT_ROOT/../paddle_on_cpu/third_party/onnxruntime-linux-x64-*
+    # 复用相邻项目的预编译 (onnxruntime-linux-${ONNXRUNTIME_ARCH}-*)
     local proj_parent
     proj_parent="$(dirname "$PROJECT_ROOT")"
     local src
-    src="$(ls -d "$proj_parent"/paddle_on_cpu/third_party/onnxruntime-linux-x64-* 2>/dev/null | head -1)"
+    src="$(ls -d "$proj_parent"/paddle_on_cpu/third_party/onnxruntime-linux-${ONNXRUNTIME_ARCH}-* 2>/dev/null | head -1)"
     if [[ -z "$src" ]] || [[ ! -f "$src/include/onnxruntime_c_api.h" ]]; then
         return 1
     fi
@@ -498,7 +509,7 @@ copy_local_onnxruntime_to_deps() {
 
 download_onnxruntime() {
     local ver="$ONNXRUNTIME_VERSION"
-    local url="https://github.com/microsoft/onnxruntime/releases/download/v${ver}/onnxruntime-linux-x64-${ver}.tgz"
+    local url="https://github.com/microsoft/onnxruntime/releases/download/v${ver}/onnxruntime-linux-${ONNXRUNTIME_ARCH}-${ver}.tgz"
     local work; work="$(mktemp -d -t qasr-onnx-XXXXXX)"
     log_info "下载: $url"
     if ! curl -fsSL --retry 3 --connect-timeout 15 \
@@ -515,7 +526,7 @@ download_onnxruntime() {
         log_warn "解压失败"; rm -rf "$work"; return 1
     fi
     local extracted
-    extracted="$(find "$work" -maxdepth 1 -type d -name 'onnxruntime-linux-x64-*' | head -1)"
+    extracted="$(find "$work" -maxdepth 1 -type d -name 'onnxruntime-linux-*-*' | head -1)"
     if [[ -z "$extracted" ]]; then
         log_warn "找不到解压目录"; rm -rf "$work"; return 1
     fi
@@ -539,7 +550,7 @@ check_onnxruntime() {
     if [[ $DO_DEP -eq 0 ]]; then
         log_warn "  --no-dep 禁止自动安装, 手动装:"
         log_warn "    1) 从 https://github.com/microsoft/onnxruntime/releases 下载"
-        log_warn "       onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz"
+        log_warn "       onnxruntime-linux-${ONNXRUNTIME_ARCH}-${ONNXRUNTIME_VERSION}.tgz"
         log_warn "    2) 解到 $DEPS_DIR/onnxruntime (或设 QASR_ONNXRUNTIME_ROOT)"
         return 0
     fi

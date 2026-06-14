@@ -45,3 +45,6 @@ testfile/*.txt
 
 # JS test deps (jsdom) — installed via npm install
 node_modules/
+
+# Downloaded ONNX Runtime (installed by build script)
+deps/
