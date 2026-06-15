@@ -452,6 +452,7 @@ if(QASR_ENABLE_TESTS)
         list(APPEND QASR_UNIT_TEST_SOURCES tests/session_test.cc)
         list(APPEND QASR_UNIT_TEST_SOURCES tests/scheduler_test.cc)
         list(APPEND QASR_UNIT_TEST_SOURCES tests/cuda_backend_test.cc)
+        list(APPEND QASR_UNIT_TEST_SOURCES tests/multi_session_analysis_test.cc)
     endif()
 
     add_executable(qasr_unit_tests ${QASR_UNIT_TEST_SOURCES})
