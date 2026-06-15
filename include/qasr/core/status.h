@@ -11,6 +11,7 @@ enum class StatusCode {
     kOutOfRange,
     kFailedPrecondition,
     kNotFound,
+    kResourceExhausted,
     kInternal,
     kUnimplemented,
 };

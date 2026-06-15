@@ -1071,7 +1071,7 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
         return NULL;
     }
 
-    /* ---- Build input embeddings ---- */
+     /* ---- Build input embeddings ---- */
     int prefix_len = PREFIX_HEAD_LEN + ctx->n_prompt_tokens + PREFIX_TAIL_LEN;
     int suffix_len = SUFFIX_BASE_LEN + ctx->n_force_prompt_tokens;
     int n_past_prompt_tokens = (n_past_tokens > 0) ? (n_past_tokens + 1) : 0; /* + <asr_text> */
@@ -3511,7 +3511,8 @@ static void stream_bg_encoder_wait_idle(stream_bg_encoder_t *bg) {
             token = qwen_decoder_forward(ctx, tmp_embed);
         }
 
-        double decode_ms = get_time_ms() - t0;
+   double decode_ms = get_time_ms() - t0;
+    fprintf(stderr, "\n");
         ctx->perf_decode_ms += decode_ms;
         if (qwen_verbose >= 2)
             fprintf(stderr, "  Decode: %d tokens (%.0f ms, %.1f ms/token%s)\n",

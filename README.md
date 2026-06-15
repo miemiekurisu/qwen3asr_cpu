@@ -1,8 +1,10 @@
 # qwen3asr_cpu
 
-Qwen3-ASR 的 CPU 推理服务与命令行工具，使用 C/C++17 实现。项目提供本地离线转写、字幕输出、HTTP API、内置 Web UI，以及面向 Windows / Linux / macOS 的 CPU 构建路径。
+Qwen3-ASR 的 CPU + GPU 推理服务与命令行工具，使用 C/C++17 实现。项目提供本地离线转写、字幕输出、HTTP API、内置 Web UI，以及面向 Windows / Linux / macOS 的构建路径。
 
-支持 Qwen3-ASR 0.6B / 1.7B safetensors 模型；Windows 和 Linux 使用 OpenBLAS，macOS 使用 Accelerate。可选 oneDNN INT8 路径用于 encoder / decoder 加速。
+支持 Qwen3-ASR 0.6B / 1.7B safetensors 模型：
+- **CPU**: OpenBLAS (win/linux) / Accelerate (macOS)，可选 oneDNN INT8 加速
+- **GPU (CUDA)**: DGX Spark / GB10 (sm_121)，自定义 CUDA kernel + cuBLAS
 
 **当前版本: v1.0.0** — [Release Notes](https://github.com/miemiekurisu/qwen3asr_cpu/releases/tag/v1.0.0)
 
@@ -17,7 +19,7 @@ Qwen3-ASR 的 CPU 推理服务与命令行工具，使用 C/C++17 实现。项�
 ```bat
 build_all.ps1                    # 一键 clean + configure + compile
 build_all.ps1 --incremental      # 增量编译（不删 build/）
-build_all.ps1 --test             # 构建后运行单元测试 (667 cases)
+build_all.ps1 --test             # 构建后运行单元测试 (735 cases)
 build_all.ps1 --clean            # 清理 build/
 build_all.ps1 --openblas-dir <path>  # 例如 D:\dev\OpenBLAS
 ```
@@ -100,7 +102,26 @@ HTTPS 反代每次启动 `mktemp -d` 生成自签 cert（退出时自动清，�
 
 ### macOS
 
-macOS 没有提供一键脚本，请按下面的手动流程编译：
+### Linux / DGX Spark — CUDA 后端
+
+CUDA 后端支持 DGX Spark (GB10, sm_121) 等 aarch64 Linux 平台，使用自定义 CUDA kernel（RMSNorm、RoPE、SwiGLU、Attention、tiled GEMV）+ cuBLAS fp32：
+
+```bash
+./build_cuda.sh                    # 一键构建 + short 音频测试
+./build_cuda.sh --long             # + long 音频测试
+./build_cuda.sh --clean            # 全量重建
+./build_cuda.sh --no-build         # 仅运行测试（跳过编译）
+```
+
+环境要求：CUDA Toolkit 13.x、cuBLAS、sm_121 架构。构建脚本会自动检查。
+
+CPU/CUDA 输出对比验证：
+```bash
+./build-dgx/qasr_v2_test <model_dir> <audio.wav> verify
+```
+`verify` 模式先后跑 CPU 和 CUDA，自动比对输出文本。
+
+### macOS
 
 ```bash
 brew install cmake ninja ffmpeg
@@ -516,18 +537,24 @@ export QWEN_DEC_PREFILL_QKV_BUDGET_MB=256
 ## 项目结构
 
 ```text
-app/                    CLI, server, benchmark entry points
-include/qasr/           Public C++ headers
+app/                    CLI, server, benchmark, v2 test entry points
+include/qasr/           Public C++ headers (backend, engine, scheduler)
 src/backend/qwen_cpu/   Internal C CPU backend and kernels
+src/backend/*.cu        CUDA kernels (attention, gemv, rms_norm, rope, swiglu, ...)
+src/backend/cuda_backend.cc  CUDA pipeline (encoder, decoder, prepare weights)
+src/backend/cpu_backend.cc   CPU pipeline
+src/engine/             V2 engine (CPU + CUDA engine adapters)
+src/scheduler/          GPU job scheduler
 src/service/            HTTP server and realtime session handling
 src/runtime/            Model bridge, tasks, sessions, queues
 src/protocol/           OpenAI/vLLM request validation
 src/audio/              WAV parsing, resampling, ffmpeg conversion helpers
 src/subtitle/           SRT/VTT/JSON subtitle writers
-tests/                  Unit and regression tests
+tests/                  Unit and regression tests (735 cases)
 ui/                     Browser UI
 tools/                  Build, benchmark, Docker helper scripts
 docs/                   Design notes and internal references
+build_cuda.sh           One-click CUDA build & test script (DGX Spark)
 ```
 
 ## License
@@ -585,6 +612,14 @@ tools/run_linux_server.sh --detach --https
 
 28.77 min 长音频从单次全段改为 ~40 个段, 单段 RTF 0.16-0.18, 总 wall time ~ RTF 1.3-1.5x (因 VAD sweep + 段提交 overhead)。`long.mp3` (6.9 MB, 28.77 min) 端到端 ~600s 跑通。
 
+CUDA 后端性能参考 (DGX Spark, GB10)：
+
+| 测试 | CPU | CUDA | 加速比 |
+|------|-----|------|--------|
+| 0.6B short (3s) | 1437 ms | 862 ms | 1.67x |
+| 1.7B short (3s) | 2190 ms | 1479 ms | 1.48x |
+| 0.6B long (28.8min) | — | 165 s (RTF 10.5x) | ~10x |
+
 #### 模型预热 (Model Warmup)
 
 Server 启动时自动运行 1 秒静音推理，触发 oneDNN JIT 编译并预热 CPU 缓存。预热同步完成后再监听 HTTP 端口，首次请求不会被 JIT 编译拖慢延迟。
@@ -600,8 +635,11 @@ Stop 请求立即返回 VAD 分段结果，后台异步使用 batch 模型（1.7
 #### 测试
 
 ```bash
-# C++ 单测 (667 cases, 全部 PASS, ASAN build 654 cases)
+# C++ 单测 (735 cases, 全部 PASS)
 ctest --test-dir build/linux-openblas --output-on-failure
+
+# CUDA 单元测试 (与 CPU 分开构建)
+./build-dgx/qasr_unit_tests
 
 # JS 状态机纯函数 (47 cases — 6 个纯函数: 重置/确认/降采样/PCM16/字符数/导出名)
 node tests/state_pure_test.js
