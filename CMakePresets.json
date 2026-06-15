@@ -45,10 +45,23 @@
       }
     },
     {
-      "name": "windows-openblas",
-      "inherits": "base",
-      "description": "Windows / OpenBLAS"
-    }
+       "name": "windows-openblas",
+       "inherits": "base",
+       "description": "Windows / OpenBLAS"
+     },
+     {
+       "name": "linux-aarch64-dgx-spark-cuda13-sm121",
+       "inherits": "base",
+       "description": "DGX Spark / aarch64 / CUDA 13 / sm_121 / Engine v2",
+       "cacheVariables": {
+         "CMAKE_BUILD_TYPE": "Release",
+         "QASR_ENABLE_CUDA_BACKEND": "ON",
+         "QASR_ENABLE_SILERO_VAD": "ON",
+         "QASR_CUDA_PLATFORM": "dgx_spark",
+         "CMAKE_CUDA_COMPILER": "/usr/local/cuda/bin/nvcc",
+         "CMAKE_CUDA_ARCHITECTURES": "121"
+       }
+     }
   ],
   "buildPresets": [
     {
@@ -68,9 +81,13 @@
       "configurePreset": "linux-openblas-asan"
     },
     {
-      "name": "windows-openblas",
-      "configurePreset": "windows-openblas"
-    }
+       "name": "windows-openblas",
+       "configurePreset": "windows-openblas"
+     },
+     {
+       "name": "linux-aarch64-dgx-spark-cuda13-sm121",
+       "configurePreset": "linux-aarch64-dgx-spark-cuda13-sm121"
+     }
   ],
   "testPresets": [
     {
@@ -101,12 +118,19 @@
         "outputOnFailure": true
       }
     },
-    {
-      "name": "windows-openblas",
-      "configurePreset": "windows-openblas",
-      "output": {
-        "outputOnFailure": true
-      }
-    }
+   {
+       "name": "windows-openblas",
+       "configurePreset": "windows-openblas",
+       "output": {
+         "outputOnFailure": true
+       }
+     },
+     {
+       "name": "linux-aarch64-dgx-spark-cuda13-sm121",
+       "configurePreset": "linux-aarch64-dgx-spark-cuda13-sm121",
+       "output": {
+         "outputOnFailure": true
+       }
+     }
   ]
 }
