@@ -46,6 +46,8 @@ std::string_view StatusCodeName(StatusCode code) noexcept {
             return "FAILED_PRECONDITION";
         case StatusCode::kNotFound:
             return "NOT_FOUND";
+        case StatusCode::kResourceExhausted:
+            return "RESOURCE_EXHAUSTED";
         case StatusCode::kInternal:
             return "INTERNAL";
         case StatusCode::kUnimplemented:
