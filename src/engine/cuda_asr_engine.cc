@@ -8,6 +8,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
+#ifdef QASR_CUDA_BACKEND_ENABLED
+#include <cuda_runtime.h>
+#endif
 
 extern "C" {
 #include "qwen_asr.h"
@@ -18,6 +21,7 @@ extern "C" {
 
 namespace qasr {
 
+#ifdef QASR_CUDA_BACKEND_ENABLED
 /* ---- Single-segment GPU transcribe helper ---- */
 
 static std::string transcribe_segment_gpu(
@@ -187,6 +191,7 @@ static bool should_insert_boundary_space(int prev_ch, int next_ch) {
         return false;
     return true;
 }
+#endif
 
 Status CudaAsrEngine::LoadModel(const V2EngineConfig & config) {
     config_ = config;
@@ -214,12 +219,6 @@ Status CudaAsrEngine::LoadModel(const V2EngineConfig & config) {
         cpu_fallback_ = std::make_shared<CpuBackend>();
         return cpu_fallback_->PrepareWeights(config_.model_dir);
     }
-
-    scheduler_.SetCallback([this](const SegmentResult & res) {
-        (void)res;
-    });
-    scheduler_.SetWorker(config_.max_active_gpu_jobs);
-    scheduler_.Start();
 
     return OkStatus();
 }
@@ -316,6 +315,7 @@ AsrSegmentResult CudaAsrEngine::TranscribeSegment(std::uint64_t session_id,
         return result;
     }
 
+ #ifdef QASR_CUDA_BACKEND_ENABLED
     if (!cuda_backend_ || !cuda_backend_->cuda_weights() ||
         !cuda_backend_->cuda_weights()->decoder_ready) {
         result.status = Status(StatusCode::kFailedPrecondition, "no backend available");
@@ -475,11 +475,33 @@ AsrSegmentResult CudaAsrEngine::TranscribeSegment(std::uint64_t session_id,
     result.total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     result.status = OkStatus();
     return result;
+#else
+    result.status = Status(StatusCode::kUnimplemented,
+                           "CUDA not available — use CPU backend or rebuild with -DQASR_ENABLE_CUDA_BACKEND=ON");
+    return result;
+#endif
 }
 
 int CudaAsrEngine::ActiveSessionCount() const {
     std::lock_guard<std::mutex> lock(mu_);
     return static_cast<int>(sessions_.size());
+}
+
+std::unique_ptr<SessionHandle> CudaAsrEngine::CreateRealtimeSession(
+    const SessionOptions & opts) {
+    (void)opts;
+    // CUDA realtime session: nativeCtx() returns nullptr, inference goes
+    // through AsrEngine::TranscribeSegment.
+    return nullptr;
+}
+
+void CudaAsrEngine::CloseSessionHandle(std::unique_ptr<SessionHandle>) {
+    // No-op for CUDA path (no native ctx to free)
+}
+
+void *CudaAsrEngine::getVadHandle() const {
+    // VAD is CPU-only; CUDA backend doesn't own a VAD handle.
+    return nullptr;
 }
 
 }  // namespace qasr

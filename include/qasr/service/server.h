@@ -8,6 +8,7 @@
 
 #include "qasr/base/http_server.h"
 #include "qasr/core/status.h"
+#include "qasr/engine/types.h"
 #include "qasr/service/realtime.h"
 
 namespace qasr {
@@ -57,6 +58,8 @@ struct ServerConfig {
      * (its quality impact is minimal).  Decoder INT8 is intentionally
      * not exposed — see docs/INCIDENTS.md for the rationale
      * (degraded language consistency). */
+    BackendKind backend = BackendKind::kCpu;
+    bool allow_backend_fallback = true;
 };
 
 Status ParseBooleanText(std::string_view field_name, std::string_view text, bool * value);

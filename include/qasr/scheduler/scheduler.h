@@ -1,7 +1,7 @@
 #pragma once
 
 #include "qasr/core/status.h"
-#include "qasr/engine/types.h"
+#include "qasr/engine/asr_engine.h"
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -9,11 +9,17 @@
 #include <queue>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <condition_variable>
 #include <atomic>
 
 namespace qasr {
+
+struct SegmentResult;
+
+using JobCompleteCallback = std::function<void(const SegmentResult &)>;
 
 struct SegmentJob {
     std::uint64_t session_id;
@@ -26,6 +32,16 @@ struct SegmentJob {
     std::chrono::steady_clock::time_point deadline;
     std::string language;
     std::string prompt;
+
+    /* Optional pre-existing engine session ID.  If non-zero,
+     * ExecuteJob reuses this session instead of creating a
+     * transient one.  The caller is responsible for cleanup. */
+    std::uint64_t engine_session_id = 0;
+
+    /* Per-job callback — invoked by ExecuteJob on completion.
+     * Takes ownership of the callback to avoid global callback
+     * race in SubmitAndAwait. */
+    JobCompleteCallback on_job_complete;
 };
 
 struct SegmentResult {
@@ -39,8 +55,6 @@ struct SegmentResult {
     int tokens = 0;
 };
 
-using JobCompleteCallback = std::function<void(const SegmentResult &)>;
-
 class SessionFairQueue {
 public:
     Status Push(const SegmentJob & job);
@@ -49,8 +63,13 @@ public:
     size_t size() const { return queue_.size(); }
     bool Full(int max_size) const { return queue_.size() >= static_cast<size_t>(max_size); }
 
+    /* Check if session has a pending job (backpressure). */
+    bool SessionHasPending(std::uint64_t session_id) const;
+
 private:
     std::queue<SegmentJob> queue_;
+    /* Per-session job count — tracks how many jobs each session has in queue. */
+    std::unordered_map<std::uint64_t, int> session_count_;
     mutable std::mutex mu_;
 };
 
@@ -59,7 +78,16 @@ public:
     GpuScheduler();
     ~GpuScheduler();
 
+    /* Set the engine that performs inference. Must be called before Start. */
+    void SetEngine(AsrEngine * engine);
+
     Status Submit(const SegmentJob & job);
+
+    /* Synchronous submit-and-await: submit a job and block until
+     * the result is ready.  Useful for batch paths that need the
+     * result inline.  Returns the SegmentResult directly. */
+    SegmentResult SubmitAndAwait(const SegmentJob & job);
+
     void SetWorker(int worker_count = 1);
     void SetCallback(JobCompleteCallback cb);
     void Start();
@@ -70,6 +98,7 @@ public:
 
 private:
     void WorkerLoop();
+    void ExecuteJob(SegmentJob & job);
 
     int max_sessions_ = 3;
     int max_active_gpu_jobs_ = 1;
@@ -79,13 +108,17 @@ private:
     SessionFairQueue realtime_queue_;
     SessionFairQueue batch_queue_;
 
+    AsrEngine * engine_ = nullptr;
+    JobCompleteCallback on_complete_;
+
+    /* Per-session inflight tracking — max 1 inflight per session. */
+    std::unordered_set<std::uint64_t> inflight_sessions_;
+
     std::mutex mu_;
     std::condition_variable cv_;
     std::atomic<bool> shutdown_{false};
     std::atomic<bool> running_{false};
     std::vector<std::thread> workers_;
-
-    JobCompleteCallback on_complete_;
 };
 
 }  // namespace qasr

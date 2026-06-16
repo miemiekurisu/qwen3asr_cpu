@@ -40,6 +40,19 @@ struct AsrSegmentResult {
 using TokenCallback = std::function<void(std::string_view)>;
 using CancelCallback = std::function<bool()>;
 
+class AsrEngine;
+
+/// Lightweight handle to a per-session inference context.
+/// CPU: nativeCtx() returns qwen_ctx_t* for C bridge interop.
+/// CUDA: nativeCtx() returns nullptr; use engine()->TranscribeSegment().
+class SessionHandle {
+public:
+    virtual ~SessionHandle() = default;
+    virtual void *nativeCtx() const = 0;
+    virtual AsrEngine *engine() const = 0;
+    virtual std::uint64_t sessionId() const = 0;
+};
+
 class AsrEngine {
 public:
     AsrEngine() = default;
@@ -55,6 +68,24 @@ public:
                                                 CancelCallback on_cancel = {}) = 0;
     virtual int ActiveSessionCount() const = 0;
     virtual const V2EngineConfig & config() const = 0;
+
+    // Create a realtime clone for a VAD/ASR worker thread.
+    // CPU returns a handle with nativeCtx() pointing to a qwen_clone_shared().
+    // CUDA returns a handle with nativeCtx() == nullptr, using engine() instead.
+    virtual std::unique_ptr<SessionHandle> CreateRealtimeSession(
+        const SessionOptions & opts) = 0;
+
+    // Release a realtime session handle.
+    virtual void CloseSessionHandle(std::unique_ptr<SessionHandle>) = 0;
+
+    // Return shared VAD handle (CPU only, for Silero VAD).
+    // Returns nullptr on CUDA backend (VAD is always CPU).
+    virtual void *getVadHandle() const = 0;
+
+    // Return underlying C context (for C bridge calls in ServerAsrFacade).
+    // CPU: returns qwen_ctx_t* from CpuBackend.
+    // CUDA: returns nullptr (or CPU fallback ctx when applicable).
+    virtual void *base_ctx() const { return nullptr; }
 };
 
 std::unique_ptr<AsrEngine> CreateEngine(BackendKind backend);

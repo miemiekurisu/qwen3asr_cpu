@@ -76,7 +76,16 @@ UI_DIR="${QASR_UI_DIR:-$PROJECT_ROOT/ui}"
 THREADS="${QASR_THREADS:-0}"
 VERBOSITY="${QASR_VERBOSITY:-0}"
 VAD_MODEL="${QASR_VAD_MODEL:-$PROJECT_ROOT/models/silero_vad/silero_vad.onnx}"
-BUILD_DIR="${QASR_BUILD_DIR:-$PROJECT_ROOT/build/linux-openblas}"
+# Auto-detect: prefer build-dgx (CUDA) over build/linux-openblas (CPU)
+if [[ -n "${QASR_BUILD_DIR:-}" ]]; then
+    BUILD_DIR="$QASR_BUILD_DIR"
+elif [[ -x "$PROJECT_ROOT/build-dgx/qasr_server" ]]; then
+    BUILD_DIR="$PROJECT_ROOT/build-dgx"
+elif [[ -x "$PROJECT_ROOT/build/linux-openblas/qasr_server" ]]; then
+    BUILD_DIR="$PROJECT_ROOT/build/linux-openblas"
+else
+    BUILD_DIR="$PROJECT_ROOT/build/linux-openblas"
+fi
 LOG_FILE="${QASR_LOG_FILE:-/tmp/qasr_server.log}"
 PID_FILE="${QASR_PID_FILE:-/tmp/qasr_server.pid}"
 PROXY_SCRIPT="${QASR_PROXY_SCRIPT:-$SCRIPT_DIR/https_proxy.py}"
@@ -149,7 +158,7 @@ HTTPS 方案对比:
 EOF
 }
 
-while [[ $# -gt 0 ]]; do
+ while [[ $# -gt 0 ]]; do
     case "$1" in
         --detach)         DETACHED=1; shift ;;
         --https)          USE_HTTPS=1; shift ;;
@@ -157,6 +166,7 @@ while [[ $# -gt 0 ]]; do
         --status)         DO_STATUS=1; shift ;;
         --https-info)     DO_HTTPS_INFO=1; shift ;;
         --verbose)        VERBOSITY=3; shift ;;
+        --backend)        shift; SERVER_BACKEND="${1:-cuda}"; shift ;;
         -h|--help)        usage; exit 0 ;;
         *)                log_err "未知选项: $1"; usage >&2; exit 2 ;;
     esac
@@ -376,7 +386,8 @@ do_start() {
         --threads   "$THREADS"
         --verbosity "$VERBOSITY"
     )
-    [[ -n "$REALTIME_MODEL_DIR" ]] && args+=(--realtime-model-dir "$REALTIME_MODEL_DIR")
+      [[ -n "$REALTIME_MODEL_DIR" ]] && args+=(--realtime-model-dir "$REALTIME_MODEL_DIR")
+    [[ -n "$SERVER_BACKEND" ]] && args+=(--backend "$SERVER_BACKEND")
 
     if [[ $DETACHED -eq 1 ]]; then
         log_step "后台启动 server (日志 $LOG_FILE, PID $PID_FILE)"

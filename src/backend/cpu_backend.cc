@@ -138,4 +138,10 @@ Status CpuBackend::ArgMax(const float * logits,
     return OkStatus();
 }
 
+void *CpuBackend::vadHandle() const {
+    if (!weights_ || !weights_->ctx) return nullptr;
+    auto * ctx = reinterpret_cast<qwen_ctx_t *>(weights_->ctx);
+    return ctx->vad ? ctx->vad : nullptr;
+}
+
 }  // namespace qasr

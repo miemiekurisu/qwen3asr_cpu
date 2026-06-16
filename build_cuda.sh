@@ -10,6 +10,9 @@ set -euo pipefail
 #   ./build_cuda.sh --clean            # full clean rebuild + short test
 #   ./build_cuda.sh --clean --long     # full clean rebuild + both tests
 #   ./build_cuda.sh --no-build         # skip build, only run tests
+#   ./build_cuda.sh --serve            # start server (bind 0.0.0.0:19991)
+#   ./build_cuda.sh --serve --https    # start server with HTTPS (port 443→19991)
+#   ./build_cuda.sh --serve --port 8080 # custom port
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -17,17 +20,25 @@ cd "$SCRIPT_DIR"
 BUILD_DIR="${SCRIPT_DIR}/build-dgx"
 BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; RED='\033[0;31m'; NC='\033[0m'
 
-DO_LONG=false; DO_CLEAN=false; NO_BUILD=false
+DO_LONG=false; DO_CLEAN=false; NO_BUILD=false; DO_SERVE=false
+SERVE_PORT=19991; SERVE_HOST="0.0.0.0"; SERVE_BACKEND=""
 for arg in "$@"; do
     case "$arg" in
         --long) DO_LONG=true ;;
         --clean) DO_CLEAN=true ;;
         --no-build) NO_BUILD=true ;;
+        --serve) DO_SERVE=true ;;
+        --port) shift; SERVE_PORT="$1" ;;
+        --host) shift; SERVE_HOST="$1" ;;
+        --backend) shift; SERVE_BACKEND="$1" ;;
         --help)
-            echo "Usage: $0 [--clean] [--long] [--no-build]"
+            echo "Usage: $0 [--clean] [--long] [--no-build] [--serve] [--port N] [--backend cpu|cuda]"
             echo "  --clean    Full clean rebuild"
             echo "  --long     Include long.mp3 test"
             echo "  --no-build Skip build, only run tests"
+            echo "  --serve    Start server (bind 0.0.0.0:19991)"
+            echo "  --port N   Server port (default: 19991)"
+            echo "  --backend  Inference backend (default: cpu)"
             exit 0 ;;
         *) echo "Unknown option: $arg (use --help)"; exit 1 ;;
     esac
@@ -115,7 +126,8 @@ else
     ok "Build done"
 fi
 
-# ── 4. Unit tests ───────────────────────────────────────────
+# ── 4. Unit tests (skip if --serve) ──────────────────────
+if [ "$DO_SERVE" = false ]; then
 step 4 $TOTAL_STEPS "Unit tests"
 
 UNIT_BIN="${BUILD_DIR}/qasr_unit_tests"
@@ -175,6 +187,42 @@ if [ "$DO_LONG" = true ]; then
         | sed 's/^/  /'
 else
     skip "use --long to test long.mp3"
+fi
+else
+    skip "tests skipped (--serve)"
+fi
+
+# ── 8. Start server (--serve) ─────────────────────────────
+if [ "$DO_SERVE" = true ]; then
+    TOTAL_STEPS=$((TOTAL_STEPS + 1))
+    step $TOTAL_STEPS $TOTAL_STEPS "Starting server"
+
+    SERVER_BIN="${BUILD_DIR}/qasr_server"
+    [ -x "$SERVER_BIN" ] || fail "Server binary not found: $SERVER_BIN"
+
+    # Kill existing
+    if pgrep -f "qasr_server.*--port ${SERVE_PORT}" > /dev/null 2>&1; then
+        echo -e "  ${YELLOW}Existing server on port $SERVE_PORT, killing...${NC}"
+        pkill -f "qasr_server.*--port ${SERVE_PORT}" || true
+        sleep 2
+    fi
+
+    echo "  model:      $MODEL_0_6B"
+    echo "  host:       $SERVE_HOST"
+    echo "  port:       $SERVE_PORT"
+    echo "  backend:    ${SERVE_BACKEND:-cpu}"
+    echo ""
+    echo -e "  ${YELLOW}Press Ctrl+C to stop${NC}"
+    echo ""
+
+    SERVER_ARGS=(
+        --model-dir "$MODEL_0_6B"
+        --host "$SERVE_HOST"
+        --port "$SERVE_PORT"
+        --verbosity 1
+    )
+    [[ -n "$SERVE_BACKEND" ]] && SERVER_ARGS+=(--backend "$SERVE_BACKEND")
+    exec "$SERVER_BIN" "${SERVER_ARGS[@]}"
 fi
 
 # ── Summary ─────────────────────────────────────────────────

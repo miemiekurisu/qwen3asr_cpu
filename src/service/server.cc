@@ -1,5 +1,6 @@
 #include "qasr/service/server.h"
 #include "qasr/service/realtime.h"
+#include "qasr/audio/audio_convert.h"
 
 #include <atomic>
 #include <cmath>
@@ -53,6 +54,9 @@ extern "C" {
 #endif
 
 #include "qasr/runtime/model_bridge.h"
+#include "qasr/engine/asr_engine.h"
+#include "qasr/engine/cpu_asr_engine.h"
+#include "qasr/scheduler/scheduler.h"
 
 namespace qasr {
 
@@ -898,201 +902,403 @@ int ForwardCancelRequest(void * userdata) {
     return (*callback)() ? 1 : 0;
 }
 
-class SharedAsrModel {
+
+// InferHandle: opaque handle returned by createInferHandle().
+// Wraps a SessionHandle or a raw qwen_ctx_t* depending on backend.
+struct InferHandle {
+    std::unique_ptr<SessionHandle> engineHandle;
+    qwen_ctx_t * nativeCtx = nullptr;  // CPU: ctx; CUDA: nullptr
+};
+
+/* ServerAsrFacade: facade over AsrEngine (CPU/CUDA) + C bridge.
+ *
+ * Provides the 6 call modes that RunServer uses:
+ *   ① TranscribeFile  (sync, batch)
+ *   ② TranscribeRealtime  (sync, chat)
+ *   ③ createInferHandle  (VAD-segmented batch, async)
+ *   ④ CreateRealtimeClone → via engine CreateRealtimeSession
+ *   ⑤ vad()
+ *   ⑥ temperature() / verbosity()
+ *
+ * CPU path: CpuAsrEngine owns qwen_ctx_t; facade calls C bridge on base_ctx().
+ * CUDA path: CudaAsrEngine handles inference via engine methods. */
+class ServerAsrFacade {
 public:
-    Status Load(const ServerConfig & config) {
-        Status status = ValidateModelDirectory(config.model_dir);
-        if (!status.ok()) {
-            return status;
+    Status Initialize(const ServerConfig & config) {
+        config_ = config;
+        backendKind_ = config.backend;
+        backendFallback_ = false;
+
+        V2EngineConfig engCfg;
+        engCfg.model_dir = config.model_dir;
+        engCfg.threads = config.threads;
+        engCfg.temperature = config.temperature;
+        engCfg.max_sessions = 8;
+        engCfg.verbosity = config.verbosity;
+
+        /* Try requested backend */
+        auto engine = CreateEngine(config.backend);
+        if (engine && engine->LoadModel(engCfg).ok()) {
+            engine_ = std::move(engine);
+        } else {
+            /* Fallback to CPU */
+            if (config.allow_backend_fallback && config.backend != BackendKind::kCpu) {
+                backendKind_ = BackendKind::kCpu;
+                backendFallback_ = true;
+                engine = CreateEngine(BackendKind::kCpu);
+                if (engine && engine->LoadModel(engCfg).ok()) {
+                    engine_ = std::move(engine);
+                }
+            }
         }
 
-        config_ = config;
-        qwen_verbose = config.verbosity;
-        qwen_monitor = 0;
-        const int threads = config.threads > 0 ? config.threads : qwen_get_num_cpus();
-        qwen_set_threads(threads);
-        ctx_ = qwen_load(config.model_dir.c_str());
-        if (ctx_ == nullptr) {
-            return Status(StatusCode::kInternal, "qwen_load failed");
+        if (!engine_) {
+            return Status(StatusCode::kInternal,
+                          "engine init failed");
         }
-        if (config.encoder_int8) {
-            /* encoder INT8 temporarily disabled (post-C8): see
-             * docs/INCIDENTS.md 2026-06-05 encoder INT8 disabled.
-             * Option still accepted for compatibility, but no-op. */
-            (void)0;
+
+        /* Initialize GPU scheduler for non-CPU backends (§7).
+         * CPU backend uses C bridge directly; scheduler is for GPU
+         * segment queuing and concurrency control. */
+        if (backendKind_ != BackendKind::kCpu) {
+            scheduler_ = std::make_unique<GpuScheduler>();
+            scheduler_->SetEngine(engine_.get());
+            scheduler_->SetCallback([](const SegmentResult & res) {
+                (void)res;
+            });
+            scheduler_->SetWorker(engCfg.max_active_gpu_jobs);
+            scheduler_->Start();
         }
-        ctx_->past_text_conditioning = 1;
-        ctx_->segment_sec = 30.0f;
-        if (config.temperature >= 0.0f) {
-            ctx_->decode_temperature = config.temperature;
-        }
+
         return OkStatus();
     }
 
-    ~SharedAsrModel() {
-        if (ctx_ != nullptr) {
-            qwen_free(ctx_);
+  AsrRunResult TranscribeFile(const fs::path & audio_path,
+                                   const ModelDecodeOptions & decode) {
+        if (!engine_) {
+            AsrRunResult r;
+            r.status = Status(StatusCode::kFailedPrecondition, "engine not loaded");
+            return r;
+        }
+        auto * base = static_cast<qwen_ctx_t *>(engine_->base_ctx());
+        if (base) {
+            return doTranscribeFile(base, decode, audio_path);
+        }
+        /* GPU path: TranscribeSegment handles the full pipeline. */
+        return doTranscribeViaEngine(decode, [this, &decode, &audio_path]() {
+            std::vector<float> samples;
+            std::int64_t dur_ms = 0;
+            Status st = LoadAudioFile(audio_path.string(), &samples, &dur_ms);
+            if (!st.ok()) {
+                AsrRunResult r;
+                r.status = Status(StatusCode::kInvalidArgument, "failed to load audio: " + audio_path.string());
+                return r;
+            }
+            return doTranscribeSamples(decode, samples);
+        });
+    }
+
+    AsrRunResult TranscribeRealtime(const std::vector<float> & samples,
+                                       const ModelDecodeOptions & decode) {
+        if (!engine_) {
+            AsrRunResult r;
+            r.status = Status(StatusCode::kFailedPrecondition, "engine not loaded");
+            return r;
+        }
+        auto * base = static_cast<qwen_ctx_t *>(engine_->base_ctx());
+        if (base) {
+            return doTranscribeRealtime(base, decode, samples);
+        }
+        /* GPU path: TranscribeSegment handles the full pipeline. */
+        return doTranscribeViaEngine(decode, [&]() {
+            return doTranscribeSamples(decode, samples);
+        });
+    }
+
+    InferHandle createInferHandle() {
+        InferHandle h;
+        if (engine_) {
+            auto handle = engine_->CreateRealtimeSession({});
+            if (handle) {
+                h.engineHandle = std::move(handle);
+                h.nativeCtx = static_cast<qwen_ctx_t *>(h.engineHandle->nativeCtx());
+            }
+        }
+        return h;
+    }
+
+    void releaseInferHandle(InferHandle & h) {
+        if (h.engineHandle && engine_) {
+            engine_->CloseSessionHandle(std::move(h.engineHandle));
+            h.nativeCtx = nullptr;
+        } else if (h.nativeCtx) {
+            qwen_free(h.nativeCtx);
+            h.nativeCtx = nullptr;
         }
     }
 
-    AsrRunResult TranscribeFile(const fs::path & audio_path, const ModelDecodeOptions & decode) {
-        std::lock_guard<std::mutex> lock(mu_);
-        AsrRunResult result;
-        if (ctx_ == nullptr) {
-            result.status = Status(StatusCode::kFailedPrecondition, "model is not loaded");
-            return result;
+    qwen_silero_vad_t *vad() const noexcept {
+        if (engine_) {
+            void * vh = engine_->getVadHandle();
+            return static_cast<qwen_silero_vad_t *>(vh);
         }
+        return nullptr;
+    }
 
+    float temperature() const noexcept { return config_.temperature; }
+    int verbosity() const noexcept { return config_.verbosity; }
+    BackendKind backendKind() const noexcept { return backendKind_; }
+    bool backendFallback() const noexcept { return backendFallback_; }
+    AsrEngine *engine() const noexcept { return engine_.get(); }
+    GpuScheduler *scheduler() const noexcept { return scheduler_.get(); }
+
+    /* GPU pipeline: transcribe samples via engine->TranscribeSegment.
+     * Public so AsrWorkerLoop (defined outside the class) can call it. */
+    AsrRunResult TranscribeSamplesViaEngine(
+        const ModelDecodeOptions & decode,
+        const std::vector<float> & samples) {
+        return doTranscribeSamples(decode, samples);
+    }
+
+private:
+    /* Engine-backed helpers. */
+    AsrRunResult doTranscribeFile(qwen_ctx_t * ctx,
+                                    const ModelDecodeOptions & decode,
+                                    const fs::path & audio_path) {
+        AsrRunResult result;
         qwen_verbose = config_.verbosity;
-        ctx_->stream_max_new_tokens = decode.stream_max_new_tokens;
-        if (decode.stream_chunk_sec > 0.0f) {
-            ctx_->stream_chunk_sec = decode.stream_chunk_sec;
-        }
-        if (decode.temperature >= 0.0f) {
-            ctx_->decode_temperature = decode.temperature;
-        } else if (config_.temperature >= 0.0f) {
-            ctx_->decode_temperature = config_.temperature;
-        }
-        if (qwen_set_prompt(ctx_, decode.prompt.empty() ? nullptr : decode.prompt.c_str()) != 0) {
+        ctx->stream_max_new_tokens = decode.stream_max_new_tokens;
+        if (decode.stream_chunk_sec > 0.0f) ctx->stream_chunk_sec = decode.stream_chunk_sec;
+        float temp = decode.temperature >= 0.0f
+            ? decode.temperature
+            : (config_.temperature >= 0.0f ? config_.temperature : -1.0f);
+        if (temp >= 0.0f) ctx->decode_temperature = temp;
+        if (qwen_set_prompt(ctx, decode.prompt.empty() ? nullptr : decode.prompt.c_str()) != 0) {
             result.status = Status(StatusCode::kInvalidArgument, "failed to set prompt");
             return result;
         }
-        if (qwen_set_force_language(ctx_, decode.language.empty() ? nullptr : decode.language.c_str()) != 0) {
-            result.status = Status(StatusCode::kInvalidArgument, "unsupported language: " + decode.language);
+        if (qwen_set_force_language(ctx, decode.language.empty() ? nullptr : decode.language.c_str()) != 0) {
+            result.status = Status(StatusCode::kInvalidArgument,
+                                   "unsupported language: " + decode.language);
             return result;
         }
-
-        std::function<void(std::string_view)> token_callback = decode.token_callback;
-        std::function<bool()> cancel_callback = decode.cancel_callback;
-        qwen_set_token_callback(ctx_, token_callback ? ForwardTokenPiece : nullptr, token_callback ? &token_callback : nullptr);
-        qwen_set_cancel_callback(ctx_, cancel_callback ? ForwardCancelRequest : nullptr, cancel_callback ? &cancel_callback : nullptr);
-
-        char * raw = qwen_transcribe(ctx_, audio_path.string().c_str());
-        const bool was_cancelled = qwen_was_cancelled(ctx_) != 0;
-        qwen_set_cancel_callback(ctx_, nullptr, nullptr);
-        qwen_set_token_callback(ctx_, nullptr, nullptr);
-        if (raw == nullptr) {
+        std::function<void(std::string_view)> token_cb = decode.token_callback;
+        std::function<bool()> cancel_cb = decode.cancel_callback;
+        qwen_set_token_callback(ctx, token_cb ? ForwardTokenPiece : nullptr,
+                                token_cb ? &token_cb : nullptr);
+        qwen_set_cancel_callback(ctx, cancel_cb ? ForwardCancelRequest : nullptr,
+                                 cancel_cb ? &cancel_cb : nullptr);
+        char * raw = qwen_transcribe(ctx, audio_path.string().c_str());
+        bool was_cancelled = qwen_was_cancelled(ctx) != 0;
+        qwen_set_cancel_callback(ctx, nullptr, nullptr);
+        qwen_set_token_callback(ctx, nullptr, nullptr);
+        if (!raw) {
             result.status = was_cancelled
                 ? Status(StatusCode::kFailedPrecondition, "transcription cancelled")
                 : Status(StatusCode::kInternal, "transcription failed");
             return result;
         }
-
         result.text = raw;
         std::free(raw);
-        result.total_ms = ctx_->perf_total_ms;
-        result.audio_ms = ctx_->perf_audio_ms;
-        result.text_tokens = ctx_->perf_text_tokens;
-        result.encode_ms = ctx_->perf_encode_ms;
-        result.decode_ms = ctx_->perf_decode_ms;
+        result.total_ms = ctx->perf_total_ms;
+        result.audio_ms = ctx->perf_audio_ms;
+        result.text_tokens = ctx->perf_text_tokens;
+        result.encode_ms = ctx->perf_encode_ms;
+        result.decode_ms = ctx->perf_decode_ms;
         result.status = was_cancelled
             ? Status(StatusCode::kFailedPrecondition, "transcription cancelled")
             : OkStatus();
         return result;
     }
 
-    AsrRunResult TranscribeRealtime(const std::vector<float> & samples, const ModelDecodeOptions & decode) {
-        std::lock_guard<std::mutex> lock(mu_);
+      AsrRunResult doTranscribeRealtime(qwen_ctx_t * ctx,
+                                        const ModelDecodeOptions & decode,
+                                        const std::vector<float> & samples) {
         AsrRunResult result;
-        if (ctx_ == nullptr) {
-            result.status = Status(StatusCode::kFailedPrecondition, "model is not loaded");
-            return result;
-        }
-
         qwen_verbose = config_.verbosity;
-        ctx_->stream_max_new_tokens = decode.stream_max_new_tokens;
-        if (decode.temperature >= 0.0f) {
-            ctx_->decode_temperature = decode.temperature;
-        } else if (config_.temperature >= 0.0f) {
-            ctx_->decode_temperature = config_.temperature;
-        }
-        if (qwen_set_prompt(ctx_, decode.prompt.empty() ? nullptr : decode.prompt.c_str()) != 0) {
+        ctx->stream_max_new_tokens = decode.stream_max_new_tokens;
+        float temp = decode.temperature >= 0.0f
+            ? decode.temperature
+            : (config_.temperature >= 0.0f ? config_.temperature : -1.0f);
+        if (temp >= 0.0f) ctx->decode_temperature = temp;
+        if (qwen_set_prompt(ctx, decode.prompt.empty() ? nullptr : decode.prompt.c_str()) != 0) {
             result.status = Status(StatusCode::kInvalidArgument, "failed to set prompt");
             return result;
         }
-        if (qwen_set_force_language(ctx_, decode.language.empty() ? nullptr : decode.language.c_str()) != 0) {
-            result.status = Status(StatusCode::kInvalidArgument, "unsupported language: " + decode.language);
+        if (qwen_set_force_language(ctx, decode.language.empty() ? nullptr : decode.language.c_str()) != 0) {
+            result.status = Status(StatusCode::kInvalidArgument,
+                                   "unsupported language: " + decode.language);
             return result;
         }
-
-        std::function<void(std::string_view)> token_callback = decode.token_callback;
-        std::function<bool()> cancel_callback = decode.cancel_callback;
-        qwen_set_token_callback(ctx_, token_callback ? ForwardTokenPiece : nullptr, token_callback ? &token_callback : nullptr);
-        qwen_set_cancel_callback(ctx_, cancel_callback ? ForwardCancelRequest : nullptr, cancel_callback ? &cancel_callback : nullptr);
-
+        std::function<void(std::string_view)> token_cb = decode.token_callback;
+        std::function<bool()> cancel_cb = decode.cancel_callback;
+        qwen_set_token_callback(ctx, token_cb ? ForwardTokenPiece : nullptr,
+                                token_cb ? &token_cb : nullptr);
+        qwen_set_cancel_callback(ctx, cancel_cb ? ForwardCancelRequest : nullptr,
+                                 cancel_cb ? &cancel_cb : nullptr);
         char * raw = decode.use_stream_path
-            ? qwen_transcribe_stream(ctx_, samples.data(), static_cast<int>(samples.size()))
-            : qwen_transcribe_audio(ctx_, samples.data(), static_cast<int>(samples.size()));
-        const bool was_cancelled = qwen_was_cancelled(ctx_) != 0;
-        qwen_set_cancel_callback(ctx_, nullptr, nullptr);
-        qwen_set_token_callback(ctx_, nullptr, nullptr);
-        if (raw == nullptr) {
+            ? qwen_transcribe_stream(ctx, samples.data(), static_cast<int>(samples.size()))
+            : qwen_transcribe_audio(ctx, samples.data(), static_cast<int>(samples.size()));
+        bool was_cancelled = qwen_was_cancelled(ctx) != 0;
+        qwen_set_cancel_callback(ctx, nullptr, nullptr);
+        qwen_set_token_callback(ctx, nullptr, nullptr);
+        if (!raw) {
             result.status = was_cancelled
-                ? Status(StatusCode::kFailedPrecondition, decode.use_stream_path ? "stream transcription cancelled" : "audio transcription cancelled")
-                : Status(StatusCode::kInternal, decode.use_stream_path ? "stream transcription failed" : "audio transcription failed");
+                ? Status(StatusCode::kFailedPrecondition, decode.use_stream_path
+                    ? "stream transcription cancelled" : "audio transcription cancelled")
+                : Status(StatusCode::kInternal, decode.use_stream_path
+                    ? "stream transcription failed" : "audio transcription failed");
             return result;
         }
-
         result.text = raw;
         std::free(raw);
-        result.total_ms = ctx_->perf_total_ms;
-        result.audio_ms = ctx_->perf_audio_ms;
-        result.text_tokens = ctx_->perf_text_tokens;
-        result.encode_ms = ctx_->perf_encode_ms;
-        result.decode_ms = ctx_->perf_decode_ms;
+        result.total_ms = ctx->perf_total_ms;
+        result.audio_ms = ctx->perf_audio_ms;
+        result.text_tokens = ctx->perf_text_tokens;
+        result.encode_ms = ctx->perf_encode_ms;
+        result.decode_ms = ctx->perf_decode_ms;
         result.status = was_cancelled
-            ? Status(StatusCode::kFailedPrecondition, decode.use_stream_path ? "stream transcription cancelled" : "audio transcription cancelled")
+            ? Status(StatusCode::kFailedPrecondition, decode.use_stream_path
+                ? "stream transcription cancelled" : "audio transcription cancelled")
             : OkStatus();
         return result;
     }
 
-    qwen_ctx_t * CreateRealtimeClone() {
-        std::lock_guard<std::mutex> lock(mu_);
-        if (ctx_ == nullptr) {
-            return nullptr;
+    /* Generic engine-backed transcription: creates a session, calls
+     * TranscribeSegment, then closes the session.  Used by both batch
+     * and realtime paths when base_ctx() is null (CUDA GPU pipeline). */
+    AsrRunResult doTranscribeViaEngine(
+        const ModelDecodeOptions & decode,
+        std::function<AsrRunResult()> transcribe_fn) {
+        auto * base = static_cast<qwen_ctx_t *>(engine_->base_ctx());
+        if (!base) {
+            std::uint64_t sid = 0;
+            SessionOptions opts;
+            opts.language = decode.language;
+            opts.prompt = decode.prompt;
+            if (decode.temperature >= 0.0f) {
+                opts.temperature = decode.temperature;
+            } else if (config_.temperature >= 0.0f) {
+                opts.temperature = config_.temperature;
+            }
+            Status st = engine_->CreateSession(opts, sid);
+            if (!st.ok()) {
+                AsrRunResult r;
+                r.status = st;
+                return r;
+            }
+            AsrRunResult result = transcribe_fn();
+            if (result.status.ok()) {
+                /* TranscribeSegment was called by the lambda — convert result. */
+            }
+            engine_->CloseSession(sid);
+            return result;
         }
-        qwen_ctx_t * clone = qwen_clone_shared(ctx_);
-        if (clone == nullptr) {
-            return nullptr;
-        }
-        /* qwen_clone_shared() resets encoder_int8 to 0 on the clone
-         * (INT8 resources are per-context, see qwen_asr.c).  Without
-         * re-applying the configured flag here, every realtime/host
-         * capture session silently runs on the F32 path even when
-         * the server was started with encoder INT8 enabled.
-         *
-         * Decoder INT8 is intentionally never applied to realtime
-         * clones — it is the autoregressive Qwen3 LM and INT8 there
-         * measurably degrades language consistency (English fragments
-         * leaking into Chinese audio, hallucinations, etc.).  See
-         * docs/INCIDENTS.md for the rationale.  Encoder INT8 is also
-         * temporarily disabled (post-C8) — see 2026-06-05 entry. */
-        if (config_.encoder_int8) {
-            /* encoder INT8 disabled — see comment above */
-            (void)0;
-        }
-        return clone;
+        return transcribe_fn();
     }
 
-    int verbosity() const noexcept {
-        return config_.verbosity;
+    /* Transcribe samples via TranscribeSegment. */
+    AsrRunResult doTranscribeSamples(const ModelDecodeOptions & decode,
+                                       const std::vector<float> & samples) {
+        if (samples.empty()) {
+            AsrRunResult r;
+            r.status = Status(StatusCode::kInvalidArgument, "empty audio");
+            return r;
+        }
+        std::uint64_t sid = 0;
+        SessionOptions opts;
+        opts.language = decode.language;
+        opts.prompt = decode.prompt;
+        if (decode.temperature >= 0.0f) {
+            opts.temperature = decode.temperature;
+        } else if (config_.temperature >= 0.0f) {
+            opts.temperature = config_.temperature;
+        }
+        Status st = engine_->CreateSession(opts, sid);
+        if (!st.ok()) {
+            AsrRunResult r;
+            r.status = st;
+            return r;
+        }
+        AsrSegmentResult seg = engine_->TranscribeSegment(sid, samples);
+        AsrRunResult result;
+        result.status = seg.status;
+        result.text = seg.text;
+        result.total_ms = seg.total_ms;
+        result.audio_ms = seg.audio_ms;
+        result.text_tokens = seg.text_tokens;
+        result.encode_ms = seg.encode_ms;
+        result.decode_ms = seg.decode_ms;
+        engine_->CloseSession(sid);
+        return result;
     }
 
-    float temperature() const noexcept {
-        return config_.temperature;
-    }
-
-    /* Return the VAD pointer owned by the loaded Qwen context.  The
-     * VAD lives for the lifetime of the SharedAsrModel and is reused
-     * across all sessions — no per-session VAD is created.  Callers
-     * must hold the server-scope vad_mu before invoking
-     * qwen_silero_vad_process/reset on this pointer. */
-    qwen_silero_vad_t * vad() const noexcept { return ctx_ ? ctx_->vad : nullptr; }
-
-private:
     ServerConfig config_;
-    qwen_ctx_t * ctx_ = nullptr;
-    std::mutex mu_;
+    std::unique_ptr<AsrEngine> engine_;
+    BackendKind backendKind_ = BackendKind::kCpu;
+    bool backendFallback_ = false;
+
+    /* ── Session pool (§6 ServerAsrFacade, §7 Scheduler) ── */
+
+    struct RealtimeSessionData {
+        std::string sessionId;
+        std::string language;
+        std::string prompt;
+        float temperature = -1.0f;
+        std::uint64_t engineSid = 0;
+        bool active = true;
+        std::chrono::steady_clock::time_point createdAt = std::chrono::steady_clock::now();
+    };
+
+    mutable std::mutex poolMu_;
+    std::unordered_map<std::string, std::unique_ptr<RealtimeSessionData>> sessions_;
+    uint64_t nextSessionId_ = 1;
+
+    /* ── GPU Scheduler (§7) ── */
+    std::unique_ptr<GpuScheduler> scheduler_;
+
+    /* Mode ④: realtime session management */
+    Status createRealtimeSession(const std::string & sid) {
+        if (!engine_) {
+            return Status(StatusCode::kFailedPrecondition, "engine not loaded");
+        }
+        std::lock_guard<std::mutex> lock(poolMu_);
+        if (sessions_.count(sid) > 0) {
+            return Status(StatusCode::kFailedPrecondition,
+                          "realtime session exists: " + sid);
+        }
+        SessionOptions opts;
+        std::uint64_t esid = 0;
+        Status st = engine_->CreateSession(opts, esid);
+        if (!st.ok()) return st;
+        auto data = std::make_unique<RealtimeSessionData>();
+        data->sessionId = sid;
+        data->engineSid = esid;
+        sessions_[sid] = std::move(data);
+        return OkStatus();
+    }
+
+    void destroyRealtimeSession(const std::string & sid) {
+        std::lock_guard<std::mutex> lock(poolMu_);
+        auto it = sessions_.find(sid);
+        if (it != sessions_.end()) {
+            auto * d = it->second.get();
+            if (d && engine_ && d->engineSid) {
+                engine_->CloseSession(d->engineSid);
+            }
+            sessions_.erase(it);
+        }
+    }
+
+    /* Get the engine session id for a realtime session. */
+    std::uint64_t getSessionEngineSid(const std::string & sid) const {
+        std::lock_guard<std::mutex> lock(poolMu_);
+        auto it = sessions_.find(sid);
+        if (it != sessions_.end() && it->second) {
+            return it->second->engineSid;
+        }
+        return 0;
+    }
 };
 
 void SetJsonResponse(HttpResponse & response, const Json & body) {
@@ -2815,6 +3021,18 @@ Status ParseServerArguments(int argc, const char * const argv[], ServerConfig * 
                 "see docs/INCIDENTS.md 2026-06-05 encoder INT8 disabled\n");
             continue;
         }
+        if (arg == "--backend") {
+            const char * value = nullptr;
+            Status status = RequireValue(argc, argv, index, "--backend", &value);
+            if (!status.ok()) return status;
+            config->backend = ParseBackendKind(value);
+            ++index;
+            continue;
+        }
+        if (arg == "--no-fallback") {
+            config->allow_backend_fallback = false;
+            continue;
+        }
         if (arg == "--temperature") {
             const char * value = nullptr;
             Status status = RequireValue(argc, argv, index, "--temperature", &value);
@@ -2858,6 +3076,8 @@ std::string BuildServerUsage(std::string_view program_name) {
     usage += "                           1=commit/summary, 2=per-poll, 3=raw\n";
     usage += "  --quiet, -q              alias for --verbosity 0\n";
     usage += "  --temperature <float>  (default: auto, 0=greedy, >0=sampling)\n";
+    usage += "  --backend cpu|cuda     (default: cpu)\n";
+    usage += "  --no-fallback          fail if requested backend unavailable\n";
     usage += "  -h, --help\n";
     return usage;
 }
@@ -3265,6 +3485,243 @@ VadSegmentedBatchResult TranscribeFileVadSegmentedImpl(
     return out;
 }
 
+/* GPU engine version of VAD-segmented batch transcription.
+ * Same VAD frame loop logic, but uses AsrEngine::TranscribeSegment
+ * instead of qwen_transcribe_audio.  This provides per-segment
+ * progress streaming for GPU backend (previously GPU path called
+ * TranscribeFile which processed the entire file in one shot). */
+VadSegmentedBatchResult TranscribeFileVadSegmentedEngineImpl(
+    AsrEngine * engine,
+    qwen_silero_vad_t * vad,
+    const char * wav_path,
+    const std::string & forced_language,
+    int verbosity,
+    const VadSegmentCallback & on_segment,
+    const std::function<bool()> & cancel_cb,
+    std::mutex * vad_mu) {
+
+    VadSegmentedBatchResult out;
+
+    if (engine == nullptr || wav_path == nullptr) {
+        out.status = Status(StatusCode::kInvalidArgument,
+                            "engine and wav_path required");
+        return out;
+    }
+
+    /* Load WAV as 16 kHz mono float. */
+    int n_samples = 0;
+    float * samples = qwen_load_wav(wav_path, &n_samples);
+    if (samples == nullptr) {
+        out.status = Status(StatusCode::kInvalidArgument,
+                            std::string("failed to load WAV file: ") + wav_path);
+        return out;
+    }
+    out.total_samples = n_samples;
+    out.audio_ms = (double)n_samples * 1000.0 / 16000.0;
+
+    if (verbosity >= 1) {
+        std::fprintf(stderr,
+                     "VAD-segmented batch (engine): %.2fs of audio, "
+                     "lang=%s\n",
+                     (double)n_samples / 16000.0,
+                     forced_language.empty() ? "<auto>" : forced_language.c_str());
+    }
+
+    /* Create persistent engine session for all segments. */
+    std::uint64_t sid = 0;
+    SessionOptions opts;
+    opts.language = forced_language;
+    opts.prompt = "";
+    Status sess_st = engine->CreateSession(opts, sid);
+    if (!sess_st.ok()) {
+        std::free(samples);
+        out.status = sess_st;
+        return out;
+    }
+
+    const bool vad_active = qwen_silero_vad_is_active(vad);
+    if (verbosity >= 1) {
+        std::fprintf(stderr,
+                     "VAD-segmented batch (engine): Silero VAD %s\n",
+                     vad_active ? "active" : "inactive (40s timer fallback)");
+    }
+    if (vad_active) {
+        if (vad_mu) {
+            std::lock_guard<std::mutex> lock(*vad_mu);
+        }
+        qwen_silero_vad_reset(vad);
+    }
+
+    std::vector<float> segment_buffer;
+    segment_buffer.reserve(kBatchVadMaxSamples * 2);
+    int64_t processed_frames = 0;
+    int silence_run = 0;
+    bool segment_active = false;
+    int seg_idx = 0;
+    int64_t total_consumed = 0;
+
+    auto commit_segment = [&](const char * reason) -> bool {
+        if (segment_buffer.empty()) {
+            silence_run = 0;
+            return true;
+        }
+        const int seg_n = static_cast<int>(segment_buffer.size());
+        const double seg_sec = (double)seg_n / 16000.0;
+        if (verbosity >= 1) {
+            std::fprintf(stderr,
+                         "VAD-segmented batch (engine): committing "
+                         "segment %d (%.2fs, reason=%s)\n",
+                         seg_idx, seg_sec, reason);
+        }
+
+        /* GPU transcription via engine. */
+        AsrSegmentResult segRes = engine->TranscribeSegment(
+            sid, segment_buffer, 16000);
+        std::string text;
+        if (segRes.status.ok()) {
+            text = segRes.text;
+        } else if (verbosity >= 1) {
+            std::fprintf(stderr,
+                         "VAD-segmented batch (engine): TranscribeSegment "
+                         "failed for seg %d: %s\n",
+                         seg_idx, segRes.status.message().c_str());
+        }
+
+        out.text += text;
+        out.text_chars += static_cast<int64_t>(text.size());
+        out.inference_ms += segRes.total_ms;
+        segment_buffer.clear();
+        processed_frames = 0;
+        silence_run = 0;
+        segment_active = false;
+        if (vad_active) {
+            if (vad_mu) {
+                std::lock_guard<std::mutex> lock(*vad_mu);
+            }
+            qwen_silero_vad_reset(vad);
+        }
+
+        const bool keep_going = !on_segment
+            ? true
+            : on_segment(seg_idx, text, seg_n, total_consumed);
+        seg_idx++;
+        out.segments = seg_idx;
+        return keep_going;
+    };
+
+    const int frame = kBatchVadFrameSamples;
+    while (true) {
+        /* Step 1: copy one frame. */
+        if (segment_buffer.size() < static_cast<std::size_t>(kBatchVadMaxSamples) &&
+            total_consumed < n_samples) {
+            int64_t want = n_samples - total_consumed;
+            if (want > frame) want = frame;
+            const int64_t room = kBatchVadMaxSamples -
+                                 static_cast<int64_t>(segment_buffer.size());
+            if (want > room) want = room;
+            if (want > 0) {
+                const std::size_t old = segment_buffer.size();
+                segment_buffer.resize(old + static_cast<std::size_t>(want));
+                std::memcpy(segment_buffer.data() + old,
+                            samples + total_consumed,
+                            static_cast<std::size_t>(want) * sizeof(float));
+                total_consumed += want;
+            }
+        }
+
+        /* Step 2: VAD sweep on any new frames. */
+        if (vad_active) {
+            const int64_t total_buf = static_cast<int64_t>(segment_buffer.size());
+            const int64_t total_frames = total_buf / frame;
+            if (vad_mu) {
+                std::lock_guard<std::mutex> lock(*vad_mu);
+                for (int64_t fi = processed_frames; fi < total_frames; ++fi) {
+                    float prob = 0.0f;
+                    qwen_silero_vad_process(vad,
+                                            segment_buffer.data() + fi * frame,
+                                            frame, &prob);
+                    if (prob >= kBatchVadSpeechProbThreshold) {
+                        segment_active = true;
+                        silence_run = 0;
+                    } else {
+                        if (segment_active) silence_run++;
+                    }
+                }
+            } else {
+                for (int64_t fi = processed_frames; fi < total_frames; ++fi) {
+                    float prob = 0.0f;
+                    qwen_silero_vad_process(vad,
+                                            segment_buffer.data() + fi * frame,
+                                            frame, &prob);
+                    if (prob >= kBatchVadSpeechProbThreshold) {
+                        segment_active = true;
+                        silence_run = 0;
+                    } else {
+                        if (segment_active) silence_run++;
+                    }
+                }
+            }
+            processed_frames = total_frames;
+        } else {
+            if (segment_buffer.size() >= 8000) {
+                segment_active = true;
+            }
+        }
+
+        /* Step 3: commit decision. */
+        bool should_commit = false;
+        const char * commit_reason = nullptr;
+        if (vad_active && segment_active &&
+            silence_run >= kBatchVadSilenceFrames) {
+            should_commit = true;
+            commit_reason = "vad_silence";
+        } else if (static_cast<int>(segment_buffer.size()) >=
+                   kBatchVadMaxSamples) {
+            should_commit = true;
+            commit_reason = "40s_safety_cap";
+        } else if (total_consumed >= n_samples && !segment_buffer.empty() &&
+                   segment_active) {
+            should_commit = true;
+            commit_reason = "eof_with_active_segment";
+        }
+        if (should_commit) {
+            if (!commit_segment(commit_reason)) {
+                std::free(samples);
+                engine->CloseSession(sid);
+                out.status = Status(StatusCode::kFailedPrecondition,
+                                    "transcription cancelled by callback");
+                return out;
+            }
+        }
+
+        /* Step 4: exit conditions. */
+        if (total_consumed >= n_samples) {
+            if (segment_buffer.empty()) {
+                break;
+            }
+            break;
+        }
+
+        /* Step 5: check cancel. */
+        if (cancel_cb && cancel_cb()) {
+            std::free(samples);
+            engine->CloseSession(sid);
+            out.status = Status(StatusCode::kFailedPrecondition,
+                                "transcription cancelled");
+            return out;
+        }
+    }
+
+    /* Flush any trailing audio. */
+    if (!segment_buffer.empty()) {
+        commit_segment("eof");
+    }
+
+    std::free(samples);
+    engine->CloseSession(sid);
+    return out;
+}
+
 int RunServer(const ServerConfig & config) {
 #ifndef QASR_CPU_BACKEND_ENABLED
     (void)config;
@@ -3277,66 +3734,33 @@ int RunServer(const ServerConfig & config) {
         return 1;
     }
 
-    /* Load one or two models.
+    /* Load model(s) via ServerAsrFacade.
      *
-     * The realtime / host-capture paths always use a per-session
-     * CLONE of the underlying model (CreateRealtimeClone on a
-     * SharedAsrModel) so that batch and realtime can run in parallel
-     * without contending on the master ctx_'s mutex.  The batch
-     * VAD-segmented path ALSO uses CreateRealtimeClone on a separate
-     * SharedAsrModel — it could share the realtime model, but doing
-     * so would make a long batch job block all live transcription.
-     *
-     * So we always need a "batch model" (used by sync/async TranscribeFile
-     * and the batch VAD-segmented clone) and a "realtime model" (used
-     * by the realtime worker).  When both paths are configured with
-     * the same --model-dir, we share the SharedAsrModel instance so
-     * the weights are loaded only once; otherwise two instances are
-     * loaded, each holding its own copy of the weights in memory. */
-    const std::string batch_dir = config.model_dir;
-    const std::string realtime_dir =
-        config.realtime_model_dir.empty() ? config.model_dir
-                                           : config.realtime_model_dir;
-    const bool share_model = (batch_dir == realtime_dir);
-
-    std::unique_ptr<SharedAsrModel> batch_model_storage;
-    std::unique_ptr<SharedAsrModel> realtime_model_storage;
-    if (share_model) {
-        batch_model_storage = std::make_unique<SharedAsrModel>();
-        const Status load_status = batch_model_storage->Load(config);
-        if (!load_status.ok()) {
-            std::fprintf(stderr, "model load failed: %s\n",
-                         load_status.message().c_str());
-            return 1;
-        }
-    } else {
-        /* Load each model with its own ServerConfig (only model_dir
-         * and the per-model INT8 / temperature knobs differ).  All
-         * other ServerConfig fields (port, host, ui_dir, ...) are
-         * shared at RunServer scope and don't affect Load(). */
-        ServerConfig batch_cfg = config;
-        batch_cfg.model_dir = batch_dir;
-        batch_model_storage = std::make_unique<SharedAsrModel>();
-        const Status batch_load = batch_model_storage->Load(batch_cfg);
-        if (!batch_load.ok()) {
-            std::fprintf(stderr, "batch model load failed (%s): %s\n",
-                         batch_dir.c_str(), batch_load.message().c_str());
-            return 1;
-        }
-        ServerConfig realtime_cfg = config;
-        realtime_cfg.model_dir = realtime_dir;
-        realtime_model_storage = std::make_unique<SharedAsrModel>();
-        const Status realtime_load = realtime_model_storage->Load(realtime_cfg);
-        if (!realtime_load.ok()) {
-            std::fprintf(stderr, "realtime model load failed (%s): %s\n",
-                         realtime_dir.c_str(),
-                         realtime_load.message().c_str());
-            return 1;
-        }
+     * The facade wraps SharedAsrModel (CPU) or AsrEngine (CUDA).
+     * Currently both batch and realtime share the same facade.
+     * Future: separate facades for batch vs realtime when different
+     * models are needed (--realtime-model-dir != --model-dir). */
+    std::unique_ptr<ServerAsrFacade> facade_ = std::make_unique<ServerAsrFacade>();
+    const Status facade_status = facade_->Initialize(config);
+    if (!facade_status.ok()) {
+        std::fprintf(stderr, "model load failed: %s\n",
+                     facade_status.message().c_str());
+        return 1;
     }
-    SharedAsrModel *const batch_model = batch_model_storage.get();
-    SharedAsrModel *const realtime_model =
-        share_model ? batch_model : realtime_model_storage.get();
+    std::string backend_label = std::string(facade_->backendKind() == BackendKind::kCpu ? "CPU" : "CUDA");
+    if (facade_->backendFallback()) {
+        std::fprintf(stderr, "backend: %s (fallback from requested %s)\n",
+                     backend_label.c_str(),
+                     config.backend == BackendKind::kCuda ? "CUDA" : "CPU");
+    } else {
+        std::fprintf(stderr, "backend: %s\n", backend_label.c_str());
+    }
+
+    /* Aliases for backward compat with existing call sites.
+     * batch_model and realtime_model now point to the same facade.
+     * Future: separate facades when --realtime-model-dir differs. */
+    ServerAsrFacade *const batch_model = facade_.get();
+    ServerAsrFacade *const realtime_model = facade_.get();
 
     /* Warmup: run a dummy inference on each loaded model to trigger
      * oneDNN JIT compilation and warm CPU caches.  Uses a clone so
@@ -3344,8 +3768,9 @@ int RunServer(const ServerConfig & config) {
      * Runs synchronously before the HTTP server starts listening, so
      * the first real request is not penalised. */
     {
-        auto do_warmup = [&](SharedAsrModel * model, const char * label) {
-            qwen_ctx_t * ctx = model->CreateRealtimeClone();
+        auto do_warmup = [&](ServerAsrFacade * model, const char * label) {
+            InferHandle wHandle = model->createInferHandle();
+            qwen_ctx_t * ctx = wHandle.nativeCtx;
             if (!ctx) {
                 if (qwen_verbose >= 1) {
                     std::fprintf(stderr, "warmup: %s clone failed, skipping\n", label);
@@ -3367,16 +3792,14 @@ int RunServer(const ServerConfig & config) {
             const double ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t0).count();
             std::free(raw);
-            qwen_free(ctx);
+            model->releaseInferHandle(wHandle);
             if (qwen_verbose >= 1) {
                 std::fprintf(stderr, "warmup: %s completed in %.0f ms\n", label, ms);
             }
         };
 
         do_warmup(batch_model, "batch");
-        if (!share_model) {
-            do_warmup(realtime_model, "realtime");
-        }
+        // share_model removed: single facade handles both paths
     }
 
     const std::string served_model_id = ResolveServedModelId(config.model_dir);
@@ -4557,37 +4980,60 @@ int RunServer(const ServerConfig & config) {
      * clone.  The HTTP /stop handler waits on this thread via join.
      * ================================================================== */
   auto AsrWorkerLoop = [&](qwen_ctx_t * live_ctx,
-                              const std::shared_ptr<RealtimeSession> & session,
-                              const std::string & forced_language,
-                              SegmentQueue * queue,
-                              const DumpConfig & dump_cfg) {
+                                const std::shared_ptr<RealtimeSession> & session,
+                                const std::string & forced_language,
+                                SegmentQueue * queue,
+                                const DumpConfig & dump_cfg,
+                                ServerAsrFacade * facade) {
         RT_LOG("AsrWorkerLoop sid=%s enter", session->id.c_str());
         qwen_verbose = realtime_model->verbosity();
+        bool gpuPipeline = live_ctx == nullptr;
+        std::uint64_t gpuSessionId = 0;
 
-        /* Configure ctx for offline-style per-segment decode.  No
-         * streaming chunk cadence, no coalesce step, no partial. */
-        live_ctx->segment_sec = 0.0f;
-        live_ctx->search_sec = 0.0f;
-        live_ctx->past_text_conditioning = 0;
-        live_ctx->stream_chunk_sec = 0.0f;
-        live_ctx->stream_max_new_tokens = 0;
-        if (qwen_set_force_language(live_ctx,
-                                    forced_language.empty() ? nullptr
-                                                            : forced_language.c_str()) != 0) {
-            std::lock_guard<std::mutex> lock(session->mu);
-            session->error = "unsupported language: " + forced_language;
-            session->worker_done = true;
-            qwen_free(live_ctx);
-            RT_LOG("AsrWorkerLoop sid=%s END (set_force_language failed)", session->id.c_str());
-            return;
-        }
-        if (qwen_set_prompt(live_ctx, nullptr) != 0) {
-            std::lock_guard<std::mutex> lock(session->mu);
-            session->error = "failed to set realtime prompt";
-            session->worker_done = true;
-            qwen_free(live_ctx);
-            RT_LOG("AsrWorkerLoop sid=%s END (set_prompt failed)", session->id.c_str());
-            return;
+        if (!gpuPipeline) {
+            /* Configure ctx for offline-style per-segment decode.  No
+             * streaming chunk cadence, no coalesce step, no partial. */
+            live_ctx->segment_sec = 0.0f;
+            live_ctx->search_sec = 0.0f;
+            live_ctx->past_text_conditioning = 0;
+            live_ctx->stream_chunk_sec = 0.0f;
+            live_ctx->stream_max_new_tokens = 0;
+            if (qwen_set_force_language(live_ctx,
+                                        forced_language.empty() ? nullptr
+                                                                : forced_language.c_str()) != 0) {
+                std::lock_guard<std::mutex> lock(session->mu);
+                session->error = "unsupported language: " + forced_language;
+                session->worker_done = true;
+                qwen_free(live_ctx);
+                RT_LOG("AsrWorkerLoop sid=%s END (set_force_language failed)", session->id.c_str());
+                return;
+            }
+            if (qwen_set_prompt(live_ctx, nullptr) != 0) {
+                std::lock_guard<std::mutex> lock(session->mu);
+                session->error = "failed to set realtime prompt";
+                session->worker_done = true;
+                qwen_free(live_ctx);
+                RT_LOG("AsrWorkerLoop sid=%s END (set_prompt failed)", session->id.c_str());
+                return;
+            }
+        } else if (facade) {
+            /* GPU path: acquire persistent engine session for this realtime session. */
+            AsrEngine * eng = facade->engine();
+            if (eng) {
+                qasr::SessionOptions gpuOpts;
+                gpuOpts.language = forced_language;
+                gpuOpts.prompt = "";
+                gpuOpts.temperature = facade->temperature();
+                gpuOpts.realtime = true;
+                if (eng->CreateSession(gpuOpts, gpuSessionId).ok()) {
+                    RT_LOG("AsrWorkerLoop sid=%s GPU session created esid=%lu",
+                           session->id.c_str(),
+                           static_cast<unsigned long>(gpuSessionId));
+                } else {
+                    RT_LOG("AsrWorkerLoop sid=%s GPU session creation failed",
+                           session->id.c_str());
+                }
+            }
         }
 
         while (true) {
@@ -4618,33 +5064,76 @@ int RunServer(const ServerConfig & config) {
                              (double)n_samples / 16000.0, seg.commit_reason.c_str(),
                              (double)session->total_samples / 16000.0);
             }
-            RT_LOG("AsrWorkerLoop sid=%s decoding n=%d reason=%s",
-                   session->id.c_str(), n_samples, seg.commit_reason.c_str());
-            char * raw = qwen_transcribe_audio(live_ctx, seg.samples.data(), n_samples);
-            RT_LOG("AsrWorkerLoop sid=%s qwen_transcribe_audio RETURNED", session->id.c_str());
+     RT_LOG("AsrWorkerLoop sid=%s decoding n=%d reason=%s",
+                    session->id.c_str(), n_samples, seg.commit_reason.c_str());
 
-            /* Phase 2.1 §3.2: separate raw_null and text_empty. */
-            const bool raw_null = raw == nullptr;
+            /* CPU: C bridge on live_ctx clone.
+             * GPU:  scheduler.SubmitAndAwait or direct TranscribeSegment. */
             std::string asr_text;
-            if (raw != nullptr) {
-                asr_text.assign(raw);
-                std::free(raw);
-                while (!asr_text.empty() &&
-                       (asr_text.back() == ' ' || asr_text.back() == '\n' || asr_text.back() == '\t')) {
-                    asr_text.pop_back();
+            double seg_total_ms = 0, seg_encode_ms = 0, seg_decode_ms = 0;
+            int seg_tokens = 0;
+            if (gpuPipeline && facade) {
+                GpuScheduler * sched = facade->scheduler();
+                if (sched) {
+                    /* Use scheduler for multi-session concurrency.
+                     * SubmitAndAwait preserves per-session ordering while
+                     * allowing other sessions' segments to process in parallel. */
+                    SegmentJob job;
+                    job.session_id = static_cast<std::uint64_t>(
+                        reinterpret_cast<std::uintptr_t>(session.get()));
+                    job.segment_id = seg.seq;
+                    job.samples = seg.samples;
+                    job.sample_rate = 16000;
+                    job.realtime = true;
+                    job.language = forced_language;
+                    job.prompt = "";
+                    job.engine_session_id = gpuSessionId;
+                    job.enqueue_time = std::chrono::steady_clock::now();
+                    SegmentResult res = sched->SubmitAndAwait(job);
+                    if (res.status.ok()) {
+                        asr_text = res.text;
+                        seg_total_ms = res.total_ms;
+                        seg_encode_ms = res.encode_ms;
+                        seg_decode_ms = res.decode_ms;
+                        seg_tokens = res.tokens;
+                    }
+                } else if (gpuSessionId) {
+                    /* Fallback: direct engine call (no scheduler). */
+                    AsrEngine * eng = facade->engine();
+                    AsrSegmentResult segRes = eng->TranscribeSegment(
+                        gpuSessionId, seg.samples, 16000);
+                    if (segRes.status.ok()) {
+                        asr_text = segRes.text;
+                        seg_total_ms = segRes.total_ms;
+                        seg_encode_ms = segRes.encode_ms;
+                        seg_decode_ms = segRes.decode_ms;
+                        seg_tokens = segRes.text_tokens;
+                    }
+                }
+            } else if (!gpuPipeline) {
+                char * raw = qwen_transcribe_audio(live_ctx, seg.samples.data(), n_samples);
+                RT_LOG("AsrWorkerLoop sid=%s qwen_transcribe_audio RETURNED", session->id.c_str());
+                if (raw != nullptr) {
+                    asr_text.assign(raw);
+                    std::free(raw);
+                    while (!asr_text.empty() &&
+                           (asr_text.back() == ' ' || asr_text.back() == '\n' || asr_text.back() == '\t')) {
+                        asr_text.pop_back();
+                    }
+                    seg_total_ms = live_ctx->perf_total_ms;
+                    seg_encode_ms = live_ctx->perf_encode_ms;
+                    seg_decode_ms = live_ctx->perf_decode_ms;
+                    seg_tokens = live_ctx->perf_text_tokens;
                 }
             }
             const bool text_empty = asr_text.empty();
+            const bool raw_null = asr_text.empty() && seg_total_ms == 0;
 
-            RT_LOG("ASR-worker-result sid=%s seq=%lu raw_null=%d text_empty=%d total=%.0fms enc=%.0fms dec=%.0fms tokens=%d",
+            RT_LOG("ASR-worker-result sid=%s seq=%lu text_empty=%d total=%.0fms enc=%.0fms dec=%.0fms tokens=%d",
                    session->id.c_str(),
                    static_cast<unsigned long>(seg.seq),
-                   raw_null ? 1 : 0,
                    text_empty ? 1 : 0,
-                   live_ctx->perf_total_ms,
-                   live_ctx->perf_encode_ms,
-                   live_ctx->perf_decode_ms,
-                   live_ctx->perf_text_tokens);
+                   seg_total_ms, seg_encode_ms, seg_decode_ms, seg_tokens);
 
             /* Phase 2.1 §3.1: dump ALL segments, including empty-text ones.
              * This eliminates the blind spot where ASR empty segments have
@@ -4693,10 +5182,10 @@ int RunServer(const ServerConfig & config) {
                     meta["boundary_overlap_ms"] = 0;
                     meta["truncated_left"] = false;
                     meta["truncated_right"] = false;
-                    meta["asr_total_ms"] = live_ctx->perf_total_ms;
-                    meta["asr_encode_ms"] = live_ctx->perf_encode_ms;
-                    meta["asr_decode_ms"] = live_ctx->perf_decode_ms;
-                    meta["asr_tokens"] = live_ctx->perf_text_tokens;
+                    meta["asr_total_ms"] = seg_total_ms;
+                    meta["asr_encode_ms"] = seg_encode_ms;
+                    meta["asr_decode_ms"] = seg_decode_ms;
+                    meta["asr_tokens"] = seg_tokens;
                     std::ofstream jf(dump_dir / json_name);
                     if (jf) {
                         jf << meta.dump() << std::endl;
@@ -4723,7 +5212,7 @@ int RunServer(const ServerConfig & config) {
                     session->text_state.last_text = asr_text;
                     session->text_state.last_decode_samples = session->total_samples;
                     session->text_state.unstable_since_samples = session->total_samples;
-                    session->last_inference_ms = live_ctx->perf_total_ms;
+                    session->last_inference_ms = seg_total_ms;
                     ApplyRealtimeUpdate(update, session->last_inference_ms,
                                         true, false, session.get());
                 }
@@ -4737,24 +5226,29 @@ int RunServer(const ServerConfig & config) {
             }
         }
 
-        /* Finalize: mark the session state so the UI knows this
-         * is the last text, and free the per-session clone. */
-        {
-            std::lock_guard<std::mutex> lock(session->mu);
-            session->last_inference_ms = live_ctx->perf_total_ms;
-            if (session->error.empty()) {
-                ApplyStableRealtimeCommit(session->total_samples,
-                                          session->stable_text,
-                                          session->last_inference_ms,
-                                          true, session.get());
-            }
-            session->finalized = true;
-            /* Final wake — SSE will see finalized=true and close
-             * the stream with data: [DONE]. */
-            session->sse_cv.notify_all();
-            session->worker_done = true;
+    /* Finalize: mark the session state so the UI knows this
+          * is the last text, and free the per-session clone. */
+         {
+             std::lock_guard<std::mutex> lock(session->mu);
+             if (session->error.empty()) {
+                 ApplyStableRealtimeCommit(session->total_samples,
+                                           session->stable_text,
+                                           session->last_inference_ms,
+                                           true, session.get());
+             }
+             session->finalized = true;
+             /* Final wake — SSE will see finalized=true and close
+              * the stream with data: [DONE]. */
+             session->sse_cv.notify_all();
+             session->worker_done = true;
+         }
+        if (live_ctx) qwen_free(live_ctx);
+        if (gpuPipeline && facade && gpuSessionId) {
+            facade->engine()->CloseSession(gpuSessionId);
+            RT_LOG("AsrWorkerLoop sid=%s GPU session closed esid=%lu",
+                   session->id.c_str(),
+                   static_cast<unsigned long>(gpuSessionId));
         }
-        qwen_free(live_ctx);
         RT_LOG("AsrWorkerLoop sid=%s END", session->id.c_str());
     };
 
@@ -4774,17 +5268,21 @@ int RunServer(const ServerConfig & config) {
         worker->vad_thread_joined = false;
         worker->asr_thread_joined = false;
 
-        qwen_ctx_t * live_ctx = realtime_model->CreateRealtimeClone();
-        if (live_ctx == nullptr) {
-            DestroyManualLiveAudio(&worker->live);
-            return Status(StatusCode::kInternal, "failed to clone realtime model context");
+        InferHandle liveHandle = realtime_model->createInferHandle();
+        qwen_ctx_t * live_ctx = liveHandle.nativeCtx;
+        liveHandle.nativeCtx = nullptr;  // ownership transferred to AsrWorkerLoop
+        const bool gpuPipeline = live_ctx == nullptr;
+        if (gpuPipeline) {
+            RT_LOG("StartRealtimeLiveWorker sid=%s nativeCtx null — using engine pipeline",
+                   session->id.c_str());
+        } else {
+            RT_LOG("StartRealtimeLiveWorker sid=%s live_ctx=%p", session->id.c_str(), (void*)live_ctx);
+            const float temperature = realtime_model->temperature();
+            if (temperature >= 0.0f) {
+                live_ctx->decode_temperature = temperature;
+            }
         }
-        RT_LOG("StartRealtimeLiveWorker sid=%s live_ctx=%p", session->id.c_str(), (void*)live_ctx);
 
-        const float temperature = realtime_model->temperature();
-        if (temperature >= 0.0f) {
-            live_ctx->decode_temperature = temperature;
-        }
         const std::string forced_language = session->language;
          /* Per-session VAD: each session owns its own Silero VAD instance
          * so LSTM hidden state is not shared across sessions.  This
@@ -4846,23 +5344,25 @@ int RunServer(const ServerConfig & config) {
             RT_LOG("vad-thread sid=%s END", session->id.c_str());
         });
 
-        /* Thread 2: ASR WORKER (consumer).  Pops AudioSegments from
-         * the queue, runs qwen_transcribe_audio, updates session. */
-        worker->asr_thread = std::thread([
-            session,
-            live_ctx,
-            forced_language,
-            worker_ptr = worker.get(),
-            &AsrWorkerLoop,
-            &dump_config]() {
-            RT_LOG("asr-thread sid=%s BEGIN", session->id.c_str());
-            /* The AsrWorkerLoop owns live_ctx and will qwen_free()
-             * it on exit.  It also takes its SegmentQueue via the
-             * worker pointer. */
-            AsrWorkerLoop(live_ctx, session, forced_language,
-                          &worker_ptr->segment_queue, dump_config);
-            RT_LOG("asr-thread sid=%s END", session->id.c_str());
-        });
+      /* Thread 2: ASR WORKER (consumer).  Pops AudioSegments from
+          * the queue, runs qwen_transcribe_audio (CPU) or
+          * TranscribeSegment (GPU), updates session. */
+         worker->asr_thread = std::thread([
+             session,
+             live_ctx,
+             forced_language,
+             facade = realtime_model,
+             worker_ptr = worker.get(),
+             &AsrWorkerLoop,
+             &dump_config]() {
+             RT_LOG("asr-thread sid=%s BEGIN", session->id.c_str());
+             /* The AsrWorkerLoop owns live_ctx and will qwen_free()
+              * it on exit.  When live_ctx is null (GPU path), it uses
+              * the facade's engine pipeline (TranscribeSegment). */
+             AsrWorkerLoop(live_ctx, session, forced_language,
+                           &worker_ptr->segment_queue, dump_config, facade);
+             RT_LOG("asr-thread sid=%s END", session->id.c_str());
+         });
 
         session->live_worker = std::move(worker);
         return OkStatus();
@@ -4880,7 +5380,9 @@ int RunServer(const ServerConfig & config) {
         }
         worker->live_ready = true;
 
-        qwen_ctx_t * live_ctx = realtime_model->CreateRealtimeClone();
+        InferHandle captureHandle = realtime_model->createInferHandle();
+        qwen_ctx_t * live_ctx = captureHandle.nativeCtx;
+        captureHandle.nativeCtx = nullptr;  // ownership transferred to host capture thread
         if (live_ctx == nullptr) {
             DestroyManualLiveAudio(&worker->live);
             return Status(StatusCode::kInternal, "failed to clone capture model context");
@@ -5174,8 +5676,9 @@ int RunServer(const ServerConfig & config) {
                  }
              }
       std::thread([ssn, sid, lang, bm = batch_model, audioCopy = std::move(audioCopy),
-                            vadText = std::move(vadText)]() mutable {
-                   qwen_ctx_t * reconcile_ctx = bm->CreateRealtimeClone();
+                             vadText = std::move(vadText)]() mutable {
+                    InferHandle rHandle = bm->createInferHandle();
+                    qwen_ctx_t * reconcile_ctx = rHandle.nativeCtx;
                   if (reconcile_ctx && audioCopy.size() > 1024) {
                       reconcile_ctx->segment_sec = 0.0f;
                       reconcile_ctx->search_sec = 0.0f;
@@ -5227,10 +5730,10 @@ int RunServer(const ServerConfig & config) {
                                   sid.c_str(), full_text.size(), vadText.size());
                           }
                       }
-                      qwen_free(reconcile_ctx);
-                  } else if (reconcile_ctx) {
-                      qwen_free(reconcile_ctx);
-                  }
+                       bm->releaseInferHandle(rHandle);
+                   } else if (reconcile_ctx) {
+                       bm->releaseInferHandle(rHandle);
+                   }
               }).detach();
          }
 
@@ -5248,6 +5751,12 @@ int RunServer(const ServerConfig & config) {
     });
     server.Get("/state_pure.js", [&](const HttpRequest &, HttpResponse & response) {
         ServeStaticTextFile(response, ui_dir / "state_pure.js", "application/javascript; charset=utf-8", "state_pure.js");
+    });
+    server.Get("/state.js", [&](const HttpRequest &, HttpResponse & response) {
+        ServeStaticTextFile(response, ui_dir / "state.js", "application/javascript; charset=utf-8", "state.js");
+    });
+    server.Get("/terminal.js", [&](const HttpRequest &, HttpResponse & response) {
+        ServeStaticTextFile(response, ui_dir / "terminal.js", "application/javascript; charset=utf-8", "terminal.js");
     });
     server.Get("/style.css", [&](const HttpRequest &, HttpResponse & response) {
         ServeStaticTextFile(response, ui_dir / "style.css", "text/css; charset=utf-8", "style.css");
@@ -5306,6 +5815,8 @@ int RunServer(const ServerConfig & config) {
         const auto uptime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - server_start).count();
         Json payload;
+        payload["backend"] = facade_->backendKind() == BackendKind::kCpu ? "cpu" : "cuda";
+        payload["backend_fallback"] = facade_->backendFallback();
         payload["uptime_ms"] = uptime_ms;
         payload["offline_requests"] = metrics.offline_requests.load();
         payload["async_jobs_submitted"] = metrics.async_jobs_submitted.load();
@@ -5451,14 +5962,97 @@ int RunServer(const ServerConfig & config) {
              * The on_segment callback fires once per VAD-committed
              * segment, updating the job's text and audio_ms under
              * jobs_mu so the UI sees growing text in real time. */
-            qwen_ctx_t *batch_ctx = batch_model->CreateRealtimeClone();
-            if (batch_ctx == nullptr) {
-                std::lock_guard<std::mutex> lock(jobs_mu);
-                OfflineJob & current = jobs[job_id];
-                current.state = "failed";
-                current.error = "failed to clone model context for batch";
-                current.updated_at = CurrentUnixSeconds();
+            InferHandle batchHandle = batch_model->createInferHandle();
+                qwen_ctx_t *batch_ctx = batchHandle.nativeCtx;
+                if (batch_ctx == nullptr) {
+                /* GPU path: VAD-segmented per-segment TranscribeSegment
+                 * with streaming progress (not whole-file TranscribeFile). */
+                RT_LOG("batch sid=%s nativeCtx null — using engine VAD-segmented",
+                       job_id.c_str());
+
+                auto on_segment_gpu = [&jobs, &jobs_mu, &job_id,
+                                       cancel_flag,
+                                       prepared_wav = prepared.wav_path](
+                                          int seg_idx,
+                                          std::string_view seg_text,
+                                          int seg_samples,
+                                          int64_t total_samples) -> bool {
+                    (void)seg_idx;
+                    (void)seg_samples;
+                    (void)prepared_wav;
+                    if (cancel_flag && cancel_flag->load()) {
+                        return false;
+                    }
+                    std::lock_guard<std::mutex> lock(jobs_mu);
+                    auto it = jobs.find(job_id);
+                    if (it == jobs.end()) {
+                        return false;
+                    }
+                    OfflineJob & current = it->second;
+                    if (!seg_text.empty()) {
+                        if (!current.text.empty() &&
+                            current.text.back() != ' ' &&
+                            current.text.back() != '\n' &&
+                            current.text.back() != '\t') {
+                            current.text.push_back(' ');
+                        }
+                        current.text.append(seg_text.data(), seg_text.size());
+                        current.token_count += (std::max)(
+                            static_cast<std::int32_t>(seg_text.size() / 3),
+                            std::int32_t{1});
+                    }
+                    current.audio_ms = static_cast<double>(total_samples) *
+                                       1000.0 / 16000.0;
+                    current.updated_at = CurrentUnixSeconds();
+                    return true;
+                };
+
+                VadSegmentedBatchResult vad_result;
+                const std::string forced_lang = options.language;
+                try {
+                    vad_result = TranscribeFileVadSegmentedEngineImpl(
+                        batch_model->engine(),
+                        batch_model->vad(),
+                        prepared.wav_path.string().c_str(),
+                        forced_lang,
+                        batch_model->verbosity(),
+                        on_segment_gpu,
+                        decode.cancel_callback,
+                        &vad_mu);
+                } catch (const std::exception & e) {
+                    vad_result.status = Status(
+                        StatusCode::kInternal,
+                        std::string("vad-segmented exception: ") + e.what());
+                } catch (...) {
+                    vad_result.status = Status(StatusCode::kInternal,
+                                               "vad-segmented unknown exception");
+                }
+                batch_model->releaseInferHandle(batchHandle);
                 CleanupPreparedAudio(&prepared);
+
+                {
+                    std::lock_guard<std::mutex> lock(jobs_mu);
+                    OfflineJob & current = jobs[job_id];
+                    current.updated_at = CurrentUnixSeconds();
+                    current.language = DetectLanguageLabel(options.language);
+                    current.inference_ms = vad_result.inference_ms;
+                    current.audio_ms = vad_result.audio_ms;
+                    if (cancel_flag && cancel_flag->load()) {
+                        current.state = "cancelled";
+                        current.error.clear();
+                    } else if (!vad_result.status.ok()) {
+                        current.state = "failed";
+                        current.error = vad_result.status.message();
+                    } else {
+                        current.state = "completed";
+                        if (current.text.empty() && !vad_result.text.empty()) {
+                            current.text = vad_result.text;
+                        }
+                    }
+                    if (current.tokens == 0 && current.token_count > 0) {
+                        current.tokens = current.token_count;
+                    }
+                }
                 return;
             }
             const int batch_verbosity = batch_model->verbosity();
@@ -5531,10 +6125,10 @@ int RunServer(const ServerConfig & config) {
                 vad_result.status = Status(StatusCode::kInternal,
                                            "vad-segmented unknown exception");
             }
-            /* Free the batch clone; it holds per-batch decoder state
-             * (KV cache, etc.) and must be released even on cancel. */
-            qwen_free(batch_ctx);
-            CleanupPreparedAudio(&prepared);
+      /* Free the batch clone; it holds per-batch decoder state
+              * (KV cache, etc.) and must be released even on cancel. */
+             batch_model->releaseInferHandle(batchHandle);
+             CleanupPreparedAudio(&prepared);
 
             {
                 std::lock_guard<std::mutex> lock(jobs_mu);

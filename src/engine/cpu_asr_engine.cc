@@ -109,4 +109,32 @@ int CpuAsrEngine::ActiveSessionCount() const {
     return static_cast<int>(sessions_.size());
 }
 
+std::unique_ptr<SessionHandle> CpuAsrEngine::CreateRealtimeSession(
+    const SessionOptions & opts) {
+    (void)opts;
+    auto * base = reinterpret_cast<qwen_ctx_t *>(backend_->base_ctx());
+    if (!base) {
+        return nullptr;
+    }
+    auto * clone = qwen_clone_shared(base);
+    if (!clone) {
+        return nullptr;
+    }
+    std::uint64_t id = next_session_id_++;
+    return std::make_unique<CpuSessionHandle>(clone, this, id);
+}
+
+void CpuAsrEngine::CloseSessionHandle(std::unique_ptr<SessionHandle> handle) {
+    if (!handle) return;
+    auto * ctx = static_cast<qwen_ctx_t *>(handle->nativeCtx());
+    if (ctx) {
+        qwen_free(ctx);
+    }
+}
+
+void *CpuAsrEngine::getVadHandle() const {
+    if (!backend_) return nullptr;
+    return backend_->vadHandle();
+}
+
 }  // namespace qasr

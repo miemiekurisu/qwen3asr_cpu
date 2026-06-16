@@ -6,6 +6,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <filesystem>
+#include <functional>
 
 namespace qasr {
 
@@ -28,6 +30,20 @@ private:
     void * base_ctx_ = nullptr;
 };
 
+class CpuSessionHandle final : public SessionHandle {
+public:
+    CpuSessionHandle(void * ctx, AsrEngine * engine, std::uint64_t id)
+        : ctx_(ctx), engine_(engine), id_(id) {}
+    void *nativeCtx() const override { return ctx_; }
+    AsrEngine *engine() const override { return engine_; }
+    std::uint64_t sessionId() const override { return id_; }
+
+private:
+    void * ctx_;
+    AsrEngine * engine_;
+    std::uint64_t id_;
+};
+
 class CpuAsrEngine final : public AsrEngine {
 public:
     CpuAsrEngine() = default;
@@ -43,6 +59,14 @@ public:
                                         CancelCallback on_cancel = {}) override;
     int ActiveSessionCount() const override;
     const V2EngineConfig & config() const override { return config_; }
+    std::unique_ptr<SessionHandle> CreateRealtimeSession(
+        const SessionOptions & opts) override;
+    void CloseSessionHandle(std::unique_ptr<SessionHandle>) override;
+    void *getVadHandle() const override;
+
+    // Expose the underlying C context for server-side C bridge calls.
+    // The facade knows C API; the engine owns the context lifetime.
+    void *base_ctx() const { return backend_ ? backend_->base_ctx() : nullptr; }
 
 private:
     struct CpuSessionEntry {

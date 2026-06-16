@@ -62,6 +62,9 @@ public:
                    int * out_idx, float * out_val = nullptr) override;
 
     void * base_ctx() const { return weights_ ? weights_->ctx : nullptr; }
+    // Return the Silero VAD handle owned by the loaded model context.
+    // CPU only; returns nullptr if model not loaded or VAD unavailable.
+    void * vadHandle() const;
 
 private:
     std::shared_ptr<CpuWeights> weights_;

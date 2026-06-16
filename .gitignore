@@ -72,3 +72,4 @@ app/test_cublaslt.cu
 
 # Dead CUDA files (not referenced by CMakeLists.txt)
 src/backend/cuda_graph_decode.cu
+certs/
