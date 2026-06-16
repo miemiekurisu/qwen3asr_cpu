@@ -73,3 +73,12 @@ app/test_cublaslt.cu
 # Dead CUDA files (not referenced by CMakeLists.txt)
 src/backend/cuda_graph_decode.cu
 certs/
+
+# Unwanted docs/tests
+PROJECT_MEMO.md
+e2e_server_test.sh
+e2e_ui_test.mjs
+docs/ARCHITECTURE.md
+docs/AUDIT_C1.md
+docs/INCIDENTS.md
+docs/SECURITY.md
