@@ -28,51 +28,66 @@ extern "C" {
 }
 #endif
 
+#ifdef QASR_CPU_BACKEND_ENABLED
+extern "C" {
+#include "qwen_asr_audio.h"
+}
+#endif
+
 namespace fs = std::filesystem;
 
 namespace {
 
 /* -------------------------------------------------------------------
- * Locate the WAV test file.
+ * Locate the audio test file.
  *
- * Filename on disk is URL-encoded (Git for Windows created it that way):
- *   %E9%A1%BE%E5%90%9B%E5%AD%90%EF%BC%8801%EF%BC%89.wav
- * This file is 顾君子（01）.wav — ~55 MB, mono/stereo 16-bit PCM.
+ * Uses short.mp3 (loaded via qwen_load_wav which handles MP3/WAV via ffmpeg).
  * ------------------------------------------------------------------- */
 
 fs::path TestfileDir() {
     return fs::path(__FILE__).parent_path().parent_path() / "testfile";
 }
 
-const char * kWavBasename =
-    "%E9%A1%BE%E5%90%9B%E5%AD%90%EF%BC%8801%EF%BC%89.wav";
+const char * kShortMp3 = "short.mp3";
 
-fs::path WavPath() {
-    return TestfileDir() / kWavBasename;
+fs::path ShortMp3Path() {
+    return TestfileDir() / kShortMp3;
 }
 
-bool WavAvailable() {
-    const auto p = WavPath();
+bool ShortMp3Available() {
+    const auto p = ShortMp3Path();
     if (fs::exists(p)) return true;
     std::fprintf(stderr, "  [SKIP] %s not found\n", p.string().c_str());
     return false;
 }
 
-/* Short helper to load the WAV and fail-fast on error. */
-struct LoadedWav {
+/* Short helper to load the audio file and fail-fast on error. */
+struct LoadedAudio {
     std::vector<float> samples;
-    std::int32_t sample_rate_hz = 0;
+    std::int32_t sample_rate_hz = 16000;  // qwen_load_wav returns 16kHz
 };
 
-bool LoadTestWav(LoadedWav * out) {
-    if (!WavAvailable()) return false;
-    qasr::Status s = qasr::ReadWav(WavPath().string(), &out->samples, &out->sample_rate_hz);
-    if (!s.ok()) {
-        std::fprintf(stderr, "  [SKIP] ReadWav failed: %s\n", s.message().c_str());
+#ifdef QASR_CPU_BACKEND_ENABLED
+bool LoadTestAudio(LoadedAudio * out) {
+    if (!ShortMp3Available()) return false;
+    int n = 0;
+    float * raw = qwen_load_wav(ShortMp3Path().string().c_str(), &n);
+    if (!raw || n <= 0) {
+        std::fprintf(stderr, "  [SKIP] qwen_load_wav failed\n");
+        if (raw) std::free(raw);
         return false;
     }
+    out->samples.assign(raw, raw + n);
+    std::free(raw);
+    out->sample_rate_hz = 16000;
     return true;
 }
+#else
+bool LoadTestAudio(LoadedAudio * out) {
+    std::fprintf(stderr, "  [SKIP] CPU backend not enabled\n");
+    return false;
+}
+#endif
 
 }  // namespace
 
@@ -80,32 +95,30 @@ bool LoadTestWav(LoadedWav * out) {
  * Group 1 — WAV Loading
  * ======================================================================== */
 
-QASR_TEST(RealWavLoadSuccess) {
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+QASR_TEST(RealAudioLoadSuccess) {
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     /* The file is non-trivial spoken Chinese audio. */
-    QASR_EXPECT(wav.sample_rate_hz > 0);
-    QASR_EXPECT(wav.samples.size() > 16000);  /* at least 1 second of audio */
+    QASR_EXPECT(audio.sample_rate_hz > 0);
+    QASR_EXPECT(audio.samples.size() > 16000);  /* at least 1 second of audio */
 }
 
-QASR_TEST(RealWavSampleRate) {
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+QASR_TEST(RealAudioSampleRate) {
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
-    /* Expect standard PCM rates: 8000, 16000, 22050, 44100, 48000 */
-    const int32_t rate = wav.sample_rate_hz;
-    QASR_EXPECT(rate == 8000 || rate == 16000 || rate == 22050 ||
-                rate == 44100 || rate == 48000);
+    /* qwen_load_wav returns 16kHz */
+    QASR_EXPECT(audio.sample_rate_hz == 16000);
 }
 
-QASR_TEST(RealWavSampleRange) {
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+QASR_TEST(RealAudioSampleRange) {
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     /* All samples should be in [-1, 1] after PCM normalisation. */
     float min_val = 0.0f, max_val = 0.0f;
-    for (float s : wav.samples) {
+    for (float s : audio.samples) {
         QASR_EXPECT(std::isfinite(s));
         if (s < min_val) min_val = s;
         if (s > max_val) max_val = s;
@@ -117,26 +130,26 @@ QASR_TEST(RealWavSampleRange) {
     QASR_EXPECT(max_val - min_val > 0.01f);
 }
 
-QASR_TEST(RealWavDuration) {
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+QASR_TEST(RealAudioDuration) {
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     /* Duration in seconds. The file is a multi-minute reading. */
-    const double dur_sec = static_cast<double>(wav.samples.size()) /
-                           static_cast<double>(wav.sample_rate_hz);
+    const double dur_sec = static_cast<double>(audio.samples.size()) /
+                           static_cast<double>(audio.sample_rate_hz);
     /* Should be at least 5 seconds and no more than 60 minutes. */
     QASR_EXPECT(dur_sec > 5.0);
     QASR_EXPECT(dur_sec < 3600.0);
 }
 
-QASR_TEST(RealWavAudioSpanValidation) {
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+QASR_TEST(RealAudioAudioSpanValidation) {
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     qasr::AudioSpan span{};
-    span.samples = wav.samples.data();
-    span.sample_count = static_cast<std::int64_t>(wav.samples.size());
-    span.sample_rate_hz = wav.sample_rate_hz;
+    span.samples = audio.samples.data();
+    span.sample_count = static_cast<std::int64_t>(audio.samples.size());
+    span.sample_rate_hz = audio.sample_rate_hz;
     span.channels = 1;
 
     QASR_EXPECT(qasr::ValidateAudioSpan(span).ok());
@@ -147,17 +160,17 @@ QASR_TEST(RealWavAudioSpanValidation) {
  * Group 2 — Resampling
  * ======================================================================== */
 
-QASR_TEST(RealWavResampleTo16k) {
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+QASR_TEST(RealAudioResampleTo16k) {
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     std::vector<float> out;
-    qasr::Status s = qasr::Resample(wav.samples, wav.sample_rate_hz, 16000, &out);
+    qasr::Status s = qasr::Resample(audio.samples, audio.sample_rate_hz, 16000, &out);
     QASR_EXPECT(s.ok());
 
     /* Target length should be proportional to rate ratio. */
-    const double ratio = 16000.0 / wav.sample_rate_hz;
-    const auto expected_len = static_cast<std::size_t>(wav.samples.size() * ratio);
+    const double ratio = 16000.0 / audio.sample_rate_hz;
+    const auto expected_len = static_cast<std::size_t>(audio.samples.size() * ratio);
     /* Allow 1-sample rounding tolerance. */
     QASR_EXPECT(out.size() >= expected_len - 1);
     QASR_EXPECT(out.size() <= expected_len + 1);
@@ -169,33 +182,33 @@ QASR_TEST(RealWavResampleTo16k) {
     }
 }
 
-QASR_TEST(RealWavResampleTo8k) {
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+QASR_TEST(RealAudioResampleTo8k) {
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     std::vector<float> out;
-    qasr::Status s = qasr::Resample(wav.samples, wav.sample_rate_hz, 8000, &out);
+    qasr::Status s = qasr::Resample(audio.samples, audio.sample_rate_hz, 8000, &out);
     QASR_EXPECT(s.ok());
     QASR_EXPECT(out.size() > 0);
 
-    const double expected = static_cast<double>(wav.samples.size()) *
-                            (8000.0 / wav.sample_rate_hz);
+    const double expected = static_cast<double>(audio.samples.size()) *
+                            (8000.0 / audio.sample_rate_hz);
     QASR_EXPECT(std::abs(static_cast<double>(out.size()) - expected) < 2.0);
 }
 
-QASR_TEST(RealWavResampleIdentity) {
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+QASR_TEST(RealAudioResampleIdentity) {
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     std::vector<float> out;
-    qasr::Status s = qasr::Resample(wav.samples, wav.sample_rate_hz,
-                                     wav.sample_rate_hz, &out);
+    qasr::Status s = qasr::Resample(audio.samples, audio.sample_rate_hz,
+                                     audio.sample_rate_hz, &out);
     QASR_EXPECT(s.ok());
-    QASR_EXPECT_EQ(out.size(), wav.samples.size());
+    QASR_EXPECT_EQ(out.size(), audio.samples.size());
 
     /* Identity resample should produce exact copy. */
     for (std::size_t i = 0; i < out.size(); ++i) {
-        QASR_EXPECT(out[i] == wav.samples[i]);
+        QASR_EXPECT(out[i] == audio.samples[i]);
     }
 }
 
@@ -203,17 +216,17 @@ QASR_TEST(RealWavResampleIdentity) {
  * Group 3 — Mel Spectrogram
  * ======================================================================== */
 
-QASR_TEST(RealWavMelSpectrogram80Bins) {
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+QASR_TEST(RealAudioMelSpectrogram80Bins) {
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     /* Resample to 16 kHz if needed. */
     std::vector<float> audio_16k;
-    if (wav.sample_rate_hz != 16000) {
-        qasr::Status rs = qasr::Resample(wav.samples, wav.sample_rate_hz, 16000, &audio_16k);
+    if (audio.sample_rate_hz != 16000) {
+        qasr::Status rs = qasr::Resample(audio.samples, audio.sample_rate_hz, 16000, &audio_16k);
         QASR_EXPECT(rs.ok());
     } else {
-        audio_16k = wav.samples;
+        audio_16k = audio.samples;
     }
 
     std::vector<float> mel;
@@ -230,16 +243,16 @@ QASR_TEST(RealWavMelSpectrogram80Bins) {
     QASR_EXPECT(frames_per_sec > 90.0 && frames_per_sec < 110.0);
 }
 
-QASR_TEST(RealWavMelSpectrogram128Bins) {
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+QASR_TEST(RealAudioMelSpectrogram128Bins) {
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     std::vector<float> audio_16k;
-    if (wav.sample_rate_hz != 16000) {
-        qasr::Status rs = qasr::Resample(wav.samples, wav.sample_rate_hz, 16000, &audio_16k);
+    if (audio.sample_rate_hz != 16000) {
+        qasr::Status rs = qasr::Resample(audio.samples, audio.sample_rate_hz, 16000, &audio_16k);
         QASR_EXPECT(rs.ok());
     } else {
-        audio_16k = wav.samples;
+        audio_16k = audio.samples;
     }
 
     std::vector<float> mel;
@@ -251,16 +264,16 @@ QASR_TEST(RealWavMelSpectrogram128Bins) {
     QASR_EXPECT_EQ(mel.size(), static_cast<std::size_t>(n_frames) * 128);
 }
 
-QASR_TEST(RealWavMelValuesFinite) {
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+QASR_TEST(RealAudioMelValuesFinite) {
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     std::vector<float> audio_16k;
-    if (wav.sample_rate_hz != 16000) {
-        qasr::Status rs = qasr::Resample(wav.samples, wav.sample_rate_hz, 16000, &audio_16k);
+    if (audio.sample_rate_hz != 16000) {
+        qasr::Status rs = qasr::Resample(audio.samples, audio.sample_rate_hz, 16000, &audio_16k);
         QASR_EXPECT(rs.ok());
     } else {
-        audio_16k = wav.samples;
+        audio_16k = audio.samples;
     }
 
     std::vector<float> mel;
@@ -283,17 +296,17 @@ QASR_TEST(RealWavMelValuesFinite) {
     QASR_EXPECT(mel_max - mel_min > 0.1f);
 }
 
-QASR_TEST(RealWavMelSpectrogram1SecSlice) {
+QASR_TEST(RealAudioMelSpectrogram1SecSlice) {
     /* Process only the first 1 second — fast, deterministic. */
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     std::vector<float> audio_16k;
-    if (wav.sample_rate_hz != 16000) {
-        qasr::Status rs = qasr::Resample(wav.samples, wav.sample_rate_hz, 16000, &audio_16k);
+    if (audio.sample_rate_hz != 16000) {
+        qasr::Status rs = qasr::Resample(audio.samples, audio.sample_rate_hz, 16000, &audio_16k);
         QASR_EXPECT(rs.ok());
     } else {
-        audio_16k = wav.samples;
+        audio_16k = audio.samples;
     }
 
     /* Take first 16000 samples (1 sec). */
@@ -313,58 +326,58 @@ QASR_TEST(RealWavMelSpectrogram1SecSlice) {
  * Group 4 — CompactSilence
  * ======================================================================== */
 
-QASR_TEST(RealWavCompactSilence) {
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+QASR_TEST(RealAudioCompactSilence) {
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     /* Work on a copy. */
-    std::vector<float> audio = wav.samples;
-    const auto original_size = audio.size();
+    std::vector<float> audioCopy = audio.samples;
+    const auto original_size = audioCopy.size();
 
-    qasr::Status s = qasr::CompactSilence(&audio, -40.0f, 200, 50);
+    qasr::Status s = qasr::CompactSilence(&audioCopy, -40.0f, 200, 50);
     QASR_EXPECT(s.ok());
 
     /* We expect the result to be no larger than the original. */
-    QASR_EXPECT(audio.size() <= original_size);
-    QASR_EXPECT(audio.size() > 0);
+    QASR_EXPECT(audioCopy.size() <= original_size);
+    QASR_EXPECT(audioCopy.size() > 0);
 
     /* All values still in [-1, 1]. */
-    for (float v : audio) {
+    for (float v : audioCopy) {
         QASR_EXPECT(std::isfinite(v));
         QASR_EXPECT(v >= -1.0f && v <= 1.0f);
     }
 }
 
-QASR_TEST(RealWavCompactSilenceTight) {
+QASR_TEST(RealAudioCompactSilenceTight) {
     /* Aggressive silence compaction: threshold=-20 dB. */
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
-    std::vector<float> audio = wav.samples;
-    const auto original_size = audio.size();
+      std::vector<float> audioCopy = audio.samples;
+    const auto original_size = audioCopy.size();
 
-    qasr::Status s = qasr::CompactSilence(&audio, -20.0f, 100, 20);
+    qasr::Status s = qasr::CompactSilence(&audioCopy, -20.0f, 100, 20);
     QASR_EXPECT(s.ok());
-    QASR_EXPECT(audio.size() <= original_size);
-    QASR_EXPECT(audio.size() > 0);
+    QASR_EXPECT(audioCopy.size() <= original_size);
+    QASR_EXPECT(audioCopy.size() > 0);
 }
 
 /* ========================================================================
  * Group 5 — StreamingAudioRing with real data
  * ======================================================================== */
 
-QASR_TEST(RealWavStreamingRingChunkedAppend) {
+QASR_TEST(RealAudioStreamingRingChunkedAppend) {
     /* Simulate streaming: feed real audio in 320-sample (20 ms) chunks. */
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     /* Use first 5 seconds max. */
     std::vector<float> audio_16k;
-    if (wav.sample_rate_hz != 16000) {
-        qasr::Status rs = qasr::Resample(wav.samples, wav.sample_rate_hz, 16000, &audio_16k);
+    if (audio.sample_rate_hz != 16000) {
+        qasr::Status rs = qasr::Resample(audio.samples, audio.sample_rate_hz, 16000, &audio_16k);
         QASR_EXPECT(rs.ok());
     } else {
-        audio_16k = wav.samples;
+        audio_16k = audio.samples;
     }
     const std::size_t max_samples = std::min<std::size_t>(audio_16k.size(), 80000);
 
@@ -387,17 +400,17 @@ QASR_TEST(RealWavStreamingRingChunkedAppend) {
     QASR_EXPECT_EQ(copied.size(), ring.current_size());
 }
 
-QASR_TEST(RealWavStreamingRingEviction) {
+QASR_TEST(RealAudioStreamingRingEviction) {
     /* Ring smaller than audio → eviction should occur. */
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     std::vector<float> audio_16k;
-    if (wav.sample_rate_hz != 16000) {
-        qasr::Status rs = qasr::Resample(wav.samples, wav.sample_rate_hz, 16000, &audio_16k);
+    if (audio.sample_rate_hz != 16000) {
+        qasr::Status rs = qasr::Resample(audio.samples, audio.sample_rate_hz, 16000, &audio_16k);
         QASR_EXPECT(rs.ok());
     } else {
-        audio_16k = wav.samples;
+        audio_16k = audio.samples;
     }
 
     /* Small ring: 1 second. */
@@ -418,18 +431,18 @@ QASR_TEST(RealWavStreamingRingEviction) {
     }
 }
 
-QASR_TEST(RealWavStreamingMelPipeline) {
+QASR_TEST(RealAudioStreamingMelPipeline) {
     /* Full streaming pipeline: ring buffer → mel spectrogram.
      * Simulates the path used for real-time inference. */
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     std::vector<float> audio_16k;
-    if (wav.sample_rate_hz != 16000) {
-        qasr::Status rs = qasr::Resample(wav.samples, wav.sample_rate_hz, 16000, &audio_16k);
+    if (audio.sample_rate_hz != 16000) {
+        qasr::Status rs = qasr::Resample(audio.samples, audio.sample_rate_hz, 16000, &audio_16k);
         QASR_EXPECT(rs.ok());
     } else {
-        audio_16k = wav.samples;
+        audio_16k = audio.samples;
     }
 
     /* Feed first 2 seconds into ring. */
@@ -481,15 +494,15 @@ float Bf16ToFloatR(std::uint16_t value) {
 QASR_TEST(RealMelInt8QuantizeAccuracy) {
     /* Load audio → mel → treat first N mel frames as a BF16 weight matrix
      * → quantise → check round-trip accuracy. */
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     std::vector<float> audio_16k;
-    if (wav.sample_rate_hz != 16000) {
-        qasr::Status rs = qasr::Resample(wav.samples, wav.sample_rate_hz, 16000, &audio_16k);
+    if (audio.sample_rate_hz != 16000) {
+        qasr::Status rs = qasr::Resample(audio.samples, audio.sample_rate_hz, 16000, &audio_16k);
         QASR_EXPECT(rs.ok());
     } else {
-        audio_16k = wav.samples;
+        audio_16k = audio.samples;
     }
 
     /* First 1 second mel. */
@@ -539,15 +552,15 @@ QASR_TEST(RealMelInt8QuantizeAccuracy) {
 
 QASR_TEST(RealMelInt8AllValuesInRange) {
     /* All INT8 quantised values should be in [-127, 127]. */
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     std::vector<float> audio_16k;
-    if (wav.sample_rate_hz != 16000) {
-        qasr::Status rs = qasr::Resample(wav.samples, wav.sample_rate_hz, 16000, &audio_16k);
+    if (audio.sample_rate_hz != 16000) {
+        qasr::Status rs = qasr::Resample(audio.samples, audio.sample_rate_hz, 16000, &audio_16k);
         QASR_EXPECT(rs.ok());
     } else {
-        audio_16k = wav.samples;
+        audio_16k = audio.samples;
     }
 
     const std::size_t one_sec = std::min<std::size_t>(audio_16k.size(), 16000);
@@ -583,15 +596,15 @@ QASR_TEST(RealMelInt8AllValuesInRange) {
 QASR_TEST(RealMelInt8MatmulDecode) {
     /* Full pipeline: audio → mel → BF16 weight → INT8 quantise →
      * oneDNN matmul execute (M = 1, simulating single-step decode). */
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     std::vector<float> audio_16k;
-    if (wav.sample_rate_hz != 16000) {
-        qasr::Status rs = qasr::Resample(wav.samples, wav.sample_rate_hz, 16000, &audio_16k);
+    if (audio.sample_rate_hz != 16000) {
+        qasr::Status rs = qasr::Resample(audio.samples, audio.sample_rate_hz, 16000, &audio_16k);
         QASR_EXPECT(rs.ok());
     } else {
-        audio_16k = wav.samples;
+        audio_16k = audio.samples;
     }
 
     /* Use first-second mel as a simulated weight [N, K]. */
@@ -653,15 +666,15 @@ QASR_TEST(RealMelInt8MatmulDecode) {
 
 QASR_TEST(RealMelInt8MatmulPrefill) {
     /* Prefill path: M = 4 tokens at once. */
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     std::vector<float> audio_16k;
-    if (wav.sample_rate_hz != 16000) {
-        qasr::Status rs = qasr::Resample(wav.samples, wav.sample_rate_hz, 16000, &audio_16k);
+    if (audio.sample_rate_hz != 16000) {
+        qasr::Status rs = qasr::Resample(audio.samples, audio.sample_rate_hz, 16000, &audio_16k);
         QASR_EXPECT(rs.ok());
     } else {
-        audio_16k = wav.samples;
+        audio_16k = audio.samples;
     }
 
     const std::size_t one_sec = std::min<std::size_t>(audio_16k.size(), 16000);
@@ -724,15 +737,15 @@ QASR_TEST(RealMelInt8MatmulPrefill) {
 QASR_TEST(RealMelInt8MatvecConsistency) {
     /* qwen_int8_matvec should produce the same result as matmul_execute
      * when tested with mel-derived weights. */
-    LoadedWav wav;
-    if (!LoadTestWav(&wav)) return;
+    LoadedAudio audio;
+    if (!LoadTestAudio(&audio)) return;
 
     std::vector<float> audio_16k;
-    if (wav.sample_rate_hz != 16000) {
-        qasr::Status rs = qasr::Resample(wav.samples, wav.sample_rate_hz, 16000, &audio_16k);
+    if (audio.sample_rate_hz != 16000) {
+        qasr::Status rs = qasr::Resample(audio.samples, audio.sample_rate_hz, 16000, &audio_16k);
         QASR_EXPECT(rs.ok());
     } else {
-        audio_16k = wav.samples;
+        audio_16k = audio.samples;
     }
 
     const std::size_t one_sec = std::min<std::size_t>(audio_16k.size(), 16000);

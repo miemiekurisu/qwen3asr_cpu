@@ -40,7 +40,7 @@
 #
 # QASR_BENCH_NOTES: hardware-specific tuning is intentionally out of scope for
 # this file.  To pick the fastest BLAS for a particular machine, run
-# `tools/blas_bench.py` (emits sgemm throughput across the realistic matmul
+# `scripts/deprecated/blas_bench.py` (emits sgemm throughput across the realistic matmul
 # sizes used by qwen_asr) and then set QASR_BLAS accordingly in your
 # CMakePresets.json.  Do not encode a specific CPU model into CMake defaults.
 #

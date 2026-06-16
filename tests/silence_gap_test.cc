@@ -12,7 +12,11 @@
  *
  * Requires:
  *   - Environment variable QASR_MODEL_DIR pointing to a Qwen3-ASR model directory
+<<<<<<< HEAD
  *   - testfile/顾君子（01）.wav (WAV audio source)
+=======
+ *   - testfile/short.mp3 (MP3 audio source, loaded via qwen_load_wav)
+>>>>>>> gpu
  *
  * Skips gracefully when model or audio file is absent (CI-safe).
  */
@@ -47,6 +51,7 @@ fs::path TestfileDir() {
     return fs::path(__FILE__).parent_path().parent_path() / "testfile";
 }
 
+<<<<<<< HEAD
 /* URL-encoded name used on Windows / Git for Windows. */
 const char * kWavBasename =
     "%E9%A1%BE%E5%90%9B%E5%AD%90%EF%BC%8801%EF%BC%89.wav";
@@ -71,6 +76,22 @@ fs::path ResolveWavPath() {
     return TestfileDir() / L"\u987e\u541b\u5b50\uff0801\uff09.wav";
 }
 
+=======
+/* Use short.mp3 instead of the missing WAV file. */
+const char * kShortMp3 = "short.mp3";
+
+fs::path ShortMp3Path() {
+    return TestfileDir() / kShortMp3;
+}
+
+bool ShortMp3Available() {
+    const auto p = ShortMp3Path();
+    if (fs::exists(p)) return true;
+    std::fprintf(stderr, "  [SKIP] short.mp3 not found: %s\n", p.string().c_str());
+    return false;
+}
+
+>>>>>>> gpu
 const char * ModelDir() {
     const char * env = std::getenv("QASR_MODEL_DIR");
     return (env && env[0] != '\0') ? env : nullptr;
@@ -118,6 +139,7 @@ QASR_TEST(SilenceGapStreamInference) {
                      "         e.g. set QASR_MODEL_DIR=D:\\models\\Qwen3-ASR-0.6B\n");
         return;
     }
+<<<<<<< HEAD
     if (!WavAvailable()) return;
 
     /* ── 1. Load speech audio ────────────────────────────────── */
@@ -141,6 +163,19 @@ QASR_TEST(SilenceGapStreamInference) {
         audio_16k = wav_samples;
     }
     wav_samples.clear();  /* free memory */
+=======
+    if (!ShortMp3Available()) return;
+
+    /* ── 1. Load speech audio via qwen_load_wav (handles MP3/WAV) ── */
+    int n_samples = 0;
+    float * mp3_raw = qwen_load_wav(ShortMp3Path().string().c_str(), &n_samples);
+    if (!mp3_raw) {
+        std::fprintf(stderr, "  [SKIP] qwen_load_wav failed: %s\n", ShortMp3Path().string().c_str());
+        return;
+    }
+    std::vector<float> audio_16k(mp3_raw, mp3_raw + n_samples);
+    std::free(mp3_raw);
+>>>>>>> gpu
 
     /* Use first 5 seconds of speech. */
     const std::size_t speech_samples = std::min<std::size_t>(audio_16k.size(), 5 * 16000);
@@ -275,6 +310,7 @@ QASR_TEST(SilenceGapLive) {
         std::fprintf(stderr, "  [SKIP] QASR_MODEL_DIR not set\n");
         return;
     }
+<<<<<<< HEAD
     if (!WavAvailable()) return;
 
     /* ── Load and build synthetic audio (same as above) ──────── */
@@ -296,6 +332,19 @@ QASR_TEST(SilenceGapLive) {
         audio_16k = wav_samples;
     }
     wav_samples.clear();
+=======
+    if (!ShortMp3Available()) return;
+
+    /* ── Load and build synthetic audio (same as above) ──────── */
+    int n_samples2 = 0;
+    float * mp3_raw2 = qwen_load_wav(ShortMp3Path().string().c_str(), &n_samples2);
+    if (!mp3_raw2) {
+        std::fprintf(stderr, "  [SKIP] qwen_load_wav failed\n");
+        return;
+    }
+    std::vector<float> audio_16k(mp3_raw2, mp3_raw2 + n_samples2);
+    std::free(mp3_raw2);
+>>>>>>> gpu
 
     const std::size_t speech_samples = std::min<std::size_t>(audio_16k.size(), 5 * 16000);
     const std::size_t silence_samples = 20 * 16000;

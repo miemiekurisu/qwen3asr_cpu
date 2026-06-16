@@ -50,6 +50,25 @@ add_library(qasr_core STATIC
     src/inference/aligner_client.cc
 )
 
+# Engine v2 sources (GPU branch)
+set(QASR_ENGINE_V2_SOURCES
+    src/engine/types.cc
+    src/engine/config.cc
+    src/engine/asr_engine.cc
+    src/engine/qwen_model.cc
+    src/engine/qwen_session.cc
+    src/engine/cpu_asr_engine.cc
+    src/engine/cpu_asr_executor.cc
+    src/engine/cuda_asr_engine.cc
+    src/engine/perf_stats.cc
+    src/backend/device_backend.cc
+    src/backend/cpu_backend.cc
+    src/backend/cuda_backend.cc
+    src/scheduler/scheduler.cc
+    src/backend/audio_segmentation.c
+)
+target_sources(qasr_core PRIVATE ${QASR_ENGINE_V2_SOURCES})
+
 target_include_directories(qasr_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -74,6 +93,21 @@ include(QasrBlas)
 qasr_configure_blas(qasr_core)
 
 include(QasrOneDNN)
+
+# Shared backend include path (audio_segmentation.h etc.)
+target_include_directories(qasr_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/backend)
+
+# libcurl for translation client
+find_package(CURL QUIET)
+if(CURL_FOUND)
+    message(STATUS "libcurl: found (${CURL_INCLUDE_DIRS})")
+    target_include_directories(qasr_core PRIVATE ${CURL_INCLUDE_DIRS})
+    target_link_libraries(qasr_core PRIVATE ${CURL_LIBRARIES})
+    target_compile_definitions(qasr_core PUBLIC QASR_CURL_AVAILABLE=1)
+    target_sources(qasr_core PRIVATE src/engine/translation.cc)
+else()
+    message(WARNING "libcurl not found; translation client disabled")
+endif()
 
 if(QASR_ENABLE_CPU_BACKEND)
     if(NOT WIN32)
@@ -187,6 +221,7 @@ if(QASR_ENABLE_CPU_BACKEND)
 
     target_compile_definitions(qasr_core PUBLIC QASR_CPU_BACKEND_ENABLED=1)
     target_include_directories(qasr_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/qwen_cpu)
+    target_include_directories(qasr_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/backend)
     if(WIN32)
         # Win32 threading API + memory-mapped I/O are in kernel32 (linked by default)
     else()
@@ -216,6 +251,68 @@ if(QASR_ENABLE_CPU_BACKEND)
     endif()
 endif()
 
+# ─── CUDA Backend (Engine v2) ───
+option(QASR_ENABLE_CUDA_BACKEND "Enable CUDA backend for Engine v2" OFF)
+set(QASR_CUDA_PLATFORM "generic" CACHE STRING "CUDA target platform: generic, dgx_spark")
+set(QASR_CUDA_BACKEND_AVAILABLE 0)
+
+if(QASR_ENABLE_CUDA_BACKEND)
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        if(QASR_CUDA_PLATFORM STREQUAL "dgx_spark")
+            set(CMAKE_CUDA_ARCHITECTURES "121")
+        else()
+            set(CMAKE_CUDA_ARCHITECTURES "native")
+        endif()
+    endif()
+
+    find_library(QASR_CUBLAS_LIBRARY cublas PATHS /usr/local/cuda/lib64 /usr/local/cuda-13.0/lib64)
+    find_path(QASR_CUDA_INCLUDE_DIR cuda_runtime.h PATHS /usr/local/cuda/include /usr/local/cuda-13.0/include)
+
+    if(QASR_CUBLAS_LIBRARY AND QASR_CUDA_INCLUDE_DIR)
+        set(QASR_CUDA_BACKEND_AVAILABLE 1)
+        message(STATUS "CUDA: platform=${QASR_CUDA_PLATFORM} arch=${CMAKE_CUDA_ARCHITECTURES}")
+        message(STATUS "CUDA: cublas=${QASR_CUBLAS_LIBRARY} include=${QASR_CUDA_INCLUDE_DIR}")
+
+        target_include_directories(qasr_core PUBLIC ${QASR_CUDA_INCLUDE_DIR})
+        target_link_libraries(qasr_core PRIVATE ${QASR_CUBLAS_LIBRARY})
+        target_compile_definitions(qasr_core PUBLIC QASR_CUDA_BACKEND_ENABLED=1)
+
+        # CUDA kernel sources (compiled by nvcc)
+        set(QASR_CUDA_KERNEL_SOURCES
+            src/backend/rms_norm.cu
+            src/backend/rope.cu
+            src/backend/swiglu.cu
+            src/backend/argmax.cu
+            src/backend/cublas_gemm.cu
+            src/backend/elementwise.cu
+            src/backend/attention.cu
+            src/backend/embedding.cu
+            src/backend/layer_norm.cu
+            src/backend/bidir_attention.cu
+            src/backend/gelu.cu
+            src/backend/fp32_transpose.cu
+            src/backend/broadcast_add.cu
+            src/backend/gemv.cu
+            src/backend/conv2d.cu
+            src/backend/reshape.cu
+            src/backend/sinusoidal_pe.cu
+            src/backend/cuda_graph.cu
+            src/backend/decoder_fusion.cu
+        )
+        target_sources(qasr_core PRIVATE ${QASR_CUDA_KERNEL_SOURCES})
+
+        if(QASR_CUDA_PLATFORM STREQUAL "dgx_spark")
+            target_compile_definitions(qasr_core PRIVATE QASR_CUDA_PLATFORM_DGX_SPARK)
+        endif()
+    else()
+        message(WARNING "CUDA backend requested but cuBLAS not found; CUDA disabled")
+    endif()
+endif()
+
 add_executable(qasr_cli
     app/qasr_cli.cc
     src/cli/options.cc
@@ -234,6 +331,18 @@ endif()
 if(QASR_ENABLE_ASAN AND NOT MSVC)
     target_compile_options(qasr_cli PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_link_options(qasr_cli PRIVATE -fsanitize=address,undefined)
+endif()
+
+# qasr_v2_test — Engine v2 CPU/CUDA comparison test
+add_executable(qasr_v2_test
+    app/qasr_v2_test.cc
+)
+target_link_libraries(qasr_v2_test PRIVATE qasr_core)
+target_include_directories(qasr_v2_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(MSVC)
+    target_compile_options(qasr_v2_test PRIVATE /W4 /permissive- /utf-8)
+else()
+    target_compile_options(qasr_v2_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 endif()
 
 # qasr_blas_bench — real-time-stream BLAS benchmark
@@ -339,6 +448,11 @@ if(QASR_ENABLE_TESTS)
     if(QASR_ENABLE_CPU_BACKEND)
         list(APPEND QASR_UNIT_TEST_SOURCES tests/qwen_cpu_kernels_test.cc)
         list(APPEND QASR_UNIT_TEST_SOURCES tests/onednn_int8_test.cc)
+        list(APPEND QASR_UNIT_TEST_SOURCES tests/engine_v2_test.cc)
+        list(APPEND QASR_UNIT_TEST_SOURCES tests/session_test.cc)
+        list(APPEND QASR_UNIT_TEST_SOURCES tests/scheduler_test.cc)
+        list(APPEND QASR_UNIT_TEST_SOURCES tests/cuda_backend_test.cc)
+        list(APPEND QASR_UNIT_TEST_SOURCES tests/multi_session_analysis_test.cc)
     endif()
 
     add_executable(qasr_unit_tests ${QASR_UNIT_TEST_SOURCES})

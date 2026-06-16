@@ -48,3 +48,37 @@ node_modules/
 
 # Downloaded ONNX Runtime (installed by build script)
 deps/
+
+AGENTS.md
+
+# CUDA build directory (DGX Spark / aarch64)
+build-dgx/
+build_dgx/
+
+# CUDA test artifacts
+gemm_verify
+gemm_verify2
+gemm_verify3
+*.fatbin
+
+# CUDA debug/verify kernels (not part of main code)
+src/backend/gemm_verify.cu
+src/backend/gemm_verify2.cu
+src/backend/bf16_gemm_verify.cu
+src/backend/bf16_gemv.cu
+src/backend/fp32_transpose.cu
+app/test_bf16.cu
+app/test_cublaslt.cu
+
+# Dead CUDA files (not referenced by CMakeLists.txt)
+src/backend/cuda_graph_decode.cu
+certs/
+
+# Unwanted docs/tests
+PROJECT_MEMO.md
+e2e_server_test.sh
+e2e_ui_test.mjs
+docs/ARCHITECTURE.md
+docs/AUDIT_C1.md
+docs/INCIDENTS.md
+docs/SECURITY.md

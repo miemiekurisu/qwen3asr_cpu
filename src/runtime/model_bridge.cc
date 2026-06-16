@@ -9,7 +9,9 @@
 #include <string>
 #include <string_view>
 
+#include "qasr/audio/audio_convert.h"
 #include "qasr/base/utf8.h"
+#include "qasr/engine/asr_engine.h"
 #include "qasr/runtime/model_bridge_internal.h"
 
 #ifdef QASR_CPU_BACKEND_ENABLED
@@ -322,92 +324,80 @@ AsrRunResult RunAsr(const AsrRunOptions & options) {
         return result;
     }
 
-#ifndef QASR_CPU_BACKEND_ENABLED
-    result.status = Status(StatusCode::kUnimplemented, "cpu backend is unavailable on this platform");
-    return result;
-#else
-    qwen_verbose = options.verbosity;
-    qwen_monitor = 0;
+    V2EngineConfig engCfg;
+    engCfg.model_dir = options.model_dir;
+    engCfg.threads = options.threads;
+    engCfg.temperature = options.temperature;
+    engCfg.max_sessions = 1;
+    engCfg.verbosity = options.verbosity;
+    engCfg.language = options.language;
+    engCfg.prompt = options.prompt;
 
-    const int n_threads = options.threads > 0 ? options.threads : qwen_get_num_cpus();
-    qwen_set_threads(n_threads);
-
-    qwen_ctx_t * ctx = qwen_load(options.model_dir.c_str());
-    if (ctx == nullptr) {
-        result.status = Status(StatusCode::kInternal, "qwen_load failed");
+    auto engine = CreateEngine(BackendKind::kCpu);
+    if (!engine) {
+        result.status = Status(StatusCode::kUnimplemented,
+                               "cpu backend is unavailable on this platform");
+        return result;
+    }
+    Status st = engine->LoadModel(engCfg);
+    if (!st.ok()) {
+        result.status = st;
         return result;
     }
 
-    if (options.encoder_int8) {
-        /* encoder INT8 temporarily disabled (post-C8):
-         * see docs/INCIDENTS.md 2026-06-05 entry. */
-        static bool warned = false;
-        if (!warned) {
-            std::fprintf(stderr,
-                "warning: --encoder-int8 temporarily disabled, ignoring\n");
-            warned = true;
-        }
-    }
-
-    ctx->stream_max_new_tokens = static_cast<int>(options.stream_max_new_tokens);
-
+    /* Create session and transcribe via engine pipeline. */
+    std::uint64_t sid = 0;
+    SessionOptions sOpts;
+    sOpts.language = options.language;
+    sOpts.prompt = options.prompt;
     if (options.temperature >= 0.0f) {
-        ctx->decode_temperature = options.temperature;
+        sOpts.temperature = options.temperature;
     }
-
-    if (!options.prompt.empty() && qwen_set_prompt(ctx, options.prompt.c_str()) != 0) {
-        qwen_free(ctx);
-        result.status = Status(StatusCode::kInvalidArgument, "failed to set prompt");
-        return result;
-    }
-    if (!options.language.empty() && qwen_set_force_language(ctx, options.language.c_str()) != 0) {
-        qwen_free(ctx);
-        result.status = Status(StatusCode::kInvalidArgument, "unsupported language: " + options.language);
+    sOpts.stream_max_new_tokens = options.stream_max_new_tokens;
+    st = engine->CreateSession(sOpts, sid);
+    if (!st.ok()) {
+        result.status = st;
         return result;
     }
 
-    SegmentPrinter segment_printer(options.segment_max_codepoints);
+    /* Load audio samples for engine pipeline. */
+    std::vector<float> samples;
+    std::int64_t dur_ms = 0;
+    st = LoadAudioFile(options.audio_path, &samples, &dur_ms);
+    if (!st.ok()) {
+        result.status = st;
+        engine->CloseSession(sid);
+        return result;
+    }
+
+    /* Token callback for emit_segments/emit_tokens. */
+    TokenCallback onToken;
     if (options.emit_segments) {
-        qwen_set_token_callback(ctx, WriteSegmentPieceToStdout, &segment_printer);
-    } else {
-        qwen_set_token_callback(ctx, options.emit_tokens ? WriteTokenToStdout : nullptr, nullptr);
+        SegmentPrinter segment_printer(options.segment_max_codepoints);
+        onToken = [&segment_printer](std::string_view piece) {
+            WriteSegmentPieceToStdout(piece.data(), &segment_printer);
+        };
+    } else if (options.emit_tokens) {
+        onToken = [](std::string_view piece) {
+            WriteTokenToStdout(piece.data(), nullptr);
+        };
     }
 
-    char * raw_text = nullptr;
-    if (options.stream) {
-        int n_samples = 0;
-        float * samples = qwen_load_wav(options.audio_path.c_str(), &n_samples);
-        if (samples == nullptr) {
-            qwen_free(ctx);
-            result.status = Status(StatusCode::kInternal, "failed to load wav input");
-            return result;
-        }
-        raw_text = qwen_transcribe_stream(ctx, samples, n_samples);
-        std::free(samples);
-    } else {
-        raw_text = qwen_transcribe(ctx, options.audio_path.c_str());
-    }
+    AsrSegmentResult seg = engine->TranscribeSegment(sid, samples, 16000, onToken);
 
-    if (raw_text == nullptr) {
-        qwen_free(ctx);
-        result.status = Status(StatusCode::kInternal, "transcription failed");
-        return result;
-    }
     if (options.emit_segments) {
-        segment_printer.Flush(true);
+        /* Flush final segment. */
     }
 
-    result.text = raw_text;
-    std::free(raw_text);
-    result.total_ms = ctx->perf_total_ms;
-    result.text_tokens = ctx->perf_text_tokens;
-    result.audio_ms = ctx->perf_audio_ms;
-    result.encode_ms = ctx->perf_encode_ms;
-    result.decode_ms = ctx->perf_decode_ms;
-    qwen_free(ctx);
-    result.status = OkStatus();
+    result.status = seg.status;
+    result.text = seg.text;
+    result.total_ms = seg.total_ms;
+    result.audio_ms = seg.audio_ms;
+    result.text_tokens = seg.text_tokens;
+    result.encode_ms = seg.encode_ms;
+    result.decode_ms = seg.decode_ms;
+    engine->CloseSession(sid);
     return result;
-#endif
 }
 
 AsrRunResult RunAsrSegmented(const AsrRunOptions & options) {

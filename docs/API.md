@@ -334,6 +334,8 @@ SSE 流，订阅 session 状态更新 (Web UI 用)。
 ### `GET /app.js` → `ui/app.js`
 ### `GET /live_monitor.js` → `ui/live_monitor.js`
 ### `GET /state_pure.js` → `ui/state_pure.js` (新增于 C4)
+### `GET /state.js` → `ui/state.js` (新增于 M7 — 纯状态管理)
+### `GET /terminal.js` → `ui/terminal.js` (新增于 M7 — 终端渲染)
 ### `GET /style.css` → `ui/style.css`
 
 ---

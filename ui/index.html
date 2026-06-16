@@ -3,69 +3,161 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>QASR Test UI</title>
+  <title>QASR — 实时转写</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <main class="shell">
+    <!-- ═══════════ Header ═══════════ -->
     <section class="hero">
-      <p class="eyebrow">Qwen3-ASR CPU Test Console</p>
-      <h1>离线上传与实时转写</h1>
-      <p class="lede">本页只作联调。离线 WAV 优先在浏览器端分块转成 16k mono PCM 推送，实时走浏览器麦克风分块推送。</p>
+      <p class="eyebrow">Qwen3-ASR</p>
+      <h1>实时语音转写</h1>
+      <p class="lede">离线上传或浏览器麦克风实时推送。支持多会话、VAD 分段、SSE 流式输出。</p>
       <div class="status-row">
         <span id="healthBadge" class="badge">检查中</span>
         <span id="runtimeHint" class="hint">服务未就绪</span>
       </div>
     </section>
 
-    <section class="grid">
-      <article class="panel">
-        <header class="panel-head">
-          <p class="panel-kicker">Offline</p>
-          <h2>音频上传</h2>
-        </header>
-        <form id="uploadForm" class="stack">
-          <label class="field">
-            <span>音频文件</span>
-            <input id="audioFile" type="file" accept="audio/*,.wav,.mp3,.m4a,.flac,.ogg,.opus,.aac,.wma">
-          </label>
-          <div class="button-row">
-            <button id="offlineSubmit" class="action" type="submit">开始转写</button>
-            <button id="offlineStop" class="ghost" type="button" disabled>停止</button>
-          </div>
-        </form>
-        <p id="offlineStatus" class="hint"></p>
-        <pre id="offlineResult" class="output">尚无结果</pre>
-      </article>
+    <!-- ═══════════ 1. Live Caption + Transcript ═══════════ -->
+    <section class="panel transcript-panel">
+      <header class="panel-head">
+        <p class="panel-kicker">Realtime</p>
+        <h2>实时转写</h2>
+      </header>
 
-      <article class="panel realtime">
-        <header class="panel-head">
-          <p class="panel-kicker">Realtime</p>
-          <h2>实时转写</h2>
-        </header>
-        <div class="stack">
-          <div class="button-row">
-            <button id="startRealtime" class="action" type="button">启动</button>
-            <button id="stopRealtime" class="ghost" type="button" disabled>停止</button>
-            <button id="clearRealtime" class="ghost" type="button" style="display:none">清空</button>
-          </div>
-          <div class="button-row export-row">
-            <button id="exportRealtimeText" class="ghost" type="button" disabled>导出 TXT</button>
-            <button id="exportRealtimeJson" class="ghost" type="button" disabled>导出 JSON</button>
-          </div>
-          <p id="realtimeStatus" class="hint" style="font-size:14px;font-weight:bold;color:#333;background:#fffbe6;padding:6px 10px;border:1px solid #f0c000;border-radius:4px;">未开始 — 点击「启动」开始实时转写</p>
-          <div id="audioMeter" style="display:none;margin:6px 0;padding:6px 10px;background:#f5f5f5;border:1px solid #ccc;border-radius:4px;font-family:monospace;font-size:13px;">
-            <span style="color:#888">mic 48k:</span> <span id="meterPre" style="color:#c00;font-weight:bold;">0.000</span>
-            <span style="color:#888;margin-left:12px">→ 16k:</span> <span id="meterPost" style="color:#c00;font-weight:bold;">0.000</span>
-            <span style="color:#888;margin-left:12px">→ server peak:</span> <span id="meterSrv" style="color:#c00;font-weight:bold;">-</span>
-          </div>
-          <div id="realtimeResult" class="output terminal"><div class="term-line cursor"><span class="cursor-blink">▌</span></div></div>
+      <!-- Control buttons -->
+      <div class="button-row">
+        <button id="startRealtime" class="action" type="button">启动</button>
+        <button id="stopRealtime" class="ghost" type="button" disabled>停止</button>
+        <button id="clearRealtime" class="ghost" type="button" style="display:none">清空</button>
+      </div>
+      <div class="button-row export-row">
+        <button id="exportRealtimeText" class="ghost" type="button" disabled>导出 TXT</button>
+        <button id="exportRealtimeJson" class="ghost" type="button" disabled>导出 JSON</button>
+        <button id="exportSrt" class="ghost" type="button" disabled>导出 SRT</button>
+      </div>
+
+      <!-- Audio meter -->
+      <p id="realtimeStatus" class="hint status-bar">未开始 — 点击「启动」开始实时转写</p>
+      <div id="audioMeter" style="display:none" class="meter-bar">
+        <span class="meter-item">mic 48k: <strong id="meterPre">0.000</strong></span>
+        <span class="meter-item">→ 16k: <strong id="meterPost">0.000</strong></span>
+        <span class="meter-item">→ server: <strong id="meterSrv">-</strong></span>
+      </div>
+
+      <!-- Live Caption area: shows latest 1-3 committed lines -->
+      <div class="live-caption" id="liveCaption">
+        <p class="live-hint">🎤 实时字幕 — 最新 1-3 条</p>
+        <div id="captionLines"></div>
+      </div>
+
+      <!-- Transcript Panel: full timeline with timestamps -->
+      <div class="transcript-container" id="transcriptContainer">
+        <div class="transcript-header">
+          <span class="col-time">时间</span>
+          <span class="col-text">原文</span>
+          <span class="col-status">状态</span>
         </div>
-      </article>
+        <div class="transcript-body" id="transcriptBody">
+          <!-- Rows injected by JS.  Template:
+          <div class="transcript-row" data-seg="0">
+            <span class="col-time">00:01.2</span>
+            <span class="col-text">我们下一步需要确认理赔规则</span>
+            <span class="col-status status-done">已确认</span>
+          </div>
+          -->
+        </div>
+      </div>
+
+      <!-- Terminal (legacy, kept for backward compat) -->
+      <div id="realtimeResult" class="output terminal">
+        <div class="term-line cursor"><span class="cursor-blink">▌</span></div>
+      </div>
     </section>
+
+    <!-- ═══════════ 4. Domain Prompt / Glossary ═══════════ -->
+    <section class="panel domain-panel">
+      <header class="panel-head">
+        <p class="panel-kicker">Prompt</p>
+        <h2>领域与术语</h2>
+      </header>
+
+      <!-- Domain selector -->
+      <div class="stack">
+        <label class="field">
+          <span>专业领域</span>
+          <select id="domainSelect">
+            <option value="general">通用</option>
+            <option value="insurance">保险</option>
+            <option value="legal">法律</option>
+            <option value="it">IT / 技术</option>
+            <option value="medical">医疗</option>
+            <option value="finance">金融</option>
+            <option value="custom">自定义</option>
+          </select>
+        </label>
+
+        <!-- Translation style (stub — no backend yet) -->
+        <label class="field">
+          <span>翻译风格 <span class="badge stub">未接入</span></span>
+          <select id="styleSelect" disabled>
+            <option value="subtitle">字幕简洁</option>
+            <option value="literal">准确直译</option>
+            <option value="business">商务会议</option>
+            <option value="tech">技术文档</option>
+            <option value="minutes">会议纪要</option>
+          </select>
+        </label>
+
+        <!-- Glossary table -->
+        <fieldset class="glossary-field">
+          <legend>术语表 <span class="badge stub">未接入</span></legend>
+          <div class="glossary-header">
+            <span>源词</span>
+            <span>目标词</span>
+            <span>语言</span>
+          </div>
+          <div id="glossaryBody" class="glossary-body">
+            <!-- Rows injected by JS -->
+          </div>
+          <button id="addGlossaryBtn" class="ghost small" disabled>+ 添加术语</button>
+        </fieldset>
+
+        <!-- Custom prompt -->
+        <label class="field">
+          <span>自定义提示</span>
+          <textarea id="customPrompt" rows="3" placeholder="本场讨论为财险理赔规则评审，claim 不译为声明，译为理赔。"></textarea>
+        </label>
+      </div>
+    </section>
+
+    <!-- ═══════════ 3. Offline Upload ═══════════ -->
+    <section class="panel offline-panel">
+      <header class="panel-head">
+        <p class="panel-kicker">Offline</p>
+        <h2>音频上传</h2>
+      </header>
+      <form id="uploadForm" class="stack">
+        <label class="field">
+          <span>音频文件 (WAV / MP3 / M4A / FLAC / OGG)</span>
+          <input id="audioFile" type="file" accept="audio/*,.wav,.mp3,.m4a,.flac,.ogg,.opus,.aac,.wma">
+        </label>
+        <div class="button-row">
+          <button id="offlineSubmit" class="action" type="submit">开始转写</button>
+          <button id="offlineStop" class="ghost" type="button" disabled>停止</button>
+        </div>
+      </form>
+      <p id="offlineStatus" class="hint"></p>
+      <pre id="offlineResult" class="output">尚无结果</pre>
+    </section>
+
   </main>
+
   <script src="/live_monitor.js"></script>
   <script src="/state_pure.js"></script>
+  <script src="/state.js"></script>
+  <script src="/terminal.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

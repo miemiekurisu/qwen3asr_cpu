@@ -739,6 +739,7 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
             }
             call_gate_up_ms += qwen_perf_now_ms() - gate_up_start;
         }
+
         qwen_swiglu_multiply(gate, gate_up, seq_len, intermediate);
         {
             const double down_t0 = qwen_perf_now_ms();
