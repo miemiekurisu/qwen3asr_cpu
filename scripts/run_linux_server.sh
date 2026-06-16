@@ -3,12 +3,12 @@
 # run_linux_server.sh — One-key Linux launcher for qwen3asr_cpu (server + optional HTTPS proxy).
 #
 # 用法:
-#   tools/run_linux_server.sh                       # 前台 qasr_server (HTTP)
-#   tools/run_linux_server.sh --detach              # 后台 qasr_server (HTTP)
-#   tools/run_linux_server.sh --detach --https      # 后台 qasr_server + HTTPS proxy (推荐)
-#   tools/run_linux_server.sh --stop                # 停 --detach 起的 server 和 proxy
-#   tools/run_linux_server.sh --status              # 查 HTTP + HTTPS health
-#   tools/run_linux_server.sh --https-info          # 显示 cert / proxy 状态
+#   scripts/run_linux_server.sh                       # 前台 qasr_server (HTTP)
+#   scripts/run_linux_server.sh --detach              # 后台 qasr_server (HTTP)
+#   scripts/run_linux_server.sh --detach --https      # 后台 qasr_server + HTTPS proxy (推荐)
+#   scripts/run_linux_server.sh --stop                # 停 --detach 起的 server 和 proxy
+#   scripts/run_linux_server.sh --status              # 查 HTTP + HTTPS health
+#   scripts/run_linux_server.sh --https-info          # 显示 cert / proxy 状态
 #
 # 必填环境变量:
 #   QASR_MODEL_DIR         Qwen3-ASR-0.6B 目录 (含 model.safetensors)
@@ -28,7 +28,7 @@
 #   QASR_HTTPS_PORT    HTTPS 代理端口 (默认 19992, 仅 --https 时生效)
 #
 # HTTPS:
-#   --https  同时启动 tools/https_proxy.py 反代, 自动 mktemp -d 生成自签 cert
+#   --https  同时启动 scripts/https_proxy.py 反代, 自动 mktemp -d 生成自签 cert
 #            (每次启动 cert 都不一样, 退出时自动删, 仓库卫生 + 临时安全)
 #   浏览器访问 https://<host>:<https-port>/, 首次警告选"高级→继续"即可
 #   想跨重启复用 cert: 设 QASR_TLS_CERT_DIR (例: /etc/qasr/tls), 配合 --https
@@ -213,7 +213,7 @@ check_required() {
 
     if [[ ! -x "$BUILD_DIR/qasr_server" ]]; then
         log_err "找不到 $BUILD_DIR/qasr_server"
-        log_err "  请先跑: tools/build_linux.sh"
+        log_err "  请先跑: scripts/build_linux.sh"
         exit 1
     fi
     log_ok "binary:  $BUILD_DIR/qasr_server"
@@ -272,7 +272,7 @@ do_stop() {
     # 兜底
     pkill -9 -f "build/linux-openblas/qasr_server" 2>/dev/null || true
     pkill -9 -f "build/silero-test/qasr_server"   2>/dev/null || true
-    pkill -9 -f "tools/https_proxy.py"            2>/dev/null || true
+    pkill -9 -f "scripts/https_proxy.py"            2>/dev/null || true
 }
 
 # ─────────────── 状态 ───────────────
@@ -343,7 +343,7 @@ check_port_free() {
             log_err "$label 端口 $port 已被占用: $occupant"
             log_err "  解决: 杀旧进程:    kill \$(cat $PID_FILE 2>/dev/null) 2>/dev/null"
             log_err "        或跑本脚本 --stop"
-            log_err "        或换端口:    QASR_PORT=19993 tools/run_linux_server.sh --detach --https"
+            log_err "        或换端口:    QASR_PORT=19993 scripts/run_linux_server.sh --detach --https"
             return 1
         fi
     elif command -v lsof >/dev/null 2>&1; then

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# tools/compare_blas.sh — build qasr_blas_bench for each BLAS backend, run it
+# scripts/compare_blas.sh — build qasr_blas_bench for each BLAS backend, run it
 # against the project's long audio, and print a side-by-side comparison.
 #
-# Usage: tools/compare_blas.sh <model-snapshot-dir> [audio.wav] [threads]
+# Usage: scripts/compare_blas.sh <model-snapshot-dir> [audio.wav] [threads]
 #   model-snapshot-dir  e.g. ~/.cache/huggingface/.../snapshots/<sha>
 #   audio.wav           defaults to testfile/aishell_S0002_limai_108s.wav
 #   threads             defaults to 8

@@ -13,15 +13,15 @@
 #   7. (可选) --compare-blas 跑 OpenBLAS/BLIS/MKL 三家实测对比
 #
 # 用法:
-#   tools/build_linux.sh [选项]
+#   scripts/build_linux.sh [选项]
 #
 # 常用:
-#   tools/build_linux.sh                         # 默认 clean + configure + build + test
-#   tools/build_linux.sh --incremental           # 增量编译 (不删 build/)
-#   tools/build_linux.sh --clean-only            # 只清, 不编
-#   tools/build_linux.sh --asan                  # 用 linux-openblas-asan preset
-#   tools/build_linux.sh --no-test               # 跳过 ctest
-#   tools/build_linux.sh --model-dir /path/Qwen3-ASR-0.6B
+#   scripts/build_linux.sh                         # 默认 clean + configure + build + test
+#   scripts/build_linux.sh --incremental           # 增量编译 (不删 build/)
+#   scripts/build_linux.sh --clean-only            # 只清, 不编
+#   scripts/build_linux.sh --asan                  # 用 linux-openblas-asan preset
+#   scripts/build_linux.sh --no-test               # 跳过 ctest
+#   scripts/build_linux.sh --model-dir /path/Qwen3-ASR-0.6B
 #
 # 环境变量 (覆盖默认值):
 #   QASR_DEPS_DIR       OpenBLAS 源码安装位置 (默认 /opt/qasr-deps)
@@ -127,7 +127,7 @@ Flags:
   --no-model           跳过模型探测
   --no-audio           跳过测试音频探测
   --bench              编译后跑 qasr_cpu_bench --threads 8 --warmup 5 --scale 3
-  --compare-blas       编译后跑 tools/compare_blas.sh (需装好 OpenBLAS+BLIS+MKL)
+  --compare-blas       编译后跑 scripts/compare_blas.sh (需装好 OpenBLAS+BLIS+MKL)
   -y, --yes            非交互 (apt-get 装包自动 -y)
   --no-apt             不调用 apt-get (即使缺包)
 
@@ -252,7 +252,7 @@ check_os() {
             ;;
         *)
             log_err "OS '$ID' 不是 Debian/Ubuntu 系。本脚本只支持 Debian-family."
-            log_err "其它发行版请参考:tools/build_windows_openblas.ps1 / cmake/QasrBlas.cmake"
+            log_err "其它发行版请参考:scripts/deprecated/build_windows_openblas.ps1 / cmake/QasrBlas.cmake"
             exit 1
             ;;
     esac
@@ -645,7 +645,7 @@ check_audio() {
     fi
     log_warn "testfile/ 下无 .wav/.mp3/.flac (--no-audio 时忽略)"
     log_info "拉样音:"
-    log_info "  $PYTHON_BIN tools/aishell_fetch.py --speaker S0002 --clips 18"
+    log_info "  $PYTHON_BIN scripts/deprecated/aishell_fetch.py --speaker S0002 --clips 18"
     log_info "  (需要 pip install huggingface_hub, 网络可达 huggingface.co)"
 }
 
@@ -751,10 +751,10 @@ do_compare_blas() {
         return
     fi
     log_step "BLAS 对比 (OpenBLAS / BLIS / MKL)  ──  详见 docs/BLAS_COMPARISON.md"
-    if [[ -x "$PROJECT_ROOT/tools/compare_blas.sh" ]]; then
-        "$PROJECT_ROOT/tools/compare_blas.sh" "$DETECTED_MODEL_DIR"
+    if [[ -x "$PROJECT_ROOT/scripts/compare_blas.sh" ]]; then
+        "$PROJECT_ROOT/scripts/compare_blas.sh" "$DETECTED_MODEL_DIR"
     else
-        log_warn "找不到 tools/compare_blas.sh, 跳过"
+        log_warn "找不到 scripts/compare_blas.sh, 跳过"
     fi
 }
 

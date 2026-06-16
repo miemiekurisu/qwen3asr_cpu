@@ -6,13 +6,13 @@ HTTPS reverse proxy for qasr_server (HTTP backend).
 qasr_server 本身是明文 HTTP, 所以在前面套一层自签 TLS 反代.
 
 用法:
-    python3 tools/https_proxy.py                           # 0.0.0.0:19992 -> 127.0.0.1:19991, 每次启动生成新 cert
-    python3 tools/https_proxy.py --bind-port 443           # 改监听
-    python3 tools/https_proxy.py --upstream-port 19991     # 改后端
-    python3 tools/https_proxy.py --reuse-cert              # 复用 --cert-dir 下的 cert (默认每次新建)
-    python3 tools/https_proxy.py --cert-dir /path/dir      # 指定 cert 目录 (默认 mktemp -d, 退出时删)
-    python3 tools/https_proxy.py --cert a.pem --key b.pem  # 完全指定路径 (与 --reuse-cert 一起用)
-    python3 tools/https_proxy.py --generate-cert           # 单独生成 cert, 不启动代理
+    python3 scripts/https_proxy.py                           # 0.0.0.0:19992 -> 127.0.0.1:19991, 每次启动生成新 cert
+    python3 scripts/https_proxy.py --bind-port 443           # 改监听
+    python3 scripts/https_proxy.py --upstream-port 19991     # 改后端
+    python3 scripts/https_proxy.py --reuse-cert              # 复用 --cert-dir 下的 cert (默认每次新建)
+    python3 scripts/https_proxy.py --cert-dir /path/dir      # 指定 cert 目录 (默认 mktemp -d, 退出时删)
+    python3 scripts/https_proxy.py --cert a.pem --key b.pem  # 完全指定路径 (与 --reuse-cert 一起用)
+    python3 scripts/https_proxy.py --generate-cert           # 单独生成 cert, 不启动代理
 
 依赖:
     Python 3.7+ 标准库 (http.server, ssl, urllib). 无第三方依赖.

@@ -8,7 +8,7 @@ Qwen3-ASR 的 CPU + GPU 推理服务与命令行工具，使用 C/C++17 实现�
 
 **当前版本: v1.0.0** — [Release Notes](https://github.com/miemiekurisu/qwen3asr_cpu/releases/tag/v1.0.0)
 
-> ⚠️ **本文档由 AI 根据代码编写,可能存在疏漏**。请以实际代码为准: 命令行参数以 `qasr_cli --help` / `qasr_server --help` / `qasr_cpu_bench --help` 输出为权威; HTTP API 以 `src/service/server.cc` 的路由注册为权威; 环境变量以 `src/backend/qwen_cpu/qwen_asr_perf.c` / `tools/run_linux_server.sh` 的解析为权威。
+> ⚠️ **本文档由 AI 根据代码编写,可能存在疏漏**。请以实际代码为准: 命令行参数以 `qasr_cli --help` / `qasr_server --help` / `qasr_cpu_bench --help` 输出为权威; HTTP API 以 `src/service/server.cc` 的路由注册为权威; 环境变量以 `src/backend/qwen_cpu/qwen_asr_perf.c` / `scripts/run_linux_server.sh` 的解析为权威。
 
 ## 快速开始
 
@@ -40,7 +40,7 @@ $env:PATH = "<path-to-openblas>\bin;$env:PATH"   :: 例如 D:\dev\OpenBLAS\bin
 
 #### 启动 server (一键)
 
-编译完可以用 `tools/run_server.ps1` 一键起后台 server（HTTP + 可选 HTTPS + 状态查询），避免手动管 PID / log / 反代：
+编译完可以用 `scripts/deprecated/run_server.ps1` 一键起后台 server（HTTP + 可选 HTTPS + 状态查询），避免手动管 PID / log / 反代：
 
 ```powershell
 $env:QASR_MODEL_DIR = "D:\path\to\Qwen3-ASR-0___6B"
@@ -55,26 +55,26 @@ HTTPS 反代自动生成自签 cert；想跨重启复用 cert 设 `$env:QASR_TLS
 
 ### Linux
 
-一键入口是 `tools/build_linux.sh`，**仅支持 Debian 系**（Debian/Ubuntu/Kali/Linux Mint/Pop!_OS/elementary/Raspbian/Zorin/MX/deepin/Parrot）。脚本会按顺序：
+一键入口是 `scripts/build_linux.sh`，**仅支持 Debian 系**（Debian/Ubuntu/Kali/Linux Mint/Pop!_OS/elementary/Raspbian/Zorin/MX/deepin/Parrot）。脚本会按顺序：
 
 1. 校验系统与编译工具链（g++ ≥ 10 / cmake ≥ 3.21 / ninja / pkg-config / ffmpeg / git / curl），缺失会提示安装命令并退出。
 2. 检查 OpenBLAS：先看 `${QASR_DEPS_DIR:-/opt/qasr-deps}` 与系统 pkg-config；没有则尝试 `apt-get install -y libopenblas-dev`；再没有则从 GitHub 拉 `${QASR_OPENBLAS_TAG:-v0.3.30}` 源码编译到 `${QASR_DEPS_DIR}`；都失败会打印手动步骤并退出。
 3. 检查 ONNX Runtime（Silero VAD 依赖，preset `linux-openblas` 默认启用）：先看 `$QASR_ONNXRUNTIME_ROOT` / `${QASR_DEPS_DIR}/onnxruntime`；没有则复用相邻 `paddle_on_cpu/third_party/onnxruntime-linux-x64-*/`；再没有则从 GitHub releases 下 `v${QASR_ONNXRUNTIME_VERSION:-1.20.1}` 的预编译 `.tgz` 解到 `${QASR_DEPS_DIR}/onnxruntime`。找不到时 **不会**中断构建——Silero VAD 退化为 stub 模式（VAD 段式仍工作但不会自动 commit, 只在 40s 强制 cap 或 `eof` 时 commit）。
 4. 探测 `Qwen3-ASR-0.6B` 模型（`$QASR_MODEL_DIR` → `--model-dir` → `~/.cache/huggingface/.../snapshots/*/model.safetensors` → `./models/<repo>`），缺失会提示三种下载方式。
-5. 探测 `testfile/*.wav`（缺失提示 `tools/aishell_fetch.py`）。
+5. 探测 `testfile/*.wav`（缺失提示 `scripts/deprecated/aishell_fetch.py`）。
 6. 默认 `clean` 删除 `build/`，然后 `cmake -S/-B/-G Ninja` + `cmake --build` + `ctest`。
 
 ```bash
-tools/build_linux.sh                       # 默认 clean + build + test
-tools/build_linux.sh --incremental         # 增量编译（不删 build/）
-tools/build_linux.sh --clean-only          # 只清不编
-tools/build_linux.sh --asan                # 用 linux-openblas-asan preset
-tools/build_linux.sh --no-test -j 4        # 跳过 ctest, 4 并发
-tools/build_linux.sh --model-dir /data/Qwen3-ASR-0.6B
-tools/build_linux.sh --no-dep --no-apt     # 离线：禁止自动装包/下载
+scripts/build_linux.sh                       # 默认 clean + build + test
+scripts/build_linux.sh --incremental         # 增量编译（不删 build/）
+scripts/build_linux.sh --clean-only          # 只清不编
+scripts/build_linux.sh --asan                # 用 linux-openblas-asan preset
+scripts/build_linux.sh --no-test -j 4        # 跳过 ctest, 4 并发
+scripts/build_linux.sh --model-dir /data/Qwen3-ASR-0.6B
+scripts/build_linux.sh --no-dep --no-apt     # 离线：禁止自动装包/下载
 ```
 
-常用环境变量：见 [`docs/CLI.md`](docs/CLI.md) §"tools/build_linux.sh" 节。`tools/build_linux.sh --help` 同步列出。
+常用环境变量：见 [`docs/CLI.md`](docs/CLI.md) §"scripts/build_linux.sh" 节。`scripts/build_linux.sh --help` 同步列出。
 
 手动等价流程（脚本不可用时）：
 
@@ -87,18 +87,18 @@ ctest --test-dir build/linux-openblas --output-on-failure
 
 #### 启动 server (一键)
 
-编译完可以用 `tools/run_linux_server.sh` 一键起后台 server（HTTP + 可选 HTTPS + 状态查询），避免手动管 PID / log / 反代：
+编译完可以用 `scripts/run_linux_server.sh` 一键起后台 server（HTTP + 可选 HTTPS + 状态查询），避免手动管 PID / log / 反代：
 
 ```bash
 export QASR_MODEL_DIR=$HOME/.cache/huggingface/models--Qwen--Qwen3-ASR-0.6B/snapshots/<rev>
 
-tools/run_linux_server.sh --detach                  # 后台 HTTP (API/curl 用)
-tools/run_linux_server.sh --detach --https          # 后台 HTTP + HTTPS (浏览器用, 推荐, 浏览器需要 https 才能拿 mic 权限)
-tools/run_linux_server.sh --status                  # /api/health 检查
-tools/run_linux_server.sh --stop                    # 停 --detach 起的 server / proxy
+scripts/run_linux_server.sh --detach                  # 后台 HTTP (API/curl 用)
+scripts/run_linux_server.sh --detach --https          # 后台 HTTP + HTTPS (浏览器用, 推荐, 浏览器需要 https 才能拿 mic 权限)
+scripts/run_linux_server.sh --status                  # /api/health 检查
+scripts/run_linux_server.sh --stop                    # 停 --detach 起的 server / proxy
 ```
 
-HTTPS 反代每次启动 `mktemp -d` 生成自签 cert（退出时自动清，仓库卫生 + 临时安全）；想跨重启复用 cert 设 `QASR_TLS_CERT_DIR=/path/to/cert` 即可。完整环境变量 + flags 见 [`docs/CLI.md`](docs/CLI.md) §"tools/run_linux_server.sh" 节。
+HTTPS 反代每次启动 `mktemp -d` 生成自签 cert（退出时自动清，仓库卫生 + 临时安全）；想跨重启复用 cert 设 `QASR_TLS_CERT_DIR=/path/to/cert` 即可。完整环境变量 + flags 见 [`docs/CLI.md`](docs/CLI.md) §"scripts/run_linux_server.sh" 节。
 
 ### macOS
 
@@ -263,7 +263,7 @@ qasr_server --help
 
 ## 参数参考
 
-完整参数同步在 `qasr_cli --help` / `qasr_server --help` / `tools/build_linux.sh --help` 输出里。
+完整参数同步在 `qasr_cli --help` / `qasr_server --help` / `scripts/build_linux.sh --help` 输出里。
 本节是 single source of truth（与上述 help 输出保持同步，CI 不会自动校验但 review 时强制要求）。
 
 ### `qasr_cli` — 离线 CLI 转写
@@ -358,23 +358,23 @@ qasr_server --help
 | `--quiet`, `-q` | — | 等价 `--verbosity 0` |
 | `-h`, `--help` | — | 打印 usage |
 
-### `tools/run_linux_server.sh`
+### `scripts/run_linux_server.sh`
 
 封装 `qasr_server` 的生命周期 (前台 / 后台 / HTTPS / 状态查询 / 停止)。完整脚本逻辑在脚本内。
 
 **Flags**: `--detach` (后台 + PID 文件) / `--https` (起 Python HTTPS 反代, 浏览器拿 mic 权限需要) / `--https-info` (打印当前 cert 路径+指纹) / `--status` (调 `/api/health` 探活) / `--stop` (停 `--detach` 起来的 server/proxy) / `--verbose` (覆盖 `QASR_VERBOSITY=3`)。
 
-### `tools/qasr_supervisor.sh`
+### `scripts/qasr_supervisor.sh`
 
 进程守护：server 死了自动拉起, 直到显式 kill。用于 systemd-less 环境 / 容器内。
 
 **Flags**: `--no-loop` (单次启动, 死了不拉, 调试用)。
 
-### `tools/build_linux.sh`
+### `scripts/build_linux.sh`
 
 一站式编译：探测依赖 (OpenBLAS / ONNX Runtime / HF 模型) → cmake → build → ctest。详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §"Build" 节。
 
-**行为 Flags**: `--clean` (✓) / `--incremental` `--no-clean` / `--clean-only` / `--asan` (用 `linux-openblas-asan` preset) / `--no-test` / `--no-dep` / `--no-model` / `--no-audio` / `--bench` (跑 `qasr_cpu_bench`) / `--compare-blas` (跑 `tools/compare_blas.sh`) / `--no-apt` / `-h` `--help`。
+**行为 Flags**: `--clean` (✓) / `--incremental` `--no-clean` / `--clean-only` / `--asan` (用 `linux-openblas-asan` preset) / `--no-test` / `--no-dep` / `--no-model` / `--no-audio` / `--bench` (跑 `qasr_cpu_bench`) / `--compare-blas` (跑 `scripts/compare_blas.sh`) / `--no-apt` / `-h` `--help`。
 
 **路径 Flags**: `--blas NAME` (openblas / blis / mkl / auto / ref) / `--model-dir DIR` / `--deps-dir DIR` (默认 `/opt/qasr-deps`) / `--build-dir DIR` (默认 `build/linux-openblas`) / `--openblas-tag TAG` (默认 `v0.3.30`)。
 
@@ -475,8 +475,8 @@ docker run --rm -p 8080:8080 \
 | `QASR_PYTHON` | build | auto | python3 路径 |
 | `QASR_JOBS` | build | `nproc` | 编译并发 |
 | `QASR_APT_MIRROR` | build | 系统默认 | apt 源 (留空用系统默认) |
-| `QASR_APT_RETRIES` | docker | `3` | (仅 `tools/docker_linux_openblas.sh`) `apt-get install` 重试次数 |
-| `QASR_APT_TIMEOUT` | docker | `20` | (仅 `tools/docker_linux_openblas.sh`) `apt-get install` 单次超时 (秒) |
+| `QASR_APT_RETRIES` | docker | `3` | (仅 `scripts/deprecated/docker_linux_openblas.sh`) `apt-get install` 重试次数 |
+| `QASR_APT_TIMEOUT` | docker | `20` | (仅 `scripts/deprecated/docker_linux_openblas.sh`) `apt-get install` 单次超时 (秒) |
 | `QASR_HF_CACHE` | build | `~/.cache/huggingface` | HF 缓存根 |
 | `QASR_HF_REPO` | build | `Qwen/Qwen3-ASR-0.6B` | 模型仓库 (探测失败时下载) |
 | `QASR_ONNXRUNTIME_ROOT` | build | auto | ONNX runtime 安装路径 (手装时指定) |
@@ -552,7 +552,7 @@ src/audio/              WAV parsing, resampling, ffmpeg conversion helpers
 src/subtitle/           SRT/VTT/JSON subtitle writers
 tests/                  Unit and regression tests (735 cases)
 ui/                     Browser UI
-tools/                  Build, benchmark, Docker helper scripts
+scripts/              Build, benchmark, Docker, and utility scripts
 docs/                   Design notes and internal references
 build_cuda.sh           One-click CUDA build & test script (DGX Spark)
 ```
@@ -591,12 +591,12 @@ Stop 按钮解禁可重试。
 
 #### Per-feature 模型 (`--realtime-model-dir`)
 
-`tools/run_linux_server.sh` / `tools/run_server.ps1` 启动时, batch 和 realtime 可独立指定模型:
+`scripts/run_linux_server.sh` / `scripts/deprecated/run_server.ps1` 启动时, batch 和 realtime 可独立指定模型:
 
 ```bash
 export QASR_MODEL_DIR=.../Qwen3-ASR-1.7B/...   # batch (高质量)
 export QASR_REALTIME_MODEL_DIR=.../Qwen3-ASR-0.6B/...  # realtime (低延迟)
-tools/run_linux_server.sh --detach --https
+scripts/run_linux_server.sh --detach --https
 ```
 
 同路径时共享 `SharedAsrModel` 实例 (省 1.2 GB); 不同路径各自 `qwen_load` (总计 4.6 GB)。日志会打印 "2 个独立实例" 或 "0 额外内存"。
@@ -651,5 +651,5 @@ node tests/ui_state_machine_test.js
 node tests/ui_async_test.js
 
 # Bash 烟雾测试 (18 cases — server 启停 + build + 健康检查)
-bash tools/smoke_test.sh
+bash scripts/smoke_test.sh
 ```
