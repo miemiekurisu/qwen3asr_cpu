@@ -16,8 +16,8 @@ set -euo pipefail
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
-BUILD_DIR="${SCRIPT_DIR}/build-dgx"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+BUILD_DIR="${PROJECT_ROOT}/build-dgx"
 BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; RED='\033[0;31m'; NC='\033[0m'
 
 DO_LONG=false; DO_CLEAN=false; NO_BUILD=false; DO_SERVE=false

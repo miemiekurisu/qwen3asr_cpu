@@ -3,12 +3,13 @@
 # run_linux_server.sh — One-key Linux launcher for qwen3asr_cpu (server + optional HTTPS proxy).
 #
 # 用法:
-#   tools/run_linux_server.sh                       # 前台 qasr_server (HTTP)
-#   tools/run_linux_server.sh --detach              # 后台 qasr_server (HTTP)
-#   tools/run_linux_server.sh --detach --https      # 后台 qasr_server + HTTPS proxy (推荐)
-#   tools/run_linux_server.sh --stop                # 停 --detach 起的 server 和 proxy
-#   tools/run_linux_server.sh --status              # 查 HTTP + HTTPS health
-#   tools/run_linux_server.sh --https-info          # 显示 cert / proxy 状态
+#   scripts/run_linux_server.sh                       # 前台 qasr_server (HTTP)
+#   scripts/run_linux_server.sh --detach              # 后台 qasr_server (HTTP)
+#   scripts/run_linux_server.sh --detach --https      # 后台 qasr_server + HTTPS proxy (推荐)
+#   scripts/run_linux_server.sh --detach --backend cuda  # CUDA 后端
+#   scripts/run_linux_server.sh --stop                # 停 --detach 起的 server 和 proxy
+#   scripts/run_linux_server.sh --status              # 查 HTTP + HTTPS health
+#   scripts/run_linux_server.sh --https-info          # 显示 cert / proxy 状态
 #
 # 必填环境变量:
 #   QASR_MODEL_DIR         Qwen3-ASR-0.6B 目录 (含 model.safetensors)
@@ -28,15 +29,15 @@
 #   QASR_HTTPS_PORT    HTTPS 代理端口 (默认 19992, 仅 --https 时生效)
 #
 # HTTPS:
-#   --https  同时启动 tools/https_proxy.py 反代, 自动 mktemp -d 生成自签 cert
+#   --https  同时启动 scripts/https_proxy.py 反代, 自动 mktemp -d 生成自签 cert
 #            (每次启动 cert 都不一样, 退出时自动删, 仓库卫生 + 临时安全)
 #   浏览器访问 https://<host>:<https-port>/, 首次警告选"高级→继续"即可
 #   想跨重启复用 cert: 设 QASR_TLS_CERT_DIR (例: /etc/qasr/tls), 配合 --https
 #
 # 路径:
 #   QASR_PROJECT_ROOT  项目根 (默认自动探测 = 脚本 ../)
-#   QASR_BUILD_DIR     编译输出 (默认 $PROJECT_ROOT/build/linux-openblas,
-#                        对应 build_linux.sh 装到 build/linux-openblas/)
+#   QASR_BUILD_DIR     编译输出 (默认自动探测: build-dgx > build/linux-openblas)
+#   QASR_BUILD_DIR     编译输出 (默认自动探测: build-dgx > build/linux-openblas)
 #   QASR_LOG_FILE      server 日志 (默认 /tmp/qasr_server.log, --detach 才用)
 #   QASR_PID_FILE      server PID 文件 (默认 /tmp/qasr_server.pid)
 #   QASR_PROXY_LOG     proxy  日志 (默认 /tmp/qasr_proxy.log, --https 才用)
@@ -76,7 +77,16 @@ UI_DIR="${QASR_UI_DIR:-$PROJECT_ROOT/ui}"
 THREADS="${QASR_THREADS:-0}"
 VERBOSITY="${QASR_VERBOSITY:-0}"
 VAD_MODEL="${QASR_VAD_MODEL:-$PROJECT_ROOT/models/silero_vad/silero_vad.onnx}"
-BUILD_DIR="${QASR_BUILD_DIR:-$PROJECT_ROOT/build/linux-openblas}"
+# Auto-detect: prefer build-dgx (CUDA) over build/linux-openblas (CPU)
+if [[ -n "${QASR_BUILD_DIR:-}" ]]; then
+    BUILD_DIR="$QASR_BUILD_DIR"
+elif [[ -x "$PROJECT_ROOT/build-dgx/qasr_server" ]]; then
+    BUILD_DIR="$PROJECT_ROOT/build-dgx"
+elif [[ -x "$PROJECT_ROOT/build/linux-openblas/qasr_server" ]]; then
+    BUILD_DIR="$PROJECT_ROOT/build/linux-openblas"
+else
+    BUILD_DIR="$PROJECT_ROOT/build/linux-openblas"
+fi
 LOG_FILE="${QASR_LOG_FILE:-/tmp/qasr_server.log}"
 PID_FILE="${QASR_PID_FILE:-/tmp/qasr_server.pid}"
 PROXY_SCRIPT="${QASR_PROXY_SCRIPT:-$SCRIPT_DIR/https_proxy.py}"
@@ -86,6 +96,7 @@ HTTPS_PORT="${QASR_HTTPS_PORT:-19992}"
 TLS_CERT_DIR="${QASR_TLS_CERT_DIR:-}"
 MODEL_DIR="${QASR_MODEL_DIR:-}"
 REALTIME_MODEL_DIR="${QASR_REALTIME_MODEL_DIR:-}"
+SERVER_BACKEND="${QASR_BACKEND:-}"
 DETACHED=0
 DO_STOP=0
 DO_STATUS=0
@@ -105,6 +116,7 @@ Flags:
   --status            查 /api/health (HTTP + HTTPS, 若后者在跑)
   --https-info        显示 cert 目录 / proxy 状态
   --verbose           覆盖 \$QASR_VERBOSITY=3 (开发用, 一行一 poll)
+  --backend cpu|cuda  推理后端 (默认: 无, 使用 CPU)
   -h, --help          打印本帮助
 
 Env vars (必填):
@@ -157,6 +169,7 @@ while [[ $# -gt 0 ]]; do
         --status)         DO_STATUS=1; shift ;;
         --https-info)     DO_HTTPS_INFO=1; shift ;;
         --verbose)        VERBOSITY=3; shift ;;
+        --backend)        shift; SERVER_BACKEND="${1:-cuda}"; shift ;;
         -h|--help)        usage; exit 0 ;;
         *)                log_err "未知选项: $1"; usage >&2; exit 2 ;;
     esac
@@ -261,8 +274,9 @@ do_stop() {
     stop_pid_file "server" "$PID_FILE"
     # 兜底
     pkill -9 -f "build/linux-openblas/qasr_server" 2>/dev/null || true
+    pkill -9 -f "build-dgx/qasr_server"          2>/dev/null || true
     pkill -9 -f "build/silero-test/qasr_server"   2>/dev/null || true
-    pkill -9 -f "tools/https_proxy.py"            2>/dev/null || true
+    pkill -9 -f "scripts/https_proxy.py"          2>/dev/null || true
 }
 
 # ─────────────── 状态 ───────────────
@@ -377,6 +391,7 @@ do_start() {
         --verbosity "$VERBOSITY"
     )
     [[ -n "$REALTIME_MODEL_DIR" ]] && args+=(--realtime-model-dir "$REALTIME_MODEL_DIR")
+    [[ -n "$SERVER_BACKEND" ]] && args+=(--backend "$SERVER_BACKEND")
 
     if [[ $DETACHED -eq 1 ]]; then
         log_step "后台启动 server (日志 $LOG_FILE, PID $PID_FILE)"
