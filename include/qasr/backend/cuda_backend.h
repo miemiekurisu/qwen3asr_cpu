@@ -175,7 +175,7 @@ public:
     float dec_rms_norm_eps = 1e-6f;
 };
 
-class CudaSessionState {
+class CudaSessionState : public BackendSessionState {
 public:
     CudaSessionState() = default;
     ~CudaSessionState();

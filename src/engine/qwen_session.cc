@@ -1,5 +1,4 @@
 #include "qasr/engine/qwen_session.h"
-#include <cstring>
 #include <algorithm>
 
 namespace qasr {
@@ -17,29 +16,13 @@ int AudioRingBuffer::Drain(std::vector<float> & out, int max_samples) {
     return n;
 }
 
-QwenSession::QwenSession()
-    : session_id(0), model(nullptr), backend_workspace(nullptr) {}
-
 Status QwenSession::Initialize(const V2EngineConfig & config, std::shared_ptr<QwenModel> mdl) {
+    session_id = 0;
     model = std::move(mdl);
     if (config.backend == BackendKind::kCuda) {
         backend = std::make_unique<CudaBackend>();
     } else {
         backend = std::make_unique<CpuBackend>();
-    }
-    return OkStatus();
-}
-
-Status QwenSession::AllocateWorkspace(size_t bytes) {
-    if (bytes == 0) return OkStatus();
-    if (backend_workspace) {
-        std::free(backend_workspace);
-        backend_workspace = nullptr;
-    }
-    backend_workspace = std::calloc(bytes, 1);
-    if (!backend_workspace) {
-        return Status(StatusCode::kResourceExhausted,
-                      "session workspace allocation failed: " + std::to_string(bytes) + " bytes");
     }
     return OkStatus();
 }

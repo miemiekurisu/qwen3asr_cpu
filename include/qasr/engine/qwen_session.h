@@ -59,8 +59,7 @@ public:
     AudioRingBuffer audio_buffer;
     SegmentState segment_state;
 
-    std::unique_ptr<CpuSessionState> cpu_session;
-    void * backend_workspace = nullptr;
+    std::unique_ptr<BackendSessionState> backend_state;
 
     std::string prompt;
     std::string language;
@@ -72,10 +71,9 @@ public:
 
     std::mutex mu_;
 
-    QwenSession();
+    QwenSession() = default;
+    ~QwenSession() = default;
     Status Initialize(const V2EngineConfig & config, std::shared_ptr<QwenModel> model);
-    Status AllocateWorkspace(size_t bytes);
-    void * workspace() const { return backend_workspace; }
 };
 
 }  // namespace qasr

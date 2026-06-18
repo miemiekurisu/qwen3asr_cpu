@@ -3,7 +3,7 @@
  *
  * Tests:
  *   - QwenSession initialization
- *   - workspace allocation
+ *   - backend_state allocation (CPU path)
  *   - AudioRingBuffer push/drain
  *   - VadState defaults
  *   - ReorderBuffer operations
@@ -29,29 +29,32 @@ QASR_TEST(SessionDefaultConstruction) {
     QASR_EXPECT(!session.realtime);
 }
 
-QASR_TEST(SessionAllocateWorkspaceZeroBytes) {
+QASR_TEST(SessionBackendStateDefaultNull) {
     qasr::QwenSession session;
-    auto status = session.AllocateWorkspace(0);
-    QASR_EXPECT(status.ok());
-    QASR_EXPECT(!session.workspace());
+    QASR_EXPECT(!session.backend_state);
 }
 
-QASR_TEST(SessionAllocateWorkspaceValid) {
+QASR_TEST(SessionBackendStateCpuAllocation) {
     qasr::QwenSession session;
-    auto status = session.AllocateWorkspace(1024);
-    QASR_EXPECT(status.ok());
-    QASR_EXPECT(session.workspace() != nullptr);
+    session.backend_state = std::make_unique<qasr::CpuSessionState>();
+    auto * cpu = static_cast<qasr::CpuSessionState *>(session.backend_state.get());
+    cpu->workspace.resize(1024);
+    QASR_EXPECT(session.backend_state != nullptr);
+    QASR_EXPECT_EQ(cpu->workspace.size(), 1024u);
 }
 
-QASR_TEST(SessionAllocateWorkspaceReallocates) {
+QASR_TEST(SessionBackendStateReallocation) {
     qasr::QwenSession session;
-    auto status1 = session.AllocateWorkspace(256);
-    QASR_EXPECT(status1.ok());
-    void * ptr1 = session.workspace();
+    session.backend_state = std::make_unique<qasr::CpuSessionState>();
+    auto * cpu1 = static_cast<qasr::CpuSessionState *>(session.backend_state.get());
+    cpu1->workspace.resize(256);
 
-    auto status2 = session.AllocateWorkspace(512);
-    QASR_EXPECT(status2.ok());
-    QASR_EXPECT(session.workspace() != nullptr);
+    /* Re-assign: old state is freed by unique_ptr */
+    session.backend_state = std::make_unique<qasr::CpuSessionState>();
+    auto * cpu2 = static_cast<qasr::CpuSessionState *>(session.backend_state.get());
+    cpu2->workspace.resize(512);
+    QASR_EXPECT(session.backend_state != nullptr);
+    QASR_EXPECT_EQ(cpu2->workspace.size(), 512u);
 }
 
 QASR_TEST(AudioRingBufferDefaultEmpty) {

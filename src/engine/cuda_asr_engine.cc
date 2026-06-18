@@ -327,16 +327,16 @@ AsrSegmentResult CudaAsrEngine::TranscribeSegment(std::uint64_t session_id,
     auto * cuda_backend = cuda_backend_.get();
 
     /* Allocate session state if needed */
-    if (!session->backend_workspace) {
-        auto sess_state = std::make_unique<CudaSessionState>();
-        auto alloc_status = cuda_backend->AllocateSession(sess_state.get(), 4096);
+    if (!session->backend_state) {
+        session->backend_state = std::make_unique<CudaSessionState>();
+        auto alloc_status = cuda_backend->AllocateSession(
+            static_cast<CudaSessionState *>(session->backend_state.get()), 4096);
         if (!alloc_status.ok()) {
             result.status = alloc_status;
             return result;
         }
-        session->backend_workspace = sess_state.release();
     }
-    auto * sess_state = static_cast<CudaSessionState *>(session->backend_workspace);
+    auto * sess_state = static_cast<CudaSessionState *>(session->backend_state.get());
 
     /* Step 1: Silence compaction (CPU) */
     int compacted_count = 0;

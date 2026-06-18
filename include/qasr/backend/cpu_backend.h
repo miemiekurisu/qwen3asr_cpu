@@ -15,7 +15,7 @@ public:
     void * ctx = nullptr;
 };
 
-class CpuSessionState {
+class CpuSessionState : public BackendSessionState {
 public:
     void * ctx_clone = nullptr;
     std::vector<float> workspace;

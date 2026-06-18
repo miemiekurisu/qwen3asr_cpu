@@ -87,6 +87,15 @@ public:
                            float * out_val = nullptr) = 0;
 };
 
+/* Session-level state owned by QwenSession per backend kind.
+ * Replaces the old void* backend_workspace which mixed calloc and
+ * CudaSessionState* — causing leaks, allocator mismatch UB, and
+ * inability to clean up on QwenSession destruction. */
+class BackendSessionState {
+public:
+    virtual ~BackendSessionState() = default;
+};
+
 /* Factory: create a CPU backend instance. */
 std::unique_ptr<DeviceBackend> CreateCpuBackend();
 
