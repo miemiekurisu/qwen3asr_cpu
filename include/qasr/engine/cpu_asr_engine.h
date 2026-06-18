@@ -72,6 +72,11 @@ private:
     struct CpuSessionEntry {
         SessionOptions opts;
         bool active = true;
+        // Per-session cloned qwen_ctx_t: shares immutable weights with the base
+        // context but has independent KV cache, perf counters, and mutable
+        // settings (language, prompt, temperature). This eliminates the data
+        // race when multiple sessions run TranscribeSegment concurrently.
+        void * ctx_clone = nullptr;
     };
 
     V2EngineConfig config_;

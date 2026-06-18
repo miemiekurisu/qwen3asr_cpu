@@ -24,10 +24,19 @@ Status CpuAsrEngine::CreateSession(const SessionOptions & opts, std::uint64_t & 
         return Status(StatusCode::kResourceExhausted,
                       "max sessions reached: " + std::to_string(config_.max_sessions));
     }
+    auto * base = reinterpret_cast<qwen_ctx_t *>(backend_->base_ctx());
+    if (!base) {
+        return Status(StatusCode::kFailedPrecondition, "model not loaded");
+    }
+    auto * clone = qwen_clone_shared(base);
+    if (!clone) {
+        return Status(StatusCode::kResourceExhausted, "qwen_clone_shared failed");
+    }
     out_id = next_session_id_++;
     CpuSessionEntry entry;
     entry.opts = opts;
     entry.active = true;
+    entry.ctx_clone = clone;
     sessions_[out_id] = std::move(entry);
     return OkStatus();
 }
@@ -36,6 +45,7 @@ Status CpuAsrEngine::CloseSession(std::uint64_t session_id) {
     std::lock_guard<std::mutex> lock(mu_);
     auto it = sessions_.find(session_id);
     if (it != sessions_.end()) {
+        qwen_free(static_cast<qwen_ctx_t *>(it->second.ctx_clone));
         it->second.active = false;
         sessions_.erase(it);
     }
@@ -64,9 +74,9 @@ AsrSegmentResult CpuAsrEngine::TranscribeSegment(std::uint64_t session_id,
         session = &it->second;
     }
 
-    auto * base = reinterpret_cast<qwen_ctx_t *>(backend_->base_ctx());
+    auto * base = static_cast<qwen_ctx_t *>(session->ctx_clone);
     if (!base) {
-        result.status = Status(StatusCode::kFailedPrecondition, "model not loaded");
+        result.status = Status(StatusCode::kFailedPrecondition, "session ctx not available");
         return result;
     }
 
