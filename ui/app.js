@@ -72,7 +72,11 @@
   }
 
   function escapeHtml(str) {
-    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/'/g, '&#39;').replace(/"/g, '&quot;');
+  }
+
+  function safeFixed(value, decimals) {
+    return (typeof value === 'number' && !isNaN(value)) ? value.toFixed(decimals) : '-';
   }
 
   // ───── 3. Transcript Panel ─────
@@ -117,7 +121,7 @@
       html += '<div class="glossary-row">';
       html += '<span>' + escapeHtml(e.source) + '</span>';
       html += '<span>' + escapeHtml(e.target) + '</span>';
-      html += '<span>' + (e.lang || '-') + '</span>';
+      html += '<span>' + escapeHtml(e.lang || '-') + '</span>';
       html += '</div>';
     }
     glossaryBody.innerHTML = html;
@@ -190,25 +194,29 @@
   }
 
   // ───── Terminal (using QasrTerminal) ─────
-
   function renderTranscript(element, data, fallback) {
+    if (!element) return;
     if (data === null || data === undefined) {
       resetTerminal(element, fallback);
       return;
     }
     var frame = element._transcriptFrame || {};
+
     frame.pendingData = data;
     frame.pendingFallback = fallback;
     element._transcriptFrame = frame;
     if (frame.renderScheduled) return;
     frame.renderScheduled = true;
     requestAnimationFrame(function () {
-      frame.renderScheduled = false;
-      applyTranscriptRender(element, frame.pendingData, frame.pendingFallback);
+      try {
+        frame.renderScheduled = false;
+        applyTranscriptRender(element, frame.pendingData, frame.pendingFallback);
+      } catch (_e) { /* rAF 回调内异常不杀死后续 rAF */ }
     });
   }
 
   function applyTranscriptRender(element, data, fallback) {
+    if (!element || !element._transcriptFrame) return;
     var segments = [];
     if (Array.isArray(data.segments)) {
       for (var i = 0; i < data.segments.length; i++) {
@@ -261,6 +269,8 @@
   }
 
   function resetTerminal(element, fallback) {
+    if (!element) return;
+    element._transcriptFrame = null;
     if (terminalArchive.typewriterTimer !== null) {
       clearInterval(terminalArchive.typewriterTimer);
       terminalArchive.typewriterTimer = null;
@@ -278,6 +288,7 @@
   }
 
   function softResetArchive(newSessionId) {
+    if (!realtimeResult) return;
     if (terminalArchive.typewriterTimer !== null) {
       clearInterval(terminalArchive.typewriterTimer);
       terminalArchive.typewriterTimer = null;
@@ -311,6 +322,7 @@
   }
 
   function resetArchive(fallback) {
+    if (!realtimeResult) return;
     terminalArchive.lines = [];
     terminalArchive.typewriterTimer = null;
     archiveState.lastSegmentCount = 0;
@@ -445,9 +457,9 @@
       // completed
       offlineState.stopError = '';
       offlineResult.textContent = job.text || '';
-      var audioDur = (job.audio_ms / 1000).toFixed(1);
+      var audioDur = safeFixed(job.audio_ms / 1000, 1);
       var infMs = (job.inference_ms || 0).toFixed(0);
-      var rtf = job.audio_ms > 0 ? (job.inference_ms / job.audio_ms).toFixed(2) : '-';
+      var rtf = (typeof job.audio_ms === 'number' && job.audio_ms > 0) ? safeFixed(job.inference_ms / job.audio_ms, 2) : '-';
       offlineStatus.textContent = '音频 ' + audioDur + 's / 推理 ' + infMs + 'ms / RTF ' + rtf + ' / ' + (job.tokens || 0) + ' tokens';
       return;
     }
@@ -474,23 +486,28 @@
     }
 
     realtimeState.sending = true;
+    var sessionIdAtSend = realtimeState.sessionId;
     try {
-      var response = await fetch('/api/realtime/chunk?session_id=' + encodeURIComponent(realtimeState.sessionId), {
+      var response = await fetch('/api/realtime/chunk?session_id=' + encodeURIComponent(sessionIdAtSend), {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: buffer.buffer,
       });
       var data = await response.json();
       if (!response.ok) throw new Error(data.error ? data.error.message : 'HTTP ' + response.status);
+      if (realtimeState.sessionId !== sessionIdAtSend) return;
       renderTranscript(realtimeResult, data, '尚无结果');
       syncArchive(data);
       if (typeof data.max_ingress_peak === 'number') realtimeState.maxSrvPeak = data.max_ingress_peak;
       else if (typeof data.max_peak === 'number') realtimeState.maxSrvPeak = data.max_peak;
-      var audioDur = (data.sample_count / 16000).toFixed(1);
-      var decodedDur = (data.decoded_samples / 16000).toFixed(1);
-      var wallElapsed = ((performance.now() - realtimeState.startedAt) / 1000).toFixed(1);
-      var lag = (wallElapsed - decodedDur).toFixed(1);
-      var infMs = (data.inference_ms !== undefined) ? data.inference_ms.toFixed(0) : '-';
+      var audioDur = safeFixed(data.sample_count / 16000, 1);
+      var decodedDur = safeFixed(data.decoded_samples / 16000, 1);
+      var wallElapsed = safeFixed((performance.now() - realtimeState.startedAt) / 1000, 1);
+      var lag = safeFixed(
+        typeof data.decoded_samples === 'number' ? (performance.now() - realtimeState.startedAt) / 1000 - data.decoded_samples / 16000 : undefined,
+        1
+      );
+      var infMs = (data.inference_ms !== undefined) ? safeFixed(data.inference_ms, 0) : '-';
       var decodeLabel = data.decoded ? '已解码' : '待下轮';
       realtimeStatus.textContent = '音频 ' + audioDur + 's / 已解码 ' + decodedDur + 's / 耗时 ' + wallElapsed + 's / 滞后 ' + lag + 's / 推理 ' + infMs + 'ms / ' + decodeLabel +
         ' | mic 峰 ' + (realtimeState.prePeak || 0).toFixed(3) + ' → 16k 峰 ' + (realtimeState.postPeak || 0).toFixed(3);
@@ -512,16 +529,20 @@
       else if (typeof data.max_peak === 'number') realtimeState.maxSrvPeak = data.max_peak;
       renderTranscript(realtimeResult, data, '尚无结果');
       syncArchive(data);
-      var audioDur = (data.sample_count / 16000).toFixed(1);
-      var decodedDur = (data.decoded_samples / 16000).toFixed(1);
-      var wallElapsed = ((performance.now() - realtimeState.startedAt) / 1000).toFixed(1);
-      var lag = (wallElapsed - decodedDur).toFixed(1);
-      var infMs = (data.inference_ms !== undefined) ? data.inference_ms.toFixed(0) : '-';
+      var audioDur = safeFixed(data.sample_count / 16000, 1);
+      var decodedDur = safeFixed(data.decoded_samples / 16000, 1);
+      var wallElapsed = safeFixed((performance.now() - realtimeState.startedAt) / 1000, 1);
+      var lag = safeFixed(
+        typeof data.decoded_samples === 'number' ? (performance.now() - realtimeState.startedAt) / 1000 - data.decoded_samples / 16000 : undefined,
+        1
+      );
+      var infMs = (data.inference_ms !== undefined) ? safeFixed(data.inference_ms, 0) : '-';
       var decodeLabel = data.decoded ? '已解码' : '待下轮';
       realtimeStatus.textContent = '音频 ' + audioDur + 's / 已解码 ' + decodedDur + 's / 耗时 ' + wallElapsed + 's / 滞后 ' + lag + 's / 推理 ' + infMs + 'ms / ' + decodeLabel +
         ' | mic 峰 ' + (realtimeState.prePeak || 0).toFixed(3) + ' → 16k 峰 ' + (realtimeState.postPeak || 0).toFixed(3);
     }
 
+    if (realtimeState.sse) { try { realtimeState.sse.close(); } catch {} realtimeState.sse = null; }
     var es;
     try { es = new EventSource('/api/realtime/stream?session_id=' + encodeURIComponent(sessionId)); }
     catch (err) { realtimeStatus.textContent = 'SSE 失败：' + err.message; return; }
@@ -636,6 +657,9 @@
       updateControlAvailability();
       realtimeStatus.textContent = '会话 ' + realtimeState.sessionId + ' 已启动';
     } catch (error) {
+      if (realtimeState.sendTimer) { window.clearInterval(realtimeState.sendTimer); realtimeState.sendTimer = null; }
+      if (realtimeState.meterTimer) { window.clearInterval(realtimeState.meterTimer); realtimeState.meterTimer = null; }
+      if (realtimeState.sse) { try { realtimeState.sse.close(); } catch {} realtimeState.sse = null; }
       mediaStream.getTracks().forEach(function (t) { t.stop(); });
       if (audioContext) await audioContext.close();
       if (sessionData && sessionData.session_id) {
@@ -771,10 +795,6 @@
       uiState.serverBackend = 'cpu';
     }
   }
-
-  // Pick up initial cursor line
-  var initial = realtimeResult.querySelector('.term-line.cursor');
-  if (initial) terminalArchive.lines.push({ state: 'cursor', el: initial, text: '' });
 
   loadServerInfo();
   updateControlAvailability();

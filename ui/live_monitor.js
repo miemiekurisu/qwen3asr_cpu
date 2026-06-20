@@ -10,6 +10,7 @@
   const ENDPOINT = "/api/debug/state";
   const LOG = [];
   const MAX_LOG = 50;
+  const OBSERVERS = [];
 
   function snap(id) {
     const el = document.getElementById(id);
@@ -17,7 +18,6 @@
     return {
       id: id,
       text: (el.textContent || "").slice(0, 300),
-      inner: (el.innerHTML || "").slice(0, 500),
     };
   }
   function snapAll() {
@@ -56,18 +56,20 @@
       while (LOG.length > MAX_LOG) LOG.shift();
     });
     ob.observe(el, { childList: true, subtree: true, characterData: true, attributes: true });
+    OBSERVERS.push(ob);
+  }
+  function disconnectObservers() {
+    for (var i = 0; i < OBSERVERS.length; i++) OBSERVERS[i].disconnect();
+    OBSERVERS.length = 0;
   }
   function install() {
     attach("realtimeResult");
     attach("realtimeConfirmed");
     attach("realtimeStatus");
-    /* Reduced from 200ms to 1000ms: 5/s → 1/s, saving ~4 req/s per
-     * page.  The monitor is for human inspection via curl, not
-     * control-loop, so 1Hz is plenty. */
     setInterval(post, 1000);
-    // also post on key DOM changes
     document.addEventListener("DOMContentLoaded", post);
     setTimeout(post, 50);
+    window.addEventListener("beforeunload", disconnectObservers);
   }
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", install);

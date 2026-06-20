@@ -443,6 +443,9 @@ if(QASR_ENABLE_TESTS)
         tests/aligner_client_test.cc
         tests/chunk_callback_test.cc
         tests/qwen_clone_shared_test.cc
+        tests/audit_bug_replay_scheduler_race_test.cc
+        tests/audit_bug_replay_integer_overflow_test.cc
+        tests/audit_bug_replay_c_alloc_test.cc
     )
 
     if(QASR_ENABLE_CPU_BACKEND)
