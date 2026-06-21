@@ -1617,6 +1617,15 @@ struct RealtimeSession {
      * segment is finalized).  This replaces the rolling-decoder
      * partial/revision model with a sentence-bounded one. */
     std::vector<std::string> segments_text;
+    /* Per-segment cumulative sample position (monotonic, 16kHz).
+     * segments_sample_positions[i] is the end position of segments_text[i].
+     * Populated in AsrWorkerLoop at commit time. */
+    std::vector<std::size_t> segments_sample_positions;
+    std::size_t segment_cumulative_samples = 0;
+    /* Uncommitted tail text from the last ASR segment (mid-text boundary
+     * case).  When the final segment's tail audio is lost (no next segment
+     * to re-decode), this text is force-finalized into segments_text. */
+    std::string tail_text;
 /* VAD candidate buffer — tentative text shown to SSE client. */
      std::vector<std::string> candidates;
      std::size_t sse_last_candidate_count = 0;
@@ -1683,6 +1692,9 @@ struct RealtimeSessionSnapshot {
     std::string stable_text;
     std::string partial_text;
     std::vector<std::string> segments_text;
+    std::vector<std::size_t> segments_sample_positions;
+    std::size_t segment_cumulative_samples = 0;
+    std::string tail_text;
     std::vector<std::string> candidates;
     double current_segment_audio_sec = 0.0;
     double last_inference_ms = 0.0;
@@ -2757,6 +2769,9 @@ RealtimeSessionSnapshot SnapshotRealtimeSession(const RealtimeSession & session)
     snapshot.stable_text = session.stable_text;
     snapshot.partial_text = session.partial_text;
     snapshot.segments_text = session.segments_text;
+    snapshot.segments_sample_positions = session.segments_sample_positions;
+    snapshot.segment_cumulative_samples = session.segment_cumulative_samples;
+    snapshot.tail_text = session.tail_text;
     snapshot.current_segment_audio_sec = session.current_segment_audio_sec;
     snapshot.last_inference_ms = session.last_inference_ms;
     snapshot.last_decode_ran = session.last_decode_ran;
@@ -2917,6 +2932,15 @@ Json BuildRealtimeJson(
         }
     }
     body["segments"] = std::move(segments_arr);
+    /* Per-segment cumulative sample positions for timeline display. */
+    Json segpos_arr = Json::array();
+    if constexpr (std::is_same<SessionLike, RealtimeSessionSnapshot>::value ||
+                  std::is_same<SessionLike, RealtimeSession>::value) {
+        for (const auto & p : session.segments_sample_positions) {
+            segpos_arr.push_back(p);
+        }
+    }
+    body["segmentSamples"] = std::move(segpos_arr);
     /* P1: VAD candidates — tentative, not yet confirmed by finalizer.
      * Sent separately from segments so the UI can distinguish tentative
      * from confirmed text. */
@@ -4456,8 +4480,11 @@ int RunServer(const ServerConfig & config) {
                 /* Soft-cap or stop: even if VAD never saw speech, emit
                  * whatever audio we have.  The ASR may still produce
                  * text (e.g. low-volume speech the VAD missed, or the
-                 * user just wants to see *something*). */
-                emit_samples = segment_buffer;
+                 * user just wants to see *something*).
+                 * Preserve any prepended tail_audio from previous segment
+                 * (appended above at line 4427-4443) — do NOT overwrite. */
+                emit_samples.insert(emit_samples.end(),
+                                    segment_buffer.begin(), segment_buffer.end());
             } else {
                 /* No VAD-said-speech at all — emit empty (will discard). */
                 emit_samples.clear();
@@ -5469,6 +5496,9 @@ int RunServer(const ServerConfig & config) {
                             confirmed_text.pop_back();
                         }
                         if (!confirmed_text.empty()) {
+                            session->segment_cumulative_samples += cut_samples;
+                            session->segments_sample_positions.push_back(
+                                session->segment_cumulative_samples);
                             session->segments_text.push_back(confirmed_text);
                             RT_LOG("AsrWorkerLoop sid=%s seq=%lu confirmed=%s (boundary=%zu cut=%d/%d)",
                                    session->id.c_str(),
@@ -5477,16 +5507,28 @@ int RunServer(const ServerConfig & config) {
                                    boundary, cut_samples, n_samples);
                         }
 
-                        /* Carry tail audio for next segment re-decode. */
-                        if (cut_samples < n_samples) {
-                            session->tail_audio.assign(
-                                seg.samples.begin() + cut_samples,
-                                seg.samples.end());
-                            RT_LOG("AsrWorkerLoop sid=%s tail_carry=%d samples (%.2fs)",
-                                   session->id.c_str(),
-                                   n_samples - cut_samples,
-                                   (n_samples - cut_samples) / 16000.0);
-                        }
+                       /* Carry tail audio for next segment re-decode. */
+                         if (cut_samples < n_samples) {
+                             session->tail_audio.assign(
+                                 seg.samples.begin() + cut_samples,
+                                 seg.samples.end());
+                             RT_LOG("AsrWorkerLoop sid=%s tail_carry=%d samples (%.2fs)",
+                                    session->id.c_str(),
+                                    n_samples - cut_samples,
+                                    (n_samples - cut_samples) / 16000.0);
+                         }
+                         /* Track uncommitted tail text so that if this is
+                          * the last segment (eof_stop), the tail doesn't get
+                          * silently dropped — force-finalize pushes it. */
+                         {
+                             session->tail_text = segment_text.substr(boundary);
+                             while (!session->tail_text.empty() &&
+                                    (session->tail_text.front() == ' ' ||
+                                     session->tail_text.front() == '\n' ||
+                                     session->tail_text.front() == '\t')) {
+                                 session->tail_text.erase(session->tail_text.begin());
+                             }
+                         }
                     } else {
                         /* No mid-text boundary.  Two sub-cases:
                          *
@@ -5501,17 +5543,19 @@ int RunServer(const ServerConfig & config) {
                          *      Text is uncertain; next segment needs full
                          *      acoustic context for re-decode. */
                         if (EndsWithBoundary(segment_text)) {
-                            session->candidates.push_back(segment_text);
-                            session->tail_audio.clear();
+                             session->segment_cumulative_samples += n_samples;
+                             session->candidates.push_back(segment_text);
+                             session->tail_audio.clear();
                             RT_LOG("AsrWorkerLoop sid=%s seq=%lu candidate+no-tail=%s "
                                    "(boundary at end)",
                                    session->id.c_str(),
                                    static_cast<unsigned long>(seg.seq),
                                    segment_text.c_str());
-                        } else {
-                            session->candidates.push_back(segment_text);
-                            session->tail_audio.assign(
-                                seg.samples.begin(), seg.samples.end());
+                      } else {
+                             session->segment_cumulative_samples += n_samples;
+                             session->candidates.push_back(segment_text);
+                             session->tail_audio.assign(
+                                 seg.samples.begin(), seg.samples.end());
                             RT_LOG("AsrWorkerLoop sid=%s seq=%lu candidate+full-tail=%s "
                                    "tail=%.2fs",
                                    session->id.c_str(),
@@ -5555,15 +5599,30 @@ int RunServer(const ServerConfig & config) {
                                             session->last_inference_ms,
                                             true, session.get());
               }
-             /* P1: force-finalize any candidates that didn't get finalized
-                 * by the two-pass finalizer.  Only push candidates whose index
-                 * hasn't been covered by a finalized segment. */
-              std::size_t n_finalized = session->segments_text.size();
-              for (std::size_t i = n_finalized; i < session->candidates.size(); ++i) {
-                  session->segments_text.push_back(session->candidates[i]);
-              }
+              /* P1: force-finalize any candidates that didn't get finalized
+                  * by the two-pass finalizer.  Only push candidates whose index
+                  * hasn't been covered by a finalized segment. */
+               std::size_t n_finalized = session->segments_text.size();
+               for (std::size_t i = n_finalized; i < session->candidates.size(); ++i) {
+                   session->segments_text.push_back(session->candidates[i]);
+                   session->segments_sample_positions.push_back(
+                       session->segment_cumulative_samples);
+               }
               session->candidates.clear();
-              session->tail_audio.clear();
+               /* Push uncommitted tail text from the last mid-text boundary
+                * case.  When this was the final segment (eof_stop), the tail
+                * audio had no next segment to re-decode, but the ASR already
+                * produced the full text — so push the tail portion now. */
+               if (!session->tail_text.empty()) {
+                   session->segments_text.push_back(session->tail_text);
+                   session->segments_sample_positions.push_back(
+                       session->segment_cumulative_samples);
+                   session->tail_text.clear();
+                   RT_LOG("AsrWorkerLoop sid=%s finalize_tail_text=%s",
+                          session->id.c_str(),
+                          session->segments_text.back().c_str());
+               }
+               session->tail_audio.clear();
               session->finalized = true;
               /* Final wake — SSE will see finalized=true and close
                * the stream with data: [DONE]. */
@@ -6959,8 +7018,14 @@ int RunServer(const ServerConfig & config) {
             /* ── P1: push new finalized segments (two-pass confirmed) ── */
             if (cur_segment_count > session->sse_last_segment_count) {
                 std::vector<std::string> new_finals;
+                std::vector<std::size_t> new_positions;
                 for (std::size_t i = session->sse_last_segment_count; i < cur_segment_count; ++i) {
                     new_finals.push_back(session->segments_text[i]);
+                    if (i < session->segments_sample_positions.size()) {
+                        new_positions.push_back(session->segments_sample_positions[i]);
+                    } else {
+                        new_positions.push_back(session->total_samples);
+                    }
                 }
                 session->sse_last_segment_count = cur_segment_count;
                 const double inf_ms = session->last_inference_ms;
@@ -6974,6 +7039,9 @@ int RunServer(const ServerConfig & config) {
                 Json final_json = Json::array();
                 for (const auto & s : new_finals) final_json.push_back(s);
                 evt["new_segments"] = final_json;
+                Json pos_json = Json::array();
+                for (const auto & p : new_positions) pos_json.push_back(p);
+                evt["new_segment_positions"] = pos_json;
                 evt["total_samples"] = total_samples;
                 evt["last_inference_ms"] = inf_ms;
                 if (qwen_verbose >= 1 && !new_finals.empty()) {
