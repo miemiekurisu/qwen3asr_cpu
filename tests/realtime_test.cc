@@ -147,18 +147,31 @@ QASR_TEST(AdvanceRealtimeDisplayStateBuildsLiveTail) {
     QASR_EXPECT_EQ(snapshot.live_text, std::string("hello world"));
 }
 
-QASR_TEST(AdvanceRealtimeDisplayStateFinalizesPunctuatedSegment) {
+QASR_TEST(AdvanceRealtimeDisplayStateTailHoldbackKeepsLastSentence) {
+    /* Tail Holdback: a sentence ending with terminal punctuation but no
+     * lookahead should NOT be pushed to recent_segments.  It stays in
+     * live_stable_text until more text confirms it's truly complete. */
     qasr::RealtimeDisplayState state;
     qasr::RealtimeDisplaySnapshot snapshot;
     qasr::RealtimeTextUpdate update;
 
+    /* Call 1: "hello world. " is the last sentence — no lookahead.
+     * Tail Holdback keeps it in live_stable. */
     update.stable_text = "hello world. ";
+    update.text = update.stable_text;
+    QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
+    QASR_EXPECT(snapshot.recent_segments.empty());
+    QASR_EXPECT_EQ(snapshot.live_stable_text, std::string("hello world. "));
+    QASR_EXPECT_EQ(snapshot.display_text, std::string("hello world. "));
+
+    /* Call 2: more text follows "hello world." → now it has lookahead,
+     * so it IS pushed to recent_segments. */
+    update.stable_text = "hello world. Next sentence. ";
     update.text = update.stable_text;
     QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
     QASR_EXPECT_EQ(snapshot.recent_segments.size(), std::size_t(1));
     QASR_EXPECT_EQ(snapshot.recent_segments[0], std::string("hello world."));
-    QASR_EXPECT_EQ(snapshot.live_stable_text, std::string());
-    QASR_EXPECT_EQ(snapshot.display_text, std::string("hello world."));
+    QASR_EXPECT_EQ(snapshot.live_stable_text, std::string("Next sentence. "));
 }
 
 QASR_TEST(AdvanceRealtimeDisplayStateSplitsCommittedSentenceBeforeLiveTail) {
@@ -188,31 +201,38 @@ QASR_TEST(AdvanceRealtimeDisplayStateSplitsStableChineseClauseOnComma) {
     QASR_EXPECT_EQ(snapshot.live_stable_text, std::string("后面立刻安排救护处理"));
 }
 
-QASR_TEST(AdvanceRealtimeDisplayStateKeepsOnlyRecentSegments) {
+QASR_TEST(AdvanceRealtimeDisplayStateTailHoldbackOnlyCommitsWithLookahead) {
+    /* With Tail Holdback, a sentence ending with punctuation but no
+     * following text stays in live_stable_text.  Only when later chunks
+     * provide lookahead does it drain into recent_segments. */
     qasr::RealtimeDisplayState state;
     qasr::RealtimeDisplaySnapshot snapshot;
     qasr::RealtimeTextUpdate update;
 
+    /* Call 1: "one. " is the last sentence — held back. */
     update.stable_text = "one. ";
     update.text = update.stable_text;
     QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
+    QASR_EXPECT(snapshot.recent_segments.empty());
+    QASR_EXPECT_EQ(snapshot.live_stable_text, std::string("one. "));
 
+    /* Call 2: now "two. " follows "one. " → "one." has lookahead. */
     update.stable_text = "one. two. ";
     update.text = update.stable_text;
     QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
+    QASR_EXPECT_EQ(snapshot.recent_segments.size(), std::size_t(1));
+    QASR_EXPECT_EQ(snapshot.recent_segments[0], std::string("one."));
+    QASR_EXPECT_EQ(snapshot.live_stable_text, std::string("two. "));
 
+    /* Call 3: now "three. " follows → "two." has lookahead. */
     update.stable_text = "one. two. three. ";
     update.text = update.stable_text;
     QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
-
-    /* kRecentSegmentLimit was raised to 1000 (Web Speech API style: archive
-     * retains the full session, not just the last few).  All three
-     * segments stay in recent_segments so the user can scroll back. */
-    QASR_EXPECT_EQ(snapshot.total_finalized_segments, std::size_t(3));
-    QASR_EXPECT_EQ(snapshot.recent_segments.size(), std::size_t(3));
+    QASR_EXPECT_EQ(snapshot.recent_segments.size(), std::size_t(2));
     QASR_EXPECT_EQ(snapshot.recent_segments[0], std::string("one."));
     QASR_EXPECT_EQ(snapshot.recent_segments[1], std::string("two."));
-    QASR_EXPECT_EQ(snapshot.recent_segments[2], std::string("three."));
+    QASR_EXPECT_EQ(snapshot.live_stable_text, std::string("three. "));
+    QASR_EXPECT_EQ(snapshot.total_finalized_segments, std::size_t(2));
 }
 
 QASR_TEST(AdvanceRealtimeDisplayStateRevisionReplacesLiveStable) {
@@ -508,4 +528,111 @@ QASR_TEST(AdvanceRealtimeTextStateConsensus2xNoDisplayShrink) {
     step(48000U, "你好");
     step(64000U, "你好世");
     step(80000U, "你好世界");
+}
+
+// ===========================================================================
+// Tail Holdback: boundary tests for problem cases
+// ===========================================================================
+//
+// The user's logs show incomplete utterances being prematurely committed
+// to recent_segments:
+//   "喂，大师先生，我已经。"
+//   "means that we can avoid civil war..."
+//   "相反。"
+//
+// These must NOT enter recent_segments without force_finalize.
+// They should remain in live_stable_text until more text follows.
+
+QASR_TEST(TailHoldbackChineseIncompleteStaysInLiveStable) {
+    qasr::RealtimeDisplayState state;
+    qasr::RealtimeDisplaySnapshot snapshot;
+    qasr::RealtimeTextUpdate update;
+
+    update.stable_text = "喂，大师先生，我已经。";
+    update.text = update.stable_text;
+    QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
+    QASR_EXPECT(snapshot.recent_segments.empty());
+    QASR_EXPECT_EQ(snapshot.live_stable_text, std::string("喂，大师先生，我已经。"));
+    QASR_EXPECT_EQ(snapshot.total_finalized_segments, std::size_t(0));
+}
+
+QASR_TEST(TailHoldbackEnglishIncompleteStaysInLiveStable) {
+    qasr::RealtimeDisplayState state;
+    qasr::RealtimeDisplaySnapshot snapshot;
+    qasr::RealtimeTextUpdate update;
+
+    update.stable_text = "means that we can avoid civil war...";
+    update.text = update.stable_text;
+    QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
+    QASR_EXPECT(snapshot.recent_segments.empty());
+    QASR_EXPECT_EQ(snapshot.live_stable_text, std::string("means that we can avoid civil war..."));
+    QASR_EXPECT_EQ(snapshot.total_finalized_segments, std::size_t(0));
+}
+
+QASR_TEST(TailHoldbackChineseShortClauseStaysInLiveStable) {
+    qasr::RealtimeDisplayState state;
+    qasr::RealtimeDisplaySnapshot snapshot;
+    qasr::RealtimeTextUpdate update;
+
+    update.stable_text = "相反。";
+    update.text = update.stable_text;
+    QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
+    QASR_EXPECT(snapshot.recent_segments.empty());
+    QASR_EXPECT_EQ(snapshot.live_stable_text, std::string("相反。"));
+    QASR_EXPECT_EQ(snapshot.total_finalized_segments, std::size_t(0));
+}
+
+QASR_TEST(TailHoldbackForceFinalizeStillPushes) {
+    /* Even with tail holdback, force_finalize=true must push
+     * the last sentence to recent_segments (e.g. on session stop). */
+    qasr::RealtimeDisplayState state;
+    qasr::RealtimeDisplaySnapshot snapshot;
+    qasr::RealtimeTextUpdate update;
+
+    update.stable_text = "喂，大师先生，我已经。";
+    update.text = update.stable_text;
+    QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, true, &state, &snapshot).ok());
+    QASR_EXPECT_EQ(snapshot.recent_segments.size(), std::size_t(1));
+    QASR_EXPECT_EQ(snapshot.recent_segments[0], std::string("喂，大师先生，我已经。"));
+    QASR_EXPECT(snapshot.live_stable_text.empty());
+    QASR_EXPECT_EQ(snapshot.total_finalized_segments, std::size_t(1));
+}
+
+QASR_TEST(TailHoldbackMultiSentenceOnlyLastHeldBack) {
+    /* When multiple sentences are present, all but the last
+     * (with no lookahead) should be pushed to recent_segments. */
+    qasr::RealtimeDisplayState state;
+    qasr::RealtimeDisplaySnapshot snapshot;
+    qasr::RealtimeTextUpdate update;
+
+    update.stable_text = "第一句。第二句。第三句。";
+    update.text = update.stable_text;
+    QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
+    QASR_EXPECT_EQ(snapshot.recent_segments.size(), std::size_t(2));
+    QASR_EXPECT_EQ(snapshot.recent_segments[0], std::string("第一句。"));
+    QASR_EXPECT_EQ(snapshot.recent_segments[1], std::string("第二句。"));
+    QASR_EXPECT_EQ(snapshot.live_stable_text, std::string("第三句。"));
+    QASR_EXPECT_EQ(snapshot.total_finalized_segments, std::size_t(2));
+}
+
+QASR_TEST(TailHoldbackMoreTextCommitsPreviousTail) {
+    /* When more text arrives after a held-back sentence, the
+     * previous sentence (now with lookahead) should drain. */
+    qasr::RealtimeDisplayState state;
+    qasr::RealtimeDisplaySnapshot snapshot;
+    qasr::RealtimeTextUpdate update;
+
+    update.stable_text = "已经。";
+    update.text = update.stable_text;
+    QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
+    QASR_EXPECT(snapshot.recent_segments.empty());
+    QASR_EXPECT_EQ(snapshot.live_stable_text, std::string("已经。"));
+
+    update.stable_text = "已经。继续的内容。";
+    update.text = update.stable_text;
+    QASR_EXPECT(qasr::AdvanceRealtimeDisplayState(update, false, &state, &snapshot).ok());
+    QASR_EXPECT_EQ(snapshot.recent_segments.size(), std::size_t(1));
+    QASR_EXPECT_EQ(snapshot.recent_segments[0], std::string("已经。"));
+    QASR_EXPECT_EQ(snapshot.live_stable_text, std::string("继续的内容。"));
+    QASR_EXPECT_EQ(snapshot.total_finalized_segments, std::size_t(1));
 }

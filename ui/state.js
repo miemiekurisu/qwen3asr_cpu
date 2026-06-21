@@ -46,8 +46,9 @@
       postPeak: 0,
       postRms: 0,
       maxSrvPeak: 0,
-      // SSE state
-      sseSegments: [],
+      // SSE state — two-pass finalizer
+      sseSegments: [],      // confirmed (transcript.final)
+      sseCandidates: [],    // tentative (transcript.candidate)
       sseLastFull: null,
     };
   }

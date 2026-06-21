@@ -46,33 +46,25 @@
         <span class="meter-item">→ server: <strong id="meterSrv">-</strong></span>
       </div>
 
-      <!-- Live Caption area: shows latest 1-3 committed lines -->
-      <div class="live-caption" id="liveCaption">
-        <p class="live-hint">🎤 实时字幕 — 最新 1-3 条</p>
-        <div id="captionLines"></div>
+      <!-- Live caption: current raw ASR output -->
+      <div id="liveCaption" class="live-caption">
+        <span class="caption-label">当前识别</span>
+        <span class="caption-text" id="captionText">等待音频…</span>
       </div>
 
-      <!-- Transcript Panel: full timeline with timestamps -->
+      <!-- Terminal: typewriter waterfall showing reorganized sentences -->
+      <div id="realtimeResult" class="output terminal">
+        <div class="term-line cursor"><span class="cursor-blink">▌</span></div>
+      </div>
+
+      <!-- Transcript Panel: full merged text (confirmed + candidates) -->
       <div class="transcript-container" id="transcriptContainer">
         <div class="transcript-header">
           <span class="col-time">时间</span>
-          <span class="col-text">原文</span>
+          <span class="col-text">全文</span>
           <span class="col-status">状态</span>
         </div>
-        <div class="transcript-body" id="transcriptBody">
-          <!-- Rows injected by JS.  Template:
-          <div class="transcript-row" data-seg="0">
-            <span class="col-time">00:01.2</span>
-            <span class="col-text">我们下一步需要确认理赔规则</span>
-            <span class="col-status status-done">已确认</span>
-          </div>
-          -->
-        </div>
-      </div>
-
-      <!-- Terminal (legacy, kept for backward compat) -->
-      <div id="realtimeResult" class="output terminal">
-        <div class="term-line cursor"><span class="cursor-blink">▌</span></div>
+        <div class="transcript-body" id="transcriptBody"></div>
       </div>
     </section>
 

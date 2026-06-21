@@ -19,6 +19,7 @@ struct TranslationJob {
     std::string source_lang;  /* zh, en, ja, de */
     std::string target_lang;  /* zh, en, ja, de */
     int priority = 0;
+    bool from_finalizer = false;  /* true when source_text comes from TranscriptFinal */
 };
 
 /* Translation result */

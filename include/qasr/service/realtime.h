@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -74,6 +75,51 @@ struct RealtimeDisplayState {
     std::string live_stable_text;
     std::string live_partial_text;
     std::size_t total_finalized_segments = 0;
+};
+
+/// A candidate transcript segment produced by the realtime text boundary
+/// machine.  In the one-pass path (P1) the candidate immediately becomes
+/// final.  In two-pass mode (P2+) it is queued for the CPU/CUDA finalizer.
+struct TranscriptCandidate {
+    std::uint64_t candidate_id = 0;
+    int64_t start_ms = 0;
+    int64_t end_ms = 0;
+    std::string live_text;
+    bool force = false;
+};
+
+/// A confirmed (finalized) transcript segment.  Produced either by the
+/// one-pass path (immediately after candidate) or by the two-pass
+/// finalizer after audio-level re-decode.
+struct TranscriptFinal {
+    std::uint64_t candidate_id = 0;
+    int64_t start_ms = 0;
+    int64_t end_ms = 0;
+    std::string live_text;
+    std::string final_text;
+    bool revised = false;
+};
+
+/// Finalisation mode for the realtime pipeline.
+enum class RealtimeFinalizeMode {
+    kOnePass,         // candidate → immediate final (P1 default)
+    kTailHoldback,    // pause on last sentence, still one-pass (Phase 0)
+    kTwoPassText,     // small-model text-level fix (P4)
+    kTwoPassCpu,      // CPU audio re-decode (P2)
+    kTwoPassCuda      // CUDA audio re-decode (P3)
+};
+
+/// Configuration for the two-pass finalizer pipeline.
+struct RealtimeFinalizeConfig {
+    RealtimeFinalizeMode mode = RealtimeFinalizeMode::kOnePass;
+    int tail_hold_ms = 1500;
+    int max_tail_ms = 2500;
+    int max_candidate_audio_ms = 12000;
+    int max_candidate_codepoints = 300;
+    int finalizer_timeout_ms = 3000;
+    bool translate_only_final = true;
+    int cpu_finalizer_pool_size = 1;
+    int cuda_finalizer_pool_size = 1;
 };
 
 struct RealtimeDisplaySnapshot {

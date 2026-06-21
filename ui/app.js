@@ -27,7 +27,6 @@
   var meterSrv = document.getElementById('meterSrv');
  // New elements
    var liveCaption = document.getElementById('liveCaption');
-  var captionLines = document.getElementById('captionLines');
   var transcriptBody = document.getElementById('transcriptBody');
   var domainSelect = document.getElementById('domainSelect');
   var styleSelect = document.getElementById('styleSelect');
@@ -48,29 +47,6 @@
     typewriterTimer: null,
   };
 
- // ───── Live Caption ─────
-
-  function renderLiveCaption(data) {
-    if (!captionLines) return;
-    var segments = [];
-    if (data && data.segments) {
-      for (var i = 0; i < data.segments.length; i++) {
-        if (typeof data.segments[i] === 'string' && data.segments[i]) {
-          segments.push(data.segments[i]);
-        }
-      }
-    }
-    // Show last 3
-    var start = Math.max(0, segments.length - 3);
-    var html = '';
-    for (var j = start; j < segments.length; j++) {
-      var status = (j === segments.length - 1 && !data.finalized) ? '翻译中' : '已确认';
-      html += '<span class="caption-line"><span class="source">' + escapeHtml(segments[j]) +
-              '</span><span class="status-tag">[' + status + ']</span></span>';
-    }
-    captionLines.innerHTML = html;
-  }
-
   function escapeHtml(str) {
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/'/g, '&#39;').replace(/"/g, '&quot;');
   }
@@ -80,6 +56,7 @@
   }
 
   // ───── 3. Transcript Panel ─────
+  var transcriptCache = '';
 
   function renderTranscriptPanel(data) {
     if (!transcriptBody) return;
@@ -91,27 +68,63 @@
         }
       }
     }
-    var html = '';
-    var sampleRate = 16000;
-    var cumulativeMs = 0;
-    for (var j = 0; j < segments.length; j++) {
-      var ts = QasrState.msToTimestamp(cumulativeMs);
-      var statusClass = (data.finalized) ? 'status-done' : 'status-typing';
-      var statusText = (data.finalized) ? '已确认' : '转写中';
-      html += '<div class="transcript-row" data-seg="' + j + '">';
-      html += '<span class="col-time">' + ts + '</span>';
-      html += '<span class="col-text">' + escapeHtml(segments[j]) + '</span>';
-      html += '<span class="col-status ' + statusClass + '">' + statusText + '</span>';
-      html += '</div>';
-      cumulativeMs += 3000; // Estimate 3s per segment
+    var candidates = [];
+    if (data && data.candidates) {
+      for (var i = 0; i < data.candidates.length; i++) {
+        if (typeof data.candidates[i] === 'string' && data.candidates[i]) {
+          candidates.push(data.candidates[i]);
+        }
+      }
     }
-    transcriptBody.innerHTML = html;
-    // Auto-scroll
-    var container = document.getElementById('transcriptContainer');
-    if (container) container.scrollTop = container.scrollHeight;
+    var bodyHtml = '';
+    var sampleRate = 16000;
+    var segmentSamples = [];
+    if (data && Array.isArray(data.segmentSamples)) {
+      segmentSamples = data.segmentSamples;
+    }
+    var isFinalSession = data && (data.finalized || data.event_type === 'transcript.final');
+    /* Each committed segment is a separate row with timestamp from
+     * real audio sample position (tracked per-segment at SSE receive time). */
+    for (var j = 0; j < segments.length; j++) {
+      var samplePos = segmentSamples[j] || 0;
+      var ts = QasrState.msToTimestamp(samplePos * 1000 / sampleRate);
+      bodyHtml += '<div class="transcript-row done">';
+      bodyHtml += '<span class="col-time">' + ts + '</span>';
+      bodyHtml += '<span class="col-text">' + escapeHtml(segments[j]) + '</span>';
+      bodyHtml += '<span class="col-status status-done">已确认</span>';
+      bodyHtml += '</div>';
+    }
+    if (candidates.length > 0) {
+      var candSamplePos = segmentSamples.length > 0 ? segmentSamples[segmentSamples.length - 1] : 0;
+      var candTs = QasrState.msToTimestamp(candSamplePos * 1000 / sampleRate);
+      bodyHtml += '<div class="transcript-row typing">';
+      bodyHtml += '<span class="col-time">' + candTs + '</span>';
+      bodyHtml += '<span class="col-text">' + escapeHtml(candidates.join('')) + '</span>';
+      bodyHtml += '<span class="col-status status-typing">识别中</span>';
+      bodyHtml += '</div>';
+    }
+    if (bodyHtml !== transcriptCache) {
+      transcriptCache = bodyHtml;
+      transcriptBody.innerHTML = bodyHtml;
+      var container = document.getElementById('transcriptContainer');
+      if (container) container.scrollTop = container.scrollHeight;
+    }
   }
 
-  // ───── 4. Glossary ─────
+  // ───── 4. Live Caption (top panel) ─────
+
+  var captionText = document.getElementById('captionText');
+
+  function renderLiveCaption(data) {
+    if (!captionText) return;
+    if (!data) { captionText.textContent = ''; return; }
+    var text = data.live_text || data.text || data.stable_text || '';
+    if (text) {
+      captionText.textContent = text;
+    }
+  }
+
+  // ───── 5. Glossary ─────
 
   function renderGlossary() {
     if (!glossaryBody) return;
@@ -130,6 +143,15 @@
   // ───── 5. Export ─────
 
   function extractConfirmedText() {
+    /* P1: Only export confirmed (finalized) segments, not tentative candidates.
+     * Use the SSE state's sseSegments which only contains confirmed text. */
+    if (realtimeState && Array.isArray(realtimeState.sseSegments)) {
+      var confirmed = realtimeState.sseSegments.filter(function(s) {
+        return typeof s === 'string' && s.trim();
+      });
+      if (confirmed.length > 0) return confirmed.join(' ');
+    }
+    /* Fallback: use terminalArchive for compatibility with legacy sessions. */
     return QasrStatePure.computeConfirmedRealtimeText(terminalArchive.lines);
   }
 
@@ -162,9 +184,18 @@
 
     if (format === 'srt') {
       var segs = [];
-      for (var i = 0; i < terminalArchive.lines.length; i++) {
-        if (terminalArchive.lines[i].state === 'done' && terminalArchive.lines[i].text) {
-          segs.push({ text: terminalArchive.lines[i].text, sample_count: 48000 });
+      /* P1: Only export confirmed segments. */
+      if (realtimeState && Array.isArray(realtimeState.sseSegments)) {
+        for (var i = 0; i < realtimeState.sseSegments.length; i++) {
+          if (typeof realtimeState.sseSegments[i] === 'string' && realtimeState.sseSegments[i]) {
+            segs.push({ text: realtimeState.sseSegments[i], sample_count: 48000 });
+          }
+        }
+      } else {
+        for (var i = 0; i < terminalArchive.lines.length; i++) {
+          if (terminalArchive.lines[i].state === 'done' && terminalArchive.lines[i].text) {
+            segs.push({ text: terminalArchive.lines[i].text, sample_count: 48000 });
+          }
         }
       }
       var srt = QasrState.buildSrtFromSegments(segs, 16000);
@@ -217,6 +248,8 @@
 
   function applyTranscriptRender(element, data, fallback) {
     if (!element || !element._transcriptFrame) return;
+    /* Combine confirmed segments (final) with tentative candidates.
+     * Confirmed segments are rendered as final; candidates animated. */
     var segments = [];
     if (Array.isArray(data.segments)) {
       for (var i = 0; i < data.segments.length; i++) {
@@ -225,32 +258,64 @@
         }
       }
     }
+    var candidates = [];
+    if (Array.isArray(data.candidates)) {
+      for (var i = 0; i < data.candidates.length; i++) {
+        if (typeof data.candidates[i] === 'string' && data.candidates[i]) {
+          candidates.push(data.candidates[i]);
+        }
+      }
+    }
+    var allSegments = segments.concat(candidates);
 
-    if (segments.length > archiveState.lastSegmentCount) {
-      var newCount = segments.length - archiveState.lastSegmentCount;
+    /* Retranscription (reconciled): replace the entire terminal
+     * display with the new high-quality result.  The old VAD
+     * segments and candidates are stale and discarded. */
+    if (data.reconciled) {
+      resetTerminal(element, fallback);
+      /* Reset lastSegmentCount so the < 1-segment render below
+       * treats the reconciled segments as new. */
+      archiveState.lastSegmentCount = 0;
+      /* Fall through: the segment rendering loop will render the
+       * reconciled text as finalized segments. */
+    }
+
+    if (allSegments.length > archiveState.lastSegmentCount) {
+      var newCount = allSegments.length - archiveState.lastSegmentCount;
+      var isFinal = data.finalized || data.event_type === 'transcript.final';
       if (newCount === 1) {
-        var newText = segments[segments.length - 1];
+        var newText = allSegments[allSegments.length - 1];
         if (newText) {
-          if (data.finalized) {
+          /* Determine if this segment is confirmed or tentative.
+           * Segments from data.segments are confirmed; candidates are tentative. */
+          var isConfirmed = (allSegments.length - 1) < segments.length;
+          if (isFinal || isConfirmed) {
             QasrTerminal.renderFinalizedSegment(element, newText, terminalArchive);
           } else {
             QasrTerminal.animateSegment(element, newText, terminalArchive);
           }
         }
       } else {
-        for (var j = archiveState.lastSegmentCount; j < segments.length - 1; j++) {
-          if (segments[j]) QasrTerminal.renderFinalizedSegment(element, segments[j], terminalArchive);
+        for (var j = archiveState.lastSegmentCount; j < allSegments.length - 1; j++) {
+          if (allSegments[j]) {
+            if (j < segments.length || isFinal) {
+              QasrTerminal.renderFinalizedSegment(element, allSegments[j], terminalArchive);
+            } else {
+              QasrTerminal.animateSegment(element, allSegments[j], terminalArchive);
+            }
+          }
         }
-        var lastText = segments[segments.length - 1];
+        var lastText = allSegments[allSegments.length - 1];
         if (lastText) {
-          if (data.finalized) {
+          var lastIsConfirmed = (allSegments.length - 1) < segments.length;
+          if (isFinal || lastIsConfirmed) {
             QasrTerminal.renderFinalizedSegment(element, lastText, terminalArchive);
           } else {
             QasrTerminal.animateSegment(element, lastText, terminalArchive);
           }
         }
       }
-      archiveState.lastSegmentCount = segments.length;
+      archiveState.lastSegmentCount = allSegments.length;
     }
 
     if (data.finalized) {
@@ -259,13 +324,16 @@
         terminalArchive.typewriterTimer = null;
       }
       archiveState.finalized = true;
+      /* Session finalized: promote any remaining candidate lines to done
+       * so they become eligible for export.  This matches the server's
+       * behavior of force-finalizing candidates into segments_text. */
+      QasrTerminal.promoteCandidateToDone(terminalArchive);
     }
 
     element.scrollTop = element.scrollHeight;
     // Update new panels
     renderLiveCaption(data);
     renderTranscriptPanel(data);
-    updateExportAvailability();
   }
 
   function resetTerminal(element, fallback) {
@@ -283,7 +351,7 @@
     element.appendChild(cursorLine);
     terminalArchive.lines.push({ state: 'cursor', el: cursorLine, text: '' });
     // Clear new panels
-    if (captionLines) captionLines.innerHTML = '';
+    transcriptCache = '';
     if (transcriptBody) transcriptBody.innerHTML = '';
   }
 
@@ -331,7 +399,6 @@
     var cursorLine = QasrTerminal.makeTermLine('cursor', '', []);
     realtimeResult.appendChild(cursorLine);
     terminalArchive.lines.push({ state: 'cursor', el: cursorLine, text: '' });
-    if (captionLines) captionLines.innerHTML = '';
     if (transcriptBody) transcriptBody.innerHTML = '';
     updateExportAvailability();
   }
@@ -548,6 +615,8 @@
     catch (err) { realtimeStatus.textContent = 'SSE 失败：' + err.message; return; }
     realtimeState.sse = es;
     realtimeState.sseSegments = [];
+    realtimeState.sseCandidates = [];
+    realtimeState.sseSegmentSamples = [];
     realtimeState.sseLastFull = null;
 
     es.onmessage = function (ev) {
@@ -557,24 +626,94 @@
       try { data = JSON.parse(ev.data); } catch { return; }
       if (data.type === 'update') {
         if (!realtimeState.sseLastFull) return;
-        if (Array.isArray(data.new_segments) && data.new_segments.length > 0) {
+        if (data.reconciled) {
+          /* Retranscription result: REPLACE everything with the new
+           * single high-quality segment.  Old candidates and segments
+           * are stale — the batch decoder re-decoded the full audio. */
+          realtimeState.sseSegments = Array.isArray(data.new_segments)
+            ? data.new_segments.slice() : [];
+          realtimeState.sseCandidates = [];
+          } else if (data.partial_version && !data.new_segments && !data.new_candidates) {
+            /* Live partial update (no new VAD segment yet).  Show the
+             * current ASR live text in the caption panel only.  Don't
+             * touch the transcript panel — it updates only on VAD
+             * segment events (transcript.candidate / transcript.final). */
+            var live = data.live_text || '';
+            if (live && typeof renderLiveCaption === 'function') {
+              var partialData = {
+                segments: realtimeState.sseSegments.concat(realtimeState.sseCandidates).concat([live]),
+                text: live,
+                stable_text: data.live_stable_text || '',
+                partial_text: data.live_partial_text || '',
+                finalized: false,
+                event_type: 'transcript.candidate',
+              };
+              renderLiveCaption(partialData);
+            }
+          return;
+        } else if (data.event_type === 'transcript.candidate' &&
+                   Array.isArray(data.new_candidates) && data.new_candidates.length > 0) {
+          /* P1: VAD candidate — tentative, shown with animation. */
+          for (var i = 0; i < data.new_candidates.length; i++) {
+            if (typeof data.new_candidates[i] === 'string' && data.new_candidates[i].length > 0) {
+              realtimeState.sseCandidates.push(data.new_candidates[i]);
+            }
+          }
+        } else if (data.event_type === 'transcript.final' &&
+                   Array.isArray(data.new_segments) && data.new_segments.length > 0) {
+          /* P1: Two-pass final — confirmed text replaces candidates. */
+          var currentSamples = data.total_samples || data.decoded_samples || 0;
           for (var i = 0; i < data.new_segments.length; i++) {
             if (typeof data.new_segments[i] === 'string' && data.new_segments[i].length > 0) {
               realtimeState.sseSegments.push(data.new_segments[i]);
+              realtimeState.sseSegmentSamples.push(currentSamples);
+            }
+          }
+          /* Remove newly-finalized candidates (first N oldest). */
+          var toRemove = Math.min(data.new_segments.length, realtimeState.sseCandidates.length);
+          if (toRemove > 0) realtimeState.sseCandidates.splice(0, toRemove);
+        } else if (Array.isArray(data.new_segments) && data.new_segments.length > 0) {
+          /* Fallback: legacy behavior for compatibility. */
+          var currentSamples = data.total_samples || data.decoded_samples || 0;
+          for (var i = 0; i < data.new_segments.length; i++) {
+            if (typeof data.new_segments[i] === 'string' && data.new_segments[i].length > 0) {
+              realtimeState.sseSegments.push(data.new_segments[i]);
+              realtimeState.sseSegmentSamples.push(currentSamples);
             }
           }
         }
-        var latest = realtimeState.sseSegments.length > 0 ? realtimeState.sseSegments[realtimeState.sseSegments.length - 1] : '';
+        /* Merge: candidates are tentative, segments are confirmed. */
+        var allText = realtimeState.sseSegments.concat(realtimeState.sseCandidates);
+        var latest = allText.length > 0 ? allText[allText.length - 1] : '';
         var merged = Object.assign({}, realtimeState.sseLastFull, {
           sample_count: data.total_samples, decoded_samples: data.decoded_samples,
-          inference_ms: data.last_inference_ms, segments: realtimeState.sseSegments.slice(),
-          text: data.text || latest, stable_text: data.stable_text || latest,
+          inference_ms: data.last_inference_ms,
+          segments: realtimeState.sseSegments.slice(),
+          candidates: realtimeState.sseCandidates.slice(),
+          segmentSamples: realtimeState.sseSegmentSamples.slice(),
+          text: data.text || data.live_text || latest,
+          stable_text: data.stable_text || data.live_text || latest,
           partial_text: data.partial_text || '',
+          live_text: data.live_text || '',
+          live_stable_text: data.live_stable_text || '',
+          live_partial_text: data.live_partial_text || '',
+          finalized: data.finalized,
         });
+        if (data.event_type) merged.event_type = data.event_type;
+        if (data.reconciled) merged.reconciled = true;
         applyUpdate(merged);
       } else {
         realtimeState.sseLastFull = data;
         realtimeState.sseSegments = Array.isArray(data.segments) ? data.segments.slice() : [];
+        realtimeState.sseCandidates = Array.isArray(data.candidates) ? data.candidates.slice() : [];
+        /* Initialize segment sample positions from the full snapshot.
+         * Without per-segment timestamps from the server, use the
+         * decoded_samples as an approximate cumulative offset. */
+        realtimeState.sseSegmentSamples = [];
+        var initSamples = data.decoded_samples || data.total_samples || 0;
+        for (var i = 0; i < realtimeState.sseSegments.length; i++) {
+          realtimeState.sseSegmentSamples.push(initSamples);
+        }
         applyUpdate(data);
       }
     };
@@ -679,14 +818,18 @@
     var sessionId = realtimeState.sessionId;
     try {
       window.clearInterval(realtimeState.sendTimer);
-      if (realtimeState.sse) { try { realtimeState.sse.close(); } catch {} realtimeState.sse = null; }
+      /* Flush remaining audio so the server has the full last chunk. */
       await flushRealtimeChunk(true);
+      /* Stop mic BEFORE closing SSE so server can push final events. */
       realtimeState.processor.disconnect();
       realtimeState.source.disconnect();
       realtimeState.mediaStream.getTracks().forEach(function (t) { t.stop(); });
       await realtimeState.audioContext.close();
+      /* Send stop AFTER mic is closed and audio flushed. */
       var response = await fetch('/api/realtime/stop?session_id=' + encodeURIComponent(sessionId), { method: 'POST', body: '' });
       var data = await response.json();
+      /* Now SSE can be safely closed — server has finished and pushed [DONE]. */
+      if (realtimeState.sse) { try { realtimeState.sse.close(); } catch {} realtimeState.sse = null; }
       var prevStats = realtimeStatus.textContent;
       if (response.ok) {
         renderTranscript(realtimeResult, data, '尚无结果');

@@ -348,45 +348,34 @@ textarea {
   font-weight: 700;
 }
 
-/* ═══════════ 3. Live Caption ═══════════ */
-.live-caption {
-  margin-top: 12px;
-  padding: 12px 16px;
-  background: #172029;
-  border-radius: 14px;
-  min-height: 80px;
-}
-
-.live-hint {
-  margin: 0 0 8px;
-  color: #64748b;
-  font-size: 12px;
-  font-style: italic;
-}
-
-#captionLines {
-  font-family: "IBM Plex Mono", monospace;
-  font-size: 15px;
-  line-height: 1.6;
-}
-
-.caption-line {
-  display: block;
-  padding: 4px 0;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.15);
-}
-
-.caption-line .source {
-  color: #f8fafc;
-}
-
-.caption-line .status-tag {
-  color: #64748b;
-  font-size: 11px;
-  margin-left: 8px;
-}
-
 /* ═══════════ Transcript Panel ═══════════ */
+/* ───── Live Caption Row ───── */
+.live-caption {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 10px 14px;
+  margin-top: 8px;
+  background: #f8f6f2;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  font-size: 15px;
+  line-height: 1.5;
+}
+.caption-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.caption-text {
+  color: var(--ink);
+  flex: 1;
+  min-height: 1.5em;
+}
+
 .transcript-container {
   margin-top: 12px;
   border: 1px solid var(--line);
@@ -430,6 +419,19 @@ textarea {
   background: rgba(14, 116, 144, 0.04);
 }
 
+.transcript-row.done .col-text {
+  color: var(--ink);
+}
+
+.transcript-row.typing {
+  background: rgba(180, 83, 9, 0.04);
+}
+
+.transcript-row.typing .col-text {
+  color: var(--warn);
+  font-style: italic;
+}
+
 .col-time {
   font-family: "IBM Plex Mono", monospace;
   font-size: 12px;
@@ -452,10 +454,6 @@ textarea {
 
 .status-typing {
   color: var(--warn);
-}
-
-.status-cursor {
-  color: var(--muted);
 }
 
 /* ═══════════ 4. Domain / Glossary Panel ═══════════ */
@@ -555,6 +553,11 @@ textarea {
   color: #fde68a;
 }
 
+.term-line.candidate {
+  color: #94a3b8;
+  font-style: italic;
+}
+
 .term-line.cursor {
   color: #94a3b8;
 }
@@ -610,6 +613,7 @@ textarea {
   .transcript-header,
   .transcript-row {
     grid-template-columns: 60px 1fr 60px;
+    font-size: 13px;
   }
 }
 

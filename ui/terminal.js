@@ -42,10 +42,14 @@
       archive.typewriterTimer = null;
     }
 
-    // Find or create typing line
+    // Merge new text into existing typing line instead of creating a new
+    // line per segment.  This prevents VAD segment boundaries from
+    // appearing as visual line breaks in the terminal.
     var typingEntry = null;
     var lastLine = archive.lines[archive.lines.length - 1];
+    var prevText = '';
     if (lastLine && lastLine.state === 'cursor') {
+      // Cursor → typing
       var blink = lastLine.el.querySelector('.cursor-blink');
       if (blink) blink.remove();
       lastLine.el.classList.remove('cursor', 'empty');
@@ -53,40 +57,49 @@
       lastLine.state = 'typing';
       lastLine.el.textContent = '';
       typingEntry = lastLine;
-    } else if (lastLine && lastLine.state === 'typing') {
-      // Complete previous typing
-      lastLine.el.textContent = lastLine.text;
-      lastLine.el.classList.remove('typing');
-      lastLine.el.classList.add('done');
-      lastLine.state = 'done';
-      // Create new cursor -> typing
-      var cursorLine = makeTermLine('cursor', '', archive.lines);
-      element.appendChild(cursorLine);
-      archive.lines.push({ state: 'cursor', el: cursorLine, text: '' });
-      var blink2 = cursorLine.querySelector('.cursor-blink');
-      if (blink2) blink2.remove();
-      cursorLine.classList.remove('cursor', 'empty');
-      cursorLine.classList.add('typing');
-      cursorLine.textContent = '';
-      typingEntry = { state: 'typing', el: cursorLine, text: '' };
-      archive.lines[archive.lines.length - 1] = typingEntry;
+    } else if (lastLine && (lastLine.state === 'typing' || lastLine.state === 'candidate')) {
+      // Append to existing typing/candidate line.  When the model
+      // re-decodces the next segment with tail context, the new text
+      // extends the previous sentence — don't break the visual flow.
+      prevText = lastLine.text || '';
+      if (lastLine.state === 'candidate') {
+        lastLine.el.classList.remove('candidate');
+        lastLine.el.classList.add('typing');
+      }
+      lastLine.state = 'typing';
+      typingEntry = lastLine;
+      // Strip longest common prefix to avoid duplication when the
+      // model re-decodes the same audio with slight differences
+      // (e.g. "几日未见" vs "今日未见").
+      var commonLen = 0;
+      var maxLen = Math.min(prevText.length, text.length);
+      while (commonLen < maxLen && prevText.charCodeAt(commonLen) === text.charCodeAt(commonLen)) {
+        commonLen++;
+      }
+      if (commonLen > 0 && commonLen > prevText.length / 2) {
+        text = text.slice(commonLen);
+      }
+      typingEntry.el.textContent = prevText;
+      typingEntry.text = prevText;
     } else {
+      // First segment — fresh typing line
       var typingLine = makeTermLine('typing', '', archive.lines);
       element.appendChild(typingLine);
       typingEntry = { state: 'typing', el: typingLine, text: '' };
       archive.lines.push(typingEntry);
     }
 
-    var perCharMs = text.length <= 8 ? 10 : text.length <= 30 ? 18 : 14;
+    var textChars = Array.from(text);
+    var perCharMs = textChars.length <= 8 ? 10 : textChars.length <= 30 ? 18 : 14;
     var i = 0;
     function tick() {
-      if (i >= text.length) {
+      if (i >= textChars.length) {
         clearInterval(archive.typewriterTimer);
         archive.typewriterTimer = null;
         typingEntry.el.classList.remove('typing');
-        typingEntry.el.classList.add('done');
-        typingEntry.state = 'done';
-        typingEntry.text = text;
+        typingEntry.el.classList.add('candidate');
+        typingEntry.state = 'candidate';
+        typingEntry.text = prevText + text;
         var cursorLine = makeTermLine('cursor', '', archive.lines);
         element.appendChild(cursorLine);
         archive.lines.push({ state: 'cursor', el: cursorLine, text: '' });
@@ -94,8 +107,9 @@
         return;
       }
       i += 1;
-      typingEntry.el.textContent = text.slice(0, i);
-      typingEntry.text = text.slice(0, i);
+      var visible = textChars.slice(0, i).join('');
+      typingEntry.el.textContent = prevText + visible;
+      typingEntry.text = prevText + visible;
     }
     archive.typewriterTimer = setInterval(tick, perCharMs);
     tick(); // Show first char immediately
@@ -115,6 +129,7 @@
     }
     var lastLine = archive.lines[archive.lines.length - 1];
     if (lastLine && lastLine.state === 'cursor') {
+      /* Convert cursor line → done. */
       var blink = lastLine.el.querySelector('.cursor-blink');
       if (blink) blink.remove();
       lastLine.el.classList.remove('cursor', 'empty');
@@ -122,7 +137,17 @@
       lastLine.state = 'done';
       lastLine.text = text;
       lastLine.el.textContent = text;
+    } else if (lastLine && (lastLine.state === 'candidate' || lastLine.state === 'typing')) {
+      /* Promote existing candidate/typing line to done instead of
+       * creating a new line — prevents text duplication when a
+       * previously-shown candidate is confirmed by the server. */
+      lastLine.el.classList.remove('candidate', 'typing');
+      lastLine.el.classList.add('done');
+      lastLine.state = 'done';
+      lastLine.text = text;
+      lastLine.el.textContent = text;
     } else {
+      /* Fresh confirmed line (no prior candidate). */
       var doneLine = makeTermLine('done', text, archive.lines);
       element.appendChild(doneLine);
       archive.lines.push({ state: 'done', el: doneLine, text: text });
@@ -130,11 +155,31 @@
     element.scrollTop = element.scrollHeight;
   }
 
+  /**
+   * Promote candidate lines to done state when the finalizer confirms them.
+   * This makes the text eligible for export.
+   * @param {Object} archive — { lines }
+   */
+  function promoteCandidateToDone(archive) {
+    if (!archive || !Array.isArray(archive.lines)) return;
+    for (var i = 0; i < archive.lines.length; i++) {
+      if (archive.lines[i].state === 'candidate') {
+        archive.lines[i].state = 'done';
+        var el = archive.lines[i].el;
+        if (el) {
+          el.classList.remove('candidate');
+          el.classList.add('done');
+        }
+      }
+    }
+  }
+
   // ───── Export ─────
   var api = {
     makeTermLine: makeTermLine,
     animateSegment: animateSegment,
     renderFinalizedSegment: renderFinalizedSegment,
+    promoteCandidateToDone: promoteCandidateToDone,
   };
 
   if (typeof module !== 'undefined' && module.exports) {

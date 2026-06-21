@@ -249,8 +249,37 @@ void DrainStableSegments(bool force_finalize, RealtimeDisplayState * state) {
         if (boundary == 0U) {
             break;
         }
+
+        // Tail Holdback: when !force_finalize and the tail after boundary
+        // is empty (no lookahead), keep the sentence in live_stable_text
+        // instead of pushing to recent_segments. This prevents incomplete
+        // utterances like "我已经。" or "相反。" from being prematurely
+        // marked as finalized. Only VAD endpoint, session stop/close,
+        // timeout, or explicit force_finalize should commit the last
+        // sentence without lookahead.
+        if (!force_finalize) {
+            std::string_view tail = TrimAsciiWhitespace(
+                std::string_view(state->live_stable_text).substr(boundary));
+            // Strip trailing punctuation from the tail — ellipsis "..." or
+            // repeated dots after a period are not meaningful lookahead.
+            while (!tail.empty()) {
+                if (EndsWithTerminalPunctuation(tail)) {
+                    tail.remove_suffix(1);
+                    tail = TrimAsciiWhitespace(tail);
+                } else {
+                    break;
+                }
+            }
+            if (tail.empty()) {
+                break;
+            }
+        }
+
         PushRecentSegment(state->live_stable_text.substr(0, boundary), state);
         state->live_stable_text.erase(0, boundary);
+
+        // Only the first boundary inherits force_finalize.
+        // Subsequent boundaries must pass through normal rules.
         force_finalize = false;
     }
 }

@@ -1505,6 +1505,95 @@ Json BuildChatCompletionResponse(
     return response;
 }
 
+/* Helper: check if the string starts with the given UTF-8 encoded
+ * string literal prefix.  len is the byte length of the prefix. */
+static bool StartsWithUtf8(std::string_view s, const char * prefix, std::size_t len) {
+    if (s.size() < len) return false;
+    return s.compare(0, len, prefix, len) == 0;
+}
+
+/* Helper: check if the first UTF-8 character of s matches one of the
+ * leading whitespace/punctuation characters we want to trim.
+ * Returns the byte length to erase if a match, 0 otherwise. */
+static std::size_t TrimLeadingCharLen(std::string_view s) {
+    if (s.empty()) return 0;
+    /* ASCII space or comma. */
+    if (s[0] == ' ' || s[0] == ',') return 1;
+    /* CJK full-width comma '，' = 0xEF 0xBC 0x8C (3 bytes). */
+    if (StartsWithUtf8(s, "\xEF\xBC\x8C", 3)) return 3;
+    /* CJK enumeration comma '、' = 0xE3 0x80 0x81 (3 bytes). */
+    if (StartsWithUtf8(s, "\xE3\x80\x81", 3)) return 3;
+    return 0;
+}
+
+/* §7.2 #1: Find the last terminal sentence boundary that lies
+ * strictly BEFORE the text end.  Returns the byte offset of the
+ * character AFTER the punctuation (i.e., the start of the tail).
+ * Returns 0 if no mid-text boundary exists (only boundary-at-end
+ * or no boundary at all — entire text is uncertain). */
+static std::size_t FindLastMidTextBoundary(std::string_view text) {
+    std::size_t last_boundary = 0;
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(text[i]);
+        std::size_t boundary_after = 0;
+        /* ASCII punctuation. */
+        if (c == '?' || c == '!') {
+            boundary_after = i + 1;
+        }
+        /* English period: only terminal if followed by space, newline, or end. */
+        else if (c == '.') {
+            if (i + 1 >= text.size() ||
+                static_cast<unsigned char>(text[i + 1]) == ' ' ||
+                static_cast<unsigned char>(text[i + 1]) == '\n' ||
+                static_cast<unsigned char>(text[i + 1]) == ',' ||
+                static_cast<unsigned char>(text[i + 1]) == '!') {
+                boundary_after = i + 1;
+            }
+        }
+        /* CJK full-width punctuation: ？ ！ 。 (U+FF1F / U+FF01 / U+3002) */
+        else if (i + 2 < text.size()) {
+            unsigned char c1 = static_cast<unsigned char>(text[i + 1]);
+            unsigned char c2 = static_cast<unsigned char>(text[i + 2]);
+            if ((c == 0xEF && c1 == 0xBC && c2 == 0x9F) ||   // ？ U+FF1F
+                (c == 0xEF && c1 == 0xBC && c2 == 0x81) ||   // ！ U+FF01
+                (c == 0xE3 && c1 == 0x80 && c2 == 0x82)) {    // 。 U+3002
+                boundary_after = i + 3;
+            }
+        }
+        /* Only accept boundaries that leave at least 1 byte of tail. */
+        if (boundary_after > 0 && boundary_after < text.size()) {
+            last_boundary = boundary_after;
+        }
+    }
+    return last_boundary;
+}
+
+/* Check if text ends with sentence-ending punctuation.
+ * Returns true if the last character(s) are a terminal marker
+ * (. ? !  。 ？ ！).  Used to distinguish "boundary at end"
+ * (text is complete — no tail needed) from "no boundary at all"
+ * (text is incomplete — carry full audio as tail). */
+static bool EndsWithBoundary(std::string_view text) {
+    if (text.empty()) return false;
+    /* ASCII terminal punctuation at end. */
+    char last = text.back();
+    if (last == '.' || last == '?' || last == '!') {
+        return true;
+    }
+    /* CJK full-width punctuation:  。(U+3002) ？(U+FF1F) ！(U+FF01) */
+    if (text.size() >= 3) {
+        unsigned char c2 = static_cast<unsigned char>(text[text.size() - 1]);
+        unsigned char c1 = static_cast<unsigned char>(text[text.size() - 2]);
+        unsigned char c0 = static_cast<unsigned char>(text[text.size() - 3]);
+        if ((c0 == 0xE3 && c1 == 0x80 && c2 == 0x82) ||    // 。
+            (c0 == 0xEF && c1 == 0xBC && c2 == 0x9F) ||    // ？
+            (c0 == 0xEF && c1 == 0xBC && c2 == 0x81)) {    // ！
+            return true;
+        }
+    }
+    return false;
+}
+
 struct RealtimeSession {
     std::mutex mu;
     std::string id;
@@ -1528,6 +1617,13 @@ struct RealtimeSession {
      * segment is finalized).  This replaces the rolling-decoder
      * partial/revision model with a sentence-bounded one. */
     std::vector<std::string> segments_text;
+/* VAD candidate buffer — tentative text shown to SSE client. */
+     std::vector<std::string> candidates;
+     std::size_t sse_last_candidate_count = 0;
+     /* Pipeline config stored on session. */
+     bool gpuPipeline = false;
+     std::uint64_t gpuSessionId = 0;
+     ServerAsrFacade * facade = nullptr;
     double current_segment_audio_sec = 0.0;
     /* Audio ingress diagnostic.  Set on every chunk POST, surfaced via
      * /api/realtime/audio_diag so the UI can show "did the server
@@ -1552,6 +1648,26 @@ struct RealtimeSession {
      * SSE stream uses this to diff and only emit incremental
      * segments.  Updated by the SSE writer; read by it too. */
     std::size_t sse_last_segment_count = 0;
+    /* Post-stop full-audio retranscription result.  The background
+     * retranscription thread sets these after re-decoding the full
+     * audio, then notifies sse_cv.  The SSE loop (if still active)
+     * delivers this to the client before sending [DONE].
+     *
+     * reconcile_revised is true when the retranscribed text differs
+     * from the original VAD-based segments text. */
+    std::string reconcile_text;
+    bool reconcile_ready = false;
+    bool reconcile_revised = false;
+    /* Monotonic version counter incremented on every partial/live text
+     * update.  The SSE handler uses this to detect quickly-changing
+     * live text and push it to the client without waiting for a full
+     * VAD segment commit.  See `ApplyChunkRealtimeCommit`. */
+    std::uint64_t partial_version = 0;
+    /* Tail carry-over: audio that corresponds to text AFTER the last
+     * sentence boundary in a committed segment.  This audio is
+     * prepended to the next segment so the ASR model has full context
+     * for the incomplete sentence. */
+    std::vector<float> tail_audio;
 };
 
 struct RealtimeSessionSnapshot {
@@ -1567,6 +1683,7 @@ struct RealtimeSessionSnapshot {
     std::string stable_text;
     std::string partial_text;
     std::vector<std::string> segments_text;
+    std::vector<std::string> candidates;
     double current_segment_audio_sec = 0.0;
     double last_inference_ms = 0.0;
     bool last_decode_ran = false;
@@ -1995,7 +2112,7 @@ struct CapOnlyEndpointPolicy {
     /* New cap parameters.  First cap protects against long first-segment
      * wait during continuous speech.  Normal cap protects subsequent
      * segments.  Grace + valley avoid mid-speech cutting. */
-    int first_latency_cap_ms = 6000;
+    int first_latency_cap_ms = 20000;
     int normal_latency_cap_ms = 15000;
     int cap_grace_ms = 800;
     int cap_valley_silence_ms = 256;
@@ -2003,9 +2120,9 @@ struct CapOnlyEndpointPolicy {
     static CapOnlyEndpointPolicy FromEnv() {
         CapOnlyEndpointPolicy p;
         const char * fl = getenv("QASR_FIRST_LATENCY_CAP_MS");
-        if (fl) p.first_latency_cap_ms = std::max(1000, std::stoi(fl));
+        if (fl) p.first_latency_cap_ms = std::min(60000, std::max(1000, std::stoi(fl)));
         const char * nl = getenv("QASR_NORMAL_LATENCY_CAP_MS");
-        if (nl) p.normal_latency_cap_ms = std::max(3000, std::stoi(nl));
+        if (nl) p.normal_latency_cap_ms = std::min(120000, std::max(3000, std::stoi(nl)));
         const char * gr = getenv("QASR_LATENCY_CAP_GRACE_MS");
         if (gr) p.cap_grace_ms = std::max(100, std::stoi(gr));
         const char * vl = getenv("QASR_LATENCY_CAP_VALLEY_MS");
@@ -2045,6 +2162,8 @@ struct HostCaptureSession {
     bool stop_requested = false;
     bool worker_done = false;
     std::unique_ptr<RealtimeLiveWorker> live_worker;
+    std::uint64_t partial_version = 0;
+    std::condition_variable sse_cv;
 #if defined(_WIN32)
     HANDLE child_process = INVALID_HANDLE_VALUE;
     HANDLE read_handle = INVALID_HANDLE_VALUE;
@@ -2706,6 +2825,12 @@ void ApplyChunkRealtimeCommit(
      * silent-skip chunks contribute 0 ms which is correct. */
     const double new_inference_ms = session->last_inference_ms + chunk->decode_ms;
     ApplyRealtimeUpdate(update, new_inference_ms, true, chunk->is_final, session);
+    /* Notify SSE so the client gets partial/live text pushes.  This
+     * enables fast first-word display and smooth live partial updates.
+     * A version counter lets the SSE handler efficiently detect change
+     * without string comparison of partial_text. */
+    session->partial_version++;
+    session->sse_cv.notify_all();
 }
 
 template <typename SessionLike>
@@ -2792,6 +2917,20 @@ Json BuildRealtimeJson(
         }
     }
     body["segments"] = std::move(segments_arr);
+    /* P1: VAD candidates — tentative, not yet confirmed by finalizer.
+     * Sent separately from segments so the UI can distinguish tentative
+     * from confirmed text. */
+    Json candidates_arr = Json::array();
+    if constexpr (std::is_same<SessionLike, RealtimeSessionSnapshot>::value) {
+        for (const std::string & s : session.candidates) {
+            candidates_arr.push_back(s);
+        }
+    } else if constexpr (std::is_same<SessionLike, RealtimeSession>::value) {
+        for (const std::string & s : session.candidates) {
+            candidates_arr.push_back(s);
+        }
+    }
+    body["candidates"] = std::move(candidates_arr);
     double current_sec = 0.0;
     if constexpr (std::is_same<SessionLike, RealtimeSessionSnapshot>::value) {
         current_sec = session.current_segment_audio_sec;
@@ -4042,8 +4181,7 @@ int RunServer(const ServerConfig & config) {
      * If grace expires, emit forced.  If hard cap reached, emit hard.
      * This avoids cutting directly inside active speech.
      *
-     * Phase 1 (safe): keep soft deadline at 15s, only add grace.
-     * Phase 2 (low-latency 0.6B): soft deadline 8s, hard cap 10s. */
+     * (adjusted to 5s per user request for CUDA low-latency) */
     constexpr int kVadSegmentSoftDeadlineSamples = 15 * 16000;
     constexpr int kVadSegmentSoftGraceMs = 800;
     constexpr int kVadSegmentHardCapSamples =
@@ -4069,17 +4207,17 @@ int RunServer(const ServerConfig & config) {
     constexpr int kVadSegmentPollMs = 50;                 /* poll live buffer every 50 ms */
     constexpr int kVadVadFrameMs = 32;                    /* Silero VAD frame: 512 samples / 16 kHz */
     constexpr float kVadSpeechProbThreshold = 0.3f;       /* LOWERED from 0.5 to 0.3 to catch
-                                                                 low-energy onsets like "ich" in
-                                                                 "ichthyosaurus" that the model
-                                                                 can decode correctly but VAD
-                                                                 was missing at 0.5.  Risk:
-                                                                 more false positives (noise
-                                                                 counted as speech).  Mitigation:
-                                                                 kVadSegmentMinValidSamples
-                                                                 (0.3s) + silence 1500ms still
-                                                                 require sustained speech before
-                                                                 committing.  Tune up if too
-                                                                 many spurious segments appear. */
+                                                               low-energy onsets like "ich" in
+                                                               "ichthyosaurus" that the model
+                                                               can decode correctly but VAD
+                                                               was missing at 0.5.  Risk:
+                                                               more false positives (noise
+                                                               counted as speech).  Mitigation:
+                                                               kVadSegmentMinValidSamples
+                                                               (0.3s) + silence 1500ms still
+                                                               require sustained speech before
+                                                               committing.  Tune up if too
+                                                               many spurious segments appear. */
     /* (kVadMinRms / kVadMinPeak energy gates intentionally
      * removed — Silero VAD prob threshold + kVadSegmentMinValidSamples
      * give cleaner segment boundaries than an energy-only gate.  The
@@ -4248,41 +4386,63 @@ int RunServer(const ServerConfig & config) {
                    std::strcmp(reason, "eof_stop") == 0;
         };
 
-        /* Helper: build & push an AudioSegment from segment_buffer,
-         * with pre-roll prepended (from preroll ring buffer) and
-         * trailing silence trimmed to last_speech + post_roll. */
-        auto emit_segment_buffer = [&](const char * reason) -> bool {
-            if (segment_buffer.empty()) {
-                silence_run_ms = 0;
-                segment_active = false;
-                speech_start_offset = -1;
-                last_speech_offset = -1;
+       /* Helper: build & push an AudioSegment from segment_buffer,
+          * with tail_audio (from previous segment) + pre-roll prepended
+          * and trailing silence trimmed to last_speech + post_roll.
+          *
+          * §7.2 #7: tail_audio from the previous segment's uncertain
+          * tail is prepended to the current segment's audio so the ASR
+          * model has full context for the incomplete sentence. */
+         auto emit_segment_buffer = [&](const char * reason) -> bool {
+             if (segment_buffer.empty()) {
+                 silence_run_ms = 0;
+                 segment_active = false;
+                 speech_start_offset = -1;
+                 last_speech_offset = -1;
 
-                softcap_grace_active = false;
-                softcap_grace_start_ms = 0;
-                softcap_grace_enter_silence_ms = 0;
+                 softcap_grace_active = false;
+                 softcap_grace_start_ms = 0;
+                 softcap_grace_enter_silence_ms = 0;
 
-                return true;
-            }
-            std::vector<float> emit_samples;
-            if (last_speech_offset >= 0) {
-                int end_offset = std::min(static_cast<int>(segment_buffer.size()),
-                                          last_speech_offset + postroll_samples);
-                int start_offset = (speech_start_offset >= 0)
-                    ? std::max(0, speech_start_offset - preroll_samples)
-                    : 0;
-                if (end_offset > start_offset) {
-                    /* Prepend pre-roll (last `start_offset` samples of
-                     * the preroll ring buffer) if non-empty.  This
-                     * gives ASR the audio BEFORE the first VAD-said-
-                     * speech frame so leading consonants are preserved.
-                     */
-                    if (start_offset > 0) {
-                        std::vector<float> pr;
-                        preroll.Snapshot(&pr);
-                        if (static_cast<int>(pr.size()) > start_offset) {
-                            emit_samples.insert(emit_samples.end(),
-                                                pr.end() - start_offset, pr.end());
+                 return true;
+             }
+             std::vector<float> emit_samples;
+
+             /* §7.2 #7: Prepend tail_audio from previous segment's
+              * uncertain tail.  This gives the ASR model context for
+              * the incomplete sentence. */
+             {
+                 std::lock_guard<std::mutex> tlock(session->mu);
+                 if (!session->tail_audio.empty()) {
+                     emit_samples.insert(emit_samples.end(),
+                                         session->tail_audio.begin(),
+                                         session->tail_audio.end());
+                     RT_LOG("VadFacadeLoop sid=%s prepend tail=%d samples (%.2fs)",
+                            session->id.c_str(),
+                            static_cast<int>(session->tail_audio.size()),
+                            session->tail_audio.size() / 16000.0);
+                     session->tail_audio.clear();
+                 }
+             }
+
+             if (last_speech_offset >= 0) {
+                 int end_offset = std::min(static_cast<int>(segment_buffer.size()),
+                                           last_speech_offset + postroll_samples);
+                 int start_offset = (speech_start_offset >= 0)
+                     ? std::max(0, speech_start_offset - preroll_samples)
+                     : 0;
+                 if (end_offset > start_offset) {
+                     /* Prepend pre-roll (last `start_offset` samples of
+                      * the preroll ring buffer) if non-empty.  This
+                      * gives ASR the audio BEFORE the first VAD-said-
+                      * speech frame so leading consonants are preserved.
+                      */
+                     if (start_offset > 0) {
+                         std::vector<float> pr;
+                         preroll.Snapshot(&pr);
+                         if (static_cast<int>(pr.size()) > start_offset) {
+                             emit_samples.insert(emit_samples.end(),
+                                                 pr.end() - start_offset, pr.end());
                         } else {
                             emit_samples.insert(emit_samples.end(),
                                                 pr.begin(), pr.end());
@@ -4946,6 +5106,25 @@ int RunServer(const ServerConfig & config) {
                 }
             }
 
+            /* §7.2 #9: Idle silence fallback — after ~0.5s of idle
+             * (no speech, no active segment), force-commit pending
+             * candidates.  This ensures short utterances like "你好。"
+             * are finalized even if the user stops speaking. */
+            if (idle_polls > 10 && !session->finalized) {
+                std::lock_guard<std::mutex> lock(session->mu);
+                if (!session->candidates.empty() && !session->finalized) {
+                    for (auto & c : session->candidates) {
+                        session->segments_text.push_back(std::move(c));
+                    }
+                    session->candidates.clear();
+                    session->sse_cv.notify_all();
+                    RT_LOG("VadFacadeLoop sid=%s idle_silence_commit "
+                           "segments=%zu",
+                           session->id.c_str(),
+                           session->segments_text.size());
+                }
+            }
+
             /* EOF from the live buffer (set by /stop or eof endpoint).
              * Flush any in-flight segment and pending, then exit. */
             if (live_eof && consumed_samples > 0) {
@@ -5036,6 +5215,14 @@ int RunServer(const ServerConfig & config) {
             }
         }
 
+/* Store pipeline config for session state. */
+        {
+            std::lock_guard<std::mutex> lock(session->mu);
+            session->gpuPipeline = gpuPipeline;
+            session->facade = facade;
+            session->gpuSessionId = gpuSessionId;
+        }
+
         while (true) {
             AudioSegment seg;
             if (!queue->Pop(&seg)) {
@@ -5059,8 +5246,8 @@ int RunServer(const ServerConfig & config) {
 
             if (qwen_verbose >= 1) {
                 std::fprintf(stderr,
-                             "ASR-worker: decoding segment #%d (%.2fs, reason=%s, total_buf=%.2fs)\n",
-                             (int)session->segments_text.size() + 1,
+                              "ASR-worker: decoding candidate #%d (%.2fs, reason=%s, total_buf=%.2fs)\n",
+                              (int)session->candidates.size() + 1,
                              (double)n_samples / 16000.0, seg.commit_reason.c_str(),
                              (double)session->total_samples / 16000.0);
             }
@@ -5193,55 +5380,196 @@ int RunServer(const ServerConfig & config) {
                 }
             }
 
-           if (!asr_text.empty()) {
-                if (qwen_verbose >= 1) {
-                    std::fprintf(stderr,
-                                 "ASR-worker: segment #%d text=%s\n",
-                                 (int)session->segments_text.size() + 1, asr_text.c_str());
-                }
-                std::lock_guard<std::mutex> lock(session->mu);
-                if (!asr_text.empty()) {
-                    session->segments_text.push_back(asr_text);
-                    RealtimeTextUpdate update;
-                    update.committed = true;
-                    update.stable_text = asr_text;
-                    update.partial_text.clear();
-                    update.text = asr_text;
-                    session->stable_text = asr_text;
-                    session->text_state.stable_text = asr_text;
-                    session->text_state.last_text = asr_text;
-                    session->text_state.last_decode_samples = session->total_samples;
-                    session->text_state.unstable_since_samples = session->total_samples;
-                    session->last_inference_ms = seg_total_ms;
-                    ApplyRealtimeUpdate(update, session->last_inference_ms,
-                                        true, false, session.get());
-                }
-                /* Wake the SSE stream so the client gets a push
-                 * instead of waiting for the next poll.  Held
-                 * under session->mu. */
-                session->sse_cv.notify_all();
-            } else if (qwen_verbose >= 1) {
-                std::fprintf(stderr,
-                             "ASR-worker: qwen_transcribe_audio returned null\n");
-            }
-        }
+ /* §7.2-7.3: Sentence-boundary split with tail carry-over.
+           *
+           * The ASR model may return accumulated full text.  Strip the
+           * prefix that was already in the previous segment.  Then find
+           * the last sentence boundary (terminal punctuation).  Text
+           * before the boundary is confirmed; text after is uncertain.
+           * The audio after the boundary is estimated by proportion and
+           * carried over as tail_audio for the next segment.
+           *
+           * This prevents mid-sentence cuts: "大师先生，几日未见，您可安好？"
+           * is confirmed immediately.  The tail "哦，yes, I'm fine. Aside from"
+           * is carried to the next segment for re-decode with more context. */
+          if (!asr_text.empty()) {
+              if (qwen_verbose >= 1) {
+                  std::fprintf(stderr,
+                               "ASR-worker: segment #%d text=%s\n",
+                               (int)session->segments_text.size() + 1, asr_text.c_str());
+              }
+               std::lock_guard<std::mutex> lock(session->mu);
+               if (!asr_text.empty()) {
+                   /* Strip accumulated prefix from previous segments.
+                    * When the model re-decodes a segment with tail prepend,
+                    * it may reinterpret the prefix (e.g. "几日未见"→"今日未见"
+                    * for the same audio).  In that case the exact prefix
+                    * match fails.  Fall back to the longest common prefix
+                    * to avoid duplicating old text as a new segment. */
+                   std::string segment_text = asr_text;
+                   const std::string & prev_text = session->text;
+                   if (!prev_text.empty() && asr_text.size() > prev_text.size()) {
+                       if (asr_text.compare(0, prev_text.size(), prev_text) == 0) {
+                           /* Exact prefix match — happy path. */
+                           segment_text = asr_text.substr(prev_text.size());
+                        } else {
+                            /* Prefix diverged — find longest common prefix. */
+                            std::size_t common = 0;
+                            while (common < prev_text.size() && common < asr_text.size() &&
+                                   asr_text[common] == prev_text[common]) {
+                                ++common;
+                            }
+                            /* Rewind to valid UTF-8 character boundary to avoid
+                             * producing a string starting with continuation bytes. */
+                            while (common > 0 && common < asr_text.size() &&
+                                   (static_cast<unsigned char>(asr_text[common]) & 0xC0) == 0x80) {
+                                --common;
+                            }
+                            segment_text = asr_text.substr(common);
+                        }
+                       while (!segment_text.empty()) {
+                          std::size_t trim_len = TrimLeadingCharLen(segment_text);
+                          if (trim_len == 0) break;
+                          segment_text.erase(0, trim_len);
+                      }
+                   }
+ 
+                   /* If segment_text is empty after trimming, skip processing.
+                     * This can happen when the ASR model returns only previously-
+                     * confirmed text (no new content). */
+                    if (segment_text.empty()) {
+                       RT_LOG("AsrWorkerLoop sid=%s seq=%lu empty segment after trim, skipping",
+                              session->id.c_str(),
+                              static_cast<unsigned long>(seg.seq));
+                    } else {
+                        /* §7.2 #1: Find last mid-text sentence boundary
+                         * (terminal punctuation NOT at the text end).
+                         * Returns 0 if only boundary-at-end or no boundary. */
+                        std::size_t boundary = FindLastMidTextBoundary(segment_text);
+                        int n_samples = static_cast<int>(seg.samples.size());
 
-    /* Finalize: mark the session state so the UI knows this
-          * is the last text, and free the per-session clone. */
-         {
-             std::lock_guard<std::mutex> lock(session->mu);
-             if (session->error.empty()) {
-                 ApplyStableRealtimeCommit(session->total_samples,
-                                           session->stable_text,
-                                           session->last_inference_ms,
-                                           true, session.get());
-             }
-             session->finalized = true;
-             /* Final wake — SSE will see finalized=true and close
-              * the stream with data: [DONE]. */
-             session->sse_cv.notify_all();
-             session->worker_done = true;
-         }
+                    if (boundary > 0) {
+                        /* Mid-text boundary found → commit everything before it
+                         * and carry the tail (audio + text) to the next segment.
+                         * This follows the user's state machine rules:
+                         * 1. Punctuation IN the sentence → commit.
+                         * 2. Cut audio proportionally, tail goes to next segment.
+                         * 3. Repeat when new punctuation appears. */
+                        double ratio = static_cast<double>(boundary) /
+                                       static_cast<double>(segment_text.size());
+                        ratio = std::max(0.10, std::min(0.95, ratio));
+                        int cut_samples = static_cast<int>(n_samples * ratio);
+
+                        /* Commit confirmed text (before boundary). */
+                        std::string confirmed_text = segment_text.substr(0, boundary);
+                        while (!confirmed_text.empty() &&
+                               (confirmed_text.back() == ' ' ||
+                                confirmed_text.back() == '\n' ||
+                                confirmed_text.back() == '\t')) {
+                            confirmed_text.pop_back();
+                        }
+                        if (!confirmed_text.empty()) {
+                            session->segments_text.push_back(confirmed_text);
+                            RT_LOG("AsrWorkerLoop sid=%s seq=%lu confirmed=%s (boundary=%zu cut=%d/%d)",
+                                   session->id.c_str(),
+                                   static_cast<unsigned long>(seg.seq),
+                                   confirmed_text.c_str(),
+                                   boundary, cut_samples, n_samples);
+                        }
+
+                        /* Carry tail audio for next segment re-decode. */
+                        if (cut_samples < n_samples) {
+                            session->tail_audio.assign(
+                                seg.samples.begin() + cut_samples,
+                                seg.samples.end());
+                            RT_LOG("AsrWorkerLoop sid=%s tail_carry=%d samples (%.2fs)",
+                                   session->id.c_str(),
+                                   n_samples - cut_samples,
+                                   (n_samples - cut_samples) / 16000.0);
+                        }
+                    } else {
+                        /* No mid-text boundary.  Two sub-cases:
+                         *
+                         * ① Boundary at end (text ends with . ? !  。 ？ ！)
+                         *    → candidates, cut at end (100%), NO tail.
+                         *      Text appears complete; the audio after the last
+                         *      punctuation is VAD silence so no acoustic context
+                         *      is lost by dropping the tail.
+                         *
+                         * ② No boundary at all
+                         *    → candidates, cut at 0%, carry FULL audio as tail.
+                         *      Text is uncertain; next segment needs full
+                         *      acoustic context for re-decode. */
+                        if (EndsWithBoundary(segment_text)) {
+                            session->candidates.push_back(segment_text);
+                            session->tail_audio.clear();
+                            RT_LOG("AsrWorkerLoop sid=%s seq=%lu candidate+no-tail=%s "
+                                   "(boundary at end)",
+                                   session->id.c_str(),
+                                   static_cast<unsigned long>(seg.seq),
+                                   segment_text.c_str());
+                        } else {
+                            session->candidates.push_back(segment_text);
+                            session->tail_audio.assign(
+                                seg.samples.begin(), seg.samples.end());
+                            RT_LOG("AsrWorkerLoop sid=%s seq=%lu candidate+full-tail=%s "
+                                   "tail=%.2fs",
+                                   session->id.c_str(),
+                                   static_cast<unsigned long>(seg.seq),
+                                   segment_text.c_str(),
+                                   seg.samples.size() / 16000.0);
+                        }
+                    }
+                    } /* end: segment_text not empty */
+
+                   /* Update session text state for display. */
+                  RealtimeTextUpdate update;
+                  update.committed = true;
+                  update.stable_text = asr_text;
+                  update.partial_text.clear();
+                  update.text = asr_text;
+                  session->stable_text = asr_text;
+                  session->text_state.stable_text = asr_text;
+                  session->text_state.last_text = asr_text;
+                  session->text_state.last_decode_samples = session->total_samples;
+                  session->text_state.unstable_since_samples = session->total_samples;
+                  session->last_inference_ms = seg_total_ms;
+                  ApplyRealtimeUpdate(update, session->last_inference_ms,
+                                      true, false, session.get());
+              }
+              /* Wake the SSE stream. */
+              session->sse_cv.notify_all();
+          } else if (qwen_verbose >= 1) {
+             std::fprintf(stderr,
+                          "ASR-worker: qwen_transcribe_audio returned null\n");
+          }
+      }
+
+     /* Finalize: mark the session state so the UI knows this
+           * is the last text, and free the per-session clone. */
+          {
+              std::lock_guard<std::mutex> lock(session->mu);
+              if (session->error.empty()) {
+                  ApplyStableRealtimeCommit(session->total_samples,
+                                            session->stable_text,
+                                            session->last_inference_ms,
+                                            true, session.get());
+              }
+             /* P1: force-finalize any candidates that didn't get finalized
+                 * by the two-pass finalizer.  Only push candidates whose index
+                 * hasn't been covered by a finalized segment. */
+              std::size_t n_finalized = session->segments_text.size();
+              for (std::size_t i = n_finalized; i < session->candidates.size(); ++i) {
+                  session->segments_text.push_back(session->candidates[i]);
+              }
+              session->candidates.clear();
+              session->tail_audio.clear();
+              session->finalized = true;
+              /* Final wake — SSE will see finalized=true and close
+               * the stream with data: [DONE]. */
+              session->sse_cv.notify_all();
+              session->worker_done = true;
+          }
         if (live_ctx) qwen_free(live_ctx);
         if (gpuPipeline && facade && gpuSessionId) {
             facade->engine()->CloseSession(gpuSessionId);
@@ -5620,12 +5948,13 @@ int RunServer(const ServerConfig & config) {
         worker->segment_queue.LogStats(session_id.c_str());
         RT_LOG("FinalizeRealtimeSession sid=%s join returned", session_id.c_str());
 
-       {
-              std::lock_guard<std::mutex> lock(session->mu);
-              session->live_worker.reset();
-              session->finalized = true;
-          }
-          metrics.realtime_finalizations.fetch_add(1);
+        {
+               std::lock_guard<std::mutex> lock(session->mu);
+               session->live_worker.reset();
+               session->finalized = true;
+               session->sse_cv.notify_all();
+           }
+           metrics.realtime_finalizations.fetch_add(1);
 
           /* Snapshot VAD-segmented results immediately so the stop
             * handler can return without blocking on retranscription.
@@ -5641,6 +5970,7 @@ int RunServer(const ServerConfig & config) {
                                                  - session->retained_sample_offset;
              snapshot->retained_sample_offset = session->retained_sample_offset;
              snapshot->segments_text  = session->segments_text;
+              snapshot->candidates     = session->candidates;
              snapshot->text           = session->text;
              snapshot->stable_text    = session->stable_text;
              snapshot->partial_text   = session->partial_text;
@@ -5702,7 +6032,7 @@ int RunServer(const ServerConfig & config) {
                           }
                           const bool should_replace = !full_text.empty() &&
                               full_text.size() >= vadText.size() * 0.9;
-                          RT_LOG("RECONCILE sid=%s vad_len=%zd full_len=%zd replace=%d "
+                           RT_LOG("RECONCILE sid=%s vad_len=%zd full_len=%zd gate=%d "
                                  "forced_lang=%s full_audio_sec=%.2f",
                                  sid.c_str(),
                                  vadText.size(),
@@ -5710,19 +6040,20 @@ int RunServer(const ServerConfig & config) {
                                  should_replace ? 1 : 0,
                                  lang.empty() ? "<auto>" : lang.c_str(),
                                  static_cast<double>(audioCopy.size()) / 16000.0);
-                          if (should_replace) {
-                              if (qwen_verbose >= 1) {
-                                  std::fprintf(stderr,
-                                      "RECONCILE sid=%s: replacing VAD text (%zd chars) "
-                                      "with retranscribed (%zd chars)\n",
-                                      sid.c_str(), vadText.size(), full_text.size());
+                               if (should_replace) {
+                               if (qwen_verbose >= 1) {
+                                   std::fprintf(stderr,
+                                       "RECONCILE sid=%s: VAD=%zd chars retranscribed=%zd chars"
+                                       " — delivering as reconcile event\n",
+                                       sid.c_str(), vadText.size(), full_text.size());
+                               }
+                               {
+                                   std::lock_guard<std::mutex> lock(ssn->mu);
+                                   ssn->reconcile_text = full_text;
+                                   ssn->reconcile_revised = (full_text != vadText);
+                                   ssn->reconcile_ready = true;
+                                  ssn->sse_cv.notify_all();
                               }
-                              std::lock_guard<std::mutex> lock(ssn->mu);
-                              ssn->segments_text.clear();
-                              ssn->segments_text.push_back(full_text);
-                              ssn->text = full_text;
-                              ssn->stable_text = full_text;
-                              ssn->sse_cv.notify_all();
                           } else if (!full_text.empty() && qwen_verbose >= 1) {
                               std::fprintf(stderr,
                                   "RECONCILE sid=%s: retranscribed (%zd) shorter than "
@@ -6539,13 +6870,26 @@ int RunServer(const ServerConfig & config) {
          * Heartbeat every 5s keeps proxies from killing the
          * connection.  Per-session sse_last_segment_count lets us
          * emit only delta segments (full snapshot once at connect
-         * time).  Paired with session->mu. */
+         * time).  Paired with session->mu.
+         *
+         * Post-stop full-audio retranscription: after the VAD segments
+         * are finalized, the SSE loop does NOT exit immediately.
+         * Instead it enters Phase 2, waiting up to 60s for the
+         * retranscription (reconciliation) result.  This way the
+         * client receives the high-quality batch transcription on
+         * the same SSE connection. */
         constexpr int kSseHeartbeatMs = 5000;
+        constexpr int kReconcileTimeoutMs = 60000;
         std::size_t last_segment_count = 0;
+        std::size_t last_candidate_count = 0;
+        std::uint64_t last_partial_version = 0;
         {
             std::lock_guard<std::mutex> lock(session->mu);
             last_segment_count = session->segments_text.size();
+            last_candidate_count = session->candidates.size();
             session->sse_last_segment_count = last_segment_count;
+            session->sse_last_candidate_count = last_candidate_count;
+            last_partial_version = session->partial_version;
         }
         /* Initial full snapshot. */
         {
@@ -6562,87 +6906,169 @@ int RunServer(const ServerConfig & config) {
         }
         while (true) {
             std::unique_lock<std::mutex> lock(session->mu);
-            /* Wait for new segment or finalize or heartbeat timeout. */
+            /* Wait for new segment or finalize or reconcile or
+             * heartbeat timeout.  Also wake up on reconcile_ready
+             * in case it fires before the SSE has seen finalized
+             * (race-free on the CV). */
             session->sse_cv.wait_for(lock, std::chrono::milliseconds(kSseHeartbeatMs),
                 [&] {
                     return session->finalized
-                        || session->segments_text.size() != session->sse_last_segment_count;
+                        || session->reconcile_ready
+                        || session->segments_text.size() != session->sse_last_segment_count
+                        || session->candidates.size() != session->sse_last_candidate_count
+                        || session->partial_version != last_partial_version;
                 });
-            const std::size_t cur_count = session->segments_text.size();
-            const std::size_t prev_count = session->sse_last_segment_count;
+            const std::uint64_t cur_partial_version = session->partial_version;
+            const std::size_t cur_segment_count = session->segments_text.size();
+            const std::size_t cur_candidate_count = session->candidates.size();
             const bool finalized = session->finalized;
-            /* Capture ALL new segments since the last sent count, not
-             * just the latest one.  If multiple ASR commits happen
-             * between two SSE wakeups (fast speech, or VAD firing
-             * twice in rapid succession), only the latest text would
-             * otherwise be delivered — middle texts get dropped on
-             * the client.  Sending the full delta eliminates that
-             * class of bug.  Paired with session->mu. */
-            std::vector<std::string> new_segments;
-            for (std::size_t i = prev_count; i < cur_count; ++i) {
-                new_segments.push_back(session->segments_text[i]);
-            }
-            const double inf_ms = session->last_inference_ms;
-             const std::size_t total_samples = session->total_samples;
-             const std::size_t decoded_samples = session->decoded_samples;
-             const bool last_decode_ran = session->last_decode_ran;
-             const float max_ingress_peak = session->max_ingress_peak;
-             const float last_ingress_peak = session->last_ingress_peak;
-             const std::uint64_t ingress_chunks = session->ingress_chunks;
-             const std::string text = session->text;
-             const std::string stable_text = session->stable_text;
-             const std::string partial_text = session->partial_text;
-             const std::string live_stable = session->display_snapshot.live_stable_text;
-             const std::string live_partial = session->display_snapshot.live_partial_text;
-             const std::string live_text = session->display_snapshot.live_text;
-             const std::string display_text = session->display_snapshot.display_text;
-             session->sse_last_segment_count = cur_count;
-             lock.unlock();
+            const bool reconcile_ready = session->reconcile_ready;
 
-             /* Build incremental payload.  Include all fields that
-              * BuildRealtimeJson carries so the UI can render live
-              * partial/stable text even before a VAD segment commits. */
-             Json event;
-             event["type"] = "update";
-             event["new_segment_count"] = cur_count;
-             /* new_segments is the full delta from prev_count to
-              * cur_count.  Empty when no new segments arrived (e.g.
-              * heartbeat).  Sent as a JSON array of strings. */
-             Json new_segs_json = Json::array();
-             for (const auto & s : new_segments) {
-                 new_segs_json.push_back(s);
-             }
-             event["new_segments"] = new_segs_json;
-             event["total_samples"] = total_samples;
-             event["decoded_samples"] = decoded_samples;
-             event["last_inference_ms"] = inf_ms;
-             event["last_decode_ran"] = last_decode_ran;
-             event["max_ingress_peak"] = max_ingress_peak;
-             event["last_ingress_peak"] = last_ingress_peak;
-             event["ingress_chunks"] = ingress_chunks;
-             event["finalized"] = finalized;
-             event["text"] = text;
-             event["stable_text"] = stable_text;
-             event["partial_text"] = partial_text;
-             event["live_stable_text"] = live_stable;
-             event["live_partial_text"] = live_partial;
-            event["live_text"] = live_text;
-             event["display_text"] = display_text;
-             if (qwen_verbose >= 1 && !new_segments.empty()) {
-                 std::fprintf(stderr,
-                     "SSE-push sid=%s: %zu new segments (total=%zu)\n",
-                     session_id.c_str(), new_segments.size(), cur_count);
-                 for (const auto & ns : new_segments) {
-                     std::fprintf(stderr, "  SSE: %s\n", ns.c_str());
-                 }
-             }
-             if (!writer(BuildSseData(event.dump()))) {
-                 break;
-             }
-            if (finalized) {
+            /* ── P1: push new candidates (VAD tentative) ── */
+            if (cur_candidate_count > last_candidate_count) {
+                std::vector<std::string> new_candidates;
+                for (std::size_t i = last_candidate_count; i < cur_candidate_count; ++i) {
+                    new_candidates.push_back(session->candidates[i]);
+                }
+                last_candidate_count = cur_candidate_count;
+                session->sse_last_candidate_count = cur_candidate_count;
+                const double inf_ms = session->last_inference_ms;
+                const std::size_t total_samples = session->total_samples;
+                const std::string live_text = session->display_snapshot.live_text;
+                lock.unlock();
+
+                Json evt;
+                evt["type"] = "update";
+                evt["event_type"] = "transcript.candidate";
+                evt["candidate_count"] = cur_candidate_count;
+                Json cand_json = Json::array();
+                for (const auto & s : new_candidates) cand_json.push_back(s);
+                evt["new_candidates"] = cand_json;
+                evt["total_samples"] = total_samples;
+                evt["last_inference_ms"] = inf_ms;
+                evt["live_text"] = live_text;
+                if (qwen_verbose >= 1 && !new_candidates.empty()) {
+                    std::fprintf(stderr,
+                        "SSE-push sid=%s: %zu new candidates (total=%zu)\n",
+                        session_id.c_str(), new_candidates.size(), cur_candidate_count);
+                }
+                if (!writer(BuildSseData(evt.dump()))) break;
+                continue;
+            }
+
+            /* ── P1: push new finalized segments (two-pass confirmed) ── */
+            if (cur_segment_count > session->sse_last_segment_count) {
+                std::vector<std::string> new_finals;
+                for (std::size_t i = session->sse_last_segment_count; i < cur_segment_count; ++i) {
+                    new_finals.push_back(session->segments_text[i]);
+                }
+                session->sse_last_segment_count = cur_segment_count;
+                const double inf_ms = session->last_inference_ms;
+                const std::size_t total_samples = session->total_samples;
+                lock.unlock();
+
+                Json evt;
+                evt["type"] = "update";
+                evt["event_type"] = "transcript.final";
+                evt["segment_count"] = cur_segment_count;
+                Json final_json = Json::array();
+                for (const auto & s : new_finals) final_json.push_back(s);
+                evt["new_segments"] = final_json;
+                evt["total_samples"] = total_samples;
+                evt["last_inference_ms"] = inf_ms;
+                if (qwen_verbose >= 1 && !new_finals.empty()) {
+                    std::fprintf(stderr,
+                        "SSE-push sid=%s: %zu new final segments (total=%zu)\n",
+                        session_id.c_str(), new_finals.size(), cur_segment_count);
+                }
+                if (!writer(BuildSseData(evt.dump()))) break;
+                continue;
+            }
+
+            /* ── Phase 2: wait for retranscription ── */
+            if (finalized && !reconcile_ready) {
+                session->sse_last_segment_count = cur_segment_count;
+                session->sse_last_candidate_count = cur_candidate_count;
+                const std::string text = session->text;
+                const std::string stable_text = session->stable_text;
+                lock.unlock();
+
+                /* Send final-fallback event now; candidates become
+                 * the fallback if finalizer didn't produce results. */
+                Json evt;
+                evt["type"] = "update";
+                evt["event_type"] = "transcript.final";
+                evt["finalized"] = true;
+                evt["text"] = text;
+                evt["stable_text"] = stable_text;
+                if (!writer(BuildSseData(evt.dump()))) break;
+
+                /* Phase 2: wait for retranscription (up to 60s) */
+                RT_LOG("SSE sid=%s entering reconcile wait (60s timeout)", session_id.c_str());
+                {
+                    std::unique_lock<std::mutex> rl(session->mu);
+                    session->sse_cv.wait_for(rl,
+                        std::chrono::milliseconds(kReconcileTimeoutMs),
+                        [&] { return session->reconcile_ready; });
+                    const bool ready = session->reconcile_ready;
+                    const std::string rtext = session->reconcile_text;
+                    rl.unlock();
+
+                    if (ready && !rtext.empty()) {
+                        RT_LOG("SSE sid=%s reconcile received: %s",
+                               session_id.c_str(), rtext.c_str());
+                        Json rev;
+                        rev["type"] = "update";
+                        Json rsegs = Json::array();
+                        rsegs.push_back(rtext);
+                        rev["new_segments"] = rsegs;
+                        rev["new_segment_count"] = 1;
+                        rev["text"] = rtext;
+                        rev["stable_text"] = rtext;
+                        rev["event_type"] = "transcript.final";
+                        rev["reconciled"] = true;
+                        rev["finalized"] = true;
+                        rev["revised"] = session->reconcile_revised;
+                        if (qwen_verbose >= 1) {
+                            std::fprintf(stderr,
+                                "SSE-push sid=%s: reconcile result: %s\n",
+                                session_id.c_str(), rtext.c_str());
+                        }
+                        writer(BuildSseData(rev.dump()));
+                    } else {
+                        RT_LOG("SSE sid=%s reconcile timeout or empty", session_id.c_str());
+                    }
+                }
                 writer("data: [DONE]\n\n");
                 break;
             }
+
+        /* ── Partial / live text push (no new candidates or segments) ── */
+            if (cur_partial_version != last_partial_version) {
+                session->sse_last_segment_count = cur_segment_count;
+                const std::string live_stable = session->display_snapshot.live_stable_text;
+                const std::string live_partial = session->display_snapshot.live_partial_text;
+                const std::string live_text = session->display_snapshot.live_text;
+                const double inf_ms = session->last_inference_ms;
+                const std::size_t total_samples = session->total_samples;
+                last_partial_version = cur_partial_version;
+                lock.unlock();
+
+                Json pev;
+                pev["type"] = "update";
+                pev["partial_version"] = cur_partial_version;
+                pev["live_stable_text"] = live_stable;
+                pev["live_partial_text"] = live_partial;
+                pev["live_text"] = live_text;
+                pev["last_inference_ms"] = inf_ms;
+                pev["total_samples"] = total_samples;
+                if (!writer(BuildSseData(pev.dump()))) break;
+                continue;
+            }
+
+            /* Heartbeat — no new data, just keep the connection alive. */
+            session->sse_last_segment_count = cur_segment_count;
+            lock.unlock();
         }
     });
 
