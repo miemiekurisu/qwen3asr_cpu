@@ -410,7 +410,7 @@ textarea {
   grid-template-columns: 80px 1fr 80px;
   gap: 8px;
   padding: 6px 12px;
-  font-size: 13px;
+  font-size: 16px;
   border-bottom: 1px solid var(--line);
   align-items: center;
 }
@@ -506,7 +506,7 @@ textarea {
   background: #172029;
   color: #f8fafc;
   font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
-  font-size: 14px;
+  font-size: 17px;
   line-height: 1.6;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -517,6 +517,7 @@ textarea {
 }
 
 .output .partial {
+  font-size: 13px;
   color: #93c5fd;
   text-decoration: underline dotted rgba(147, 197, 253, 0.6);
   text-underline-offset: 4px;
@@ -621,4 +622,63 @@ textarea {
   .card-grid {
     grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
   }
+}
+
+/* ── Translation toolbar ── */
+.translation-toolbar {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: end;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.field.compact {
+  min-width: 150px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.field.compact span {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.field.compact select {
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 13px;
+  background: #fff;
+  color: var(--ink);
+}
+
+/* ── Translation text in transcript panel ── */
+.translation-original {
+  line-height: 1.45;
+}
+
+.translation-text {
+  margin-top: 4px;
+  padding-left: 10px;
+  border-left: 3px solid rgba(14, 116, 144, 0.35);
+  color: var(--accent-strong);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.translation-pending {
+  color: var(--muted);
+  font-size: 15px;
+  font-style: italic;
+}
+
+.translation-error {
+  color: var(--warn);
+  font-size: 15px;
 }

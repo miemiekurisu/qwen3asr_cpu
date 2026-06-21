@@ -57,15 +57,39 @@
         <div class="term-line cursor"><span class="cursor-blink">▌</span></div>
       </div>
 
+     <!-- Translation toolbar -->
+       <div class="translation-toolbar" id="translationToolbar">
+        <label class="field compact">
+          源语言
+          <select id="translationSourceLang">
+            <option value="auto" selected>自动</option>
+            <option value="zh-Hans">中文</option>
+            <option value="en">English</option>
+            <option value="ja">日本語</option>
+            <option value="de">Deutsch</option>
+          </select>
+        </label>
+        <label class="field compact">
+          目标语言
+          <select id="translationTargetLang">
+            <option value="en" selected>English</option>
+            <option value="zh-Hans">中文</option>
+            <option value="ja">日本語</option>
+            <option value="de">Deutsch</option>
+          </select>
+        </label>
+        <span id="translationStatus" class="hint">翻译：未检测</span>
+      </div>
+
       <!-- Transcript Panel: full merged text (confirmed + candidates) -->
-      <div class="transcript-container" id="transcriptContainer">
+       <div class="transcript-container" id="transcriptContainer">
         <div class="transcript-header">
           <span class="col-time">时间</span>
           <span class="col-text">全文</span>
           <span class="col-status">状态</span>
         </div>
         <div class="transcript-body" id="transcriptBody"></div>
-      </div>
+       </div>
     </section>
 
     <!-- ═══════════ 4. Domain Prompt / Glossary ═══════════ -->

@@ -362,6 +362,28 @@ check_port_free() {
 }
 
 do_start() {
+    # Generate runtime config for translation (and future frontend configs).
+    # This file is .gitignored and regenerated each launch.
+    {
+        local trans_enable="${QASR_TRANSLATION_ENABLE:-1}"
+        local trans_endpoint="${QASR_TRANSLATION_ENDPOINT:-http://127.0.0.1:8989}"
+        local trans_source="${QASR_TRANSLATION_SOURCE_LANG:-auto}"
+        local trans_target="${QASR_TRANSLATION_TARGET_LANG:-en}"
+        local trans_timeout="${QASR_TRANSLATION_TIMEOUT_MS:-3000}"
+        cat > "${UI_DIR}/config.runtime.js" <<EOFJS
+window.QASR_RUNTIME_CONFIG = {
+  translation: {
+    enabled: ${trans_enable},
+    provider: "mtranserver",
+    endpoint: "${trans_endpoint}",
+    sourceLang: "${trans_source}",
+    targetLang: "${trans_target}",
+    timeoutMs: ${trans_timeout}
+  }
+};
+EOFJS
+    }
+
     log_step "启动参数"
     log_info "binary:  $BUILD_DIR/qasr_server"
     log_info "model:   $MODEL_DIR"

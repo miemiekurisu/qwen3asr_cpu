@@ -82,3 +82,5 @@ docs/ARCHITECTURE.md
 docs/AUDIT_C1.md
 docs/INCIDENTS.md
 docs/SECURITY.md
+ui/config.runtime.js
+docs-internal/

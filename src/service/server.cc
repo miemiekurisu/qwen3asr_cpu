@@ -42,6 +42,10 @@
 #include <windows.h>
 #endif
 
+#ifdef QASR_CURL_AVAILABLE
+#include <curl/curl.h>
+#endif
+
 #ifdef QASR_CPU_BACKEND_ENABLED
 extern "C" {
 #include "qwen_asr.h"
@@ -1967,6 +1971,42 @@ struct QwenVadDeleter {
 };
 
 using QwenVadPtr = std::unique_ptr<qwen_silero_vad_t, QwenVadDeleter>;
+
+/* Server-level VAD instance for ASR worker audio cutting.
+ * This is a separate instance from the facade VADs so that cutting
+ * operations don't pollute the facade's LSTM state.  Protected by
+ * its own mutex to prevent cross-session state corruption. */
+static QwenVadPtr g_cut_vad;
+static std::mutex g_cut_vad_mutex;
+
+/* Find first speech onset in [start_offset, end_offset) using the
+ * shared cut VAD.  Returns the sample offset of the first speech
+ * frame, or start_offset if no speech is found.
+ *
+ * Thread-safe: caller must NOT hold g_cut_vad_mutex.
+ * Each call resets the VAD state so sessions don't interfere. */
+static int VadFindSpeechOnset(const float * samples,
+                              int start_offset, int end_offset) {
+    std::lock_guard<std::mutex> lock(g_cut_vad_mutex);
+    qwen_silero_vad_t * v = g_cut_vad.get();
+    if (!v || !qwen_silero_vad_is_active(v)) return start_offset;
+
+    /* Reset to clean state — each cut is independent. */
+    qwen_silero_vad_reset(v);
+    const int VAD_FRAME = 512;
+    int result = start_offset;
+    for (int off = (start_offset / VAD_FRAME) * VAD_FRAME;
+         off + VAD_FRAME <= end_offset;
+         off += VAD_FRAME) {
+        float prob = 0;
+        if (qwen_silero_vad_process(v, samples + off, VAD_FRAME, &prob) == 0
+            && prob > 0.5f) {
+            result = off;
+            break;
+        }
+    }
+    return result;
+}
 
 /* The realtime session's worker is now a 2-thread producer-consumer
  * pair instead of the old single-thread "VAD+ASR tight loop".  Each
@@ -3965,6 +4005,23 @@ int RunServer(const ServerConfig & config) {
         // share_model removed: single facade handles both paths
     }
 
+    /* Initialize server-level cut VAD for ASR worker audio boundary
+     * detection.  This is a separate instance from the facade/session
+     * VADs so that cutting operations don't interfere with VAD facade
+     * state.  The cut VAD is protected by g_cut_vad_mutex. */
+    g_cut_vad.reset(qwen_silero_vad_create(nullptr));
+    if (g_cut_vad && qwen_silero_vad_is_active(g_cut_vad.get())) {
+        qwen_silero_vad_reset(g_cut_vad.get());
+        if (qwen_verbose >= 1) {
+            std::fprintf(stderr, "cut-vad: server-level VAD created for audio cutting\n");
+        }
+    } else {
+        g_cut_vad.reset();
+        if (qwen_verbose >= 1) {
+            std::fprintf(stderr, "cut-vad: unavailable, falling back to fixed-tail cutting\n");
+        }
+    }
+
     const std::string served_model_id = ResolveServedModelId(config.model_dir);
     const fs::path ui_dir(config.ui_dir);
     const RealtimePolicyConfig realtime_policy;
@@ -4206,7 +4263,7 @@ int RunServer(const ServerConfig & config) {
      * This avoids cutting directly inside active speech.
      *
      * (adjusted to 5s per user request for CUDA low-latency) */
-    constexpr int kVadSegmentSoftDeadlineSamples = 15 * 16000;
+    constexpr int kVadSegmentSoftDeadlineSamples = 5 * 16000;
     constexpr int kVadSegmentSoftGraceMs = 800;
     constexpr int kVadSegmentHardCapSamples =
         kVadSegmentSoftDeadlineSamples +
@@ -5091,7 +5148,7 @@ int RunServer(const ServerConfig & config) {
                         grace_wait_ms >= kVadSegmentSoftGraceMs;
 
                     const bool should_emit_softcap =
-                        valley_cut || grace_expired || buf_hard_cap;
+                         valley_cut || grace_expired || buf_hard_cap;
 
                     if (should_emit_softcap) {
                         const char * reason =
@@ -5420,50 +5477,52 @@ int RunServer(const ServerConfig & config) {
            * is confirmed immediately.  The tail "哦，yes, I'm fine. Aside from"
            * is carried to the next segment for re-decode with more context. */
           if (!asr_text.empty()) {
-              if (qwen_verbose >= 1) {
-                  std::fprintf(stderr,
-                               "ASR-worker: segment #%d text=%s\n",
-                               (int)session->segments_text.size() + 1, asr_text.c_str());
-              }
                std::lock_guard<std::mutex> lock(session->mu);
                if (!asr_text.empty()) {
-                   /* Strip accumulated prefix from previous segments.
-                    * When the model re-decodes a segment with tail prepend,
-                    * it may reinterpret the prefix (e.g. "几日未见"→"今日未见"
-                    * for the same audio).  In that case the exact prefix
-                    * match fails.  Fall back to the longest common prefix
-                    * to avoid duplicating old text as a new segment. */
-                   std::string segment_text = asr_text;
-                   const std::string & prev_text = session->text;
-                   if (!prev_text.empty() && asr_text.size() > prev_text.size()) {
-                       if (asr_text.compare(0, prev_text.size(), prev_text) == 0) {
-                           /* Exact prefix match — happy path. */
-                           segment_text = asr_text.substr(prev_text.size());
-                        } else {
-                            /* Prefix diverged — find longest common prefix. */
-                            std::size_t common = 0;
-                            while (common < prev_text.size() && common < asr_text.size() &&
-                                   asr_text[common] == prev_text[common]) {
-                                ++common;
-                            }
-                            /* Rewind to valid UTF-8 character boundary to avoid
-                             * producing a string starting with continuation bytes. */
-                            while (common > 0 && common < asr_text.size() &&
-                                   (static_cast<unsigned char>(asr_text[common]) & 0xC0) == 0x80) {
-                                --common;
-                            }
-                            segment_text = asr_text.substr(common);
-                        }
-                       while (!segment_text.empty()) {
-                          std::size_t trim_len = TrimLeadingCharLen(segment_text);
-                          if (trim_len == 0) break;
-                          segment_text.erase(0, trim_len);
-                      }
-                   }
- 
-                   /* If segment_text is empty after trimming, skip processing.
-                     * This can happen when the ASR model returns only previously-
-                     * confirmed text (no new content). */
+                   RT_LOG("AsrWorkerLoop sid=%s seq=%lu asr_text=%s "
+                          "segments_text_count=%zu",
+                          session->id.c_str(),
+                          static_cast<unsigned long>(seg.seq),
+                          asr_text.c_str(),
+                          session->segments_text.size());
+                    /* Build combined prefix: confirmed segments + last candidate
+                       * text (if any).  When tail audio is prepended, the model
+                       * re-outputs everything it heard, including the portion
+                       * that was a candidate in the previous segment.  We need
+                       * to strip that portion to get only the new text. */
+                     std::string segment_text = asr_text;
+                     /* When tail audio is prepended, the model re-outputs
+                      * everything it heard.  The re-outputed text may differ
+                      * slightly from candidates due to model reinterpretation
+                      * (e.g. "了，最近。" → "最近，").  Therefore, we search
+                      * for the last candidate text WITHIN the asr_text and
+                      * strip everything up to and including its end.  This
+                      * gives us only the new portion that corresponds to the
+                      * fresh audio beyond the tail. */
+                     if (!session->candidates.empty()) {
+                         const std::string & last_cand =
+                             session->candidates.back();
+                         std::size_t pos = asr_text.find(last_cand);
+                         if (pos != std::string::npos) {
+                             /* Found last candidate within asr_text — strip
+                              * everything up to and including the match. */
+                             segment_text = asr_text.substr(
+                                 pos + last_cand.size());
+                             while (!segment_text.empty()) {
+                                 std::size_t trim_len =
+                                     TrimLeadingCharLen(segment_text);
+                                 if (trim_len == 0) break;
+                                 segment_text.erase(0, trim_len);
+                             }
+                             RT_LOG("AsrWorkerLoop sid=%s seq=%lu candidate-strip "
+                                    "found at pos=%zu len=%zu → remaining=%s",
+                                    session->id.c_str(),
+                                    static_cast<unsigned long>(seg.seq),
+                                    pos, last_cand.size(),
+                                    segment_text.c_str());
+                         }
+                     }
+
                     if (segment_text.empty()) {
                        RT_LOG("AsrWorkerLoop sid=%s seq=%lu empty segment after trim, skipping",
                               session->id.c_str(),
@@ -5476,59 +5535,73 @@ int RunServer(const ServerConfig & config) {
                         int n_samples = static_cast<int>(seg.samples.size());
 
                     if (boundary > 0) {
-                        /* Mid-text boundary found → commit everything before it
-                         * and carry the tail (audio + text) to the next segment.
-                         * This follows the user's state machine rules:
-                         * 1. Punctuation IN the sentence → commit.
-                         * 2. Cut audio proportionally, tail goes to next segment.
-                         * 3. Repeat when new punctuation appears. */
-                        double ratio = static_cast<double>(boundary) /
-                                       static_cast<double>(segment_text.size());
-                        ratio = std::max(0.10, std::min(0.95, ratio));
-                        int cut_samples = static_cast<int>(n_samples * ratio);
-
-                        /* Commit confirmed text (before boundary). */
+                        /* Extract confirmed text before boundary. */
                         std::string confirmed_text = segment_text.substr(0, boundary);
+                        /* Strip trailing whitespace. */
                         while (!confirmed_text.empty() &&
                                (confirmed_text.back() == ' ' ||
                                 confirmed_text.back() == '\n' ||
                                 confirmed_text.back() == '\t')) {
                             confirmed_text.pop_back();
                         }
-                        if (!confirmed_text.empty()) {
+                        /* Strip leading terminal punctuation from tail residue.
+                         * When tail audio is prepended, the model may output the
+                         * previous segment's ending punctuation at the start. */
+                        /* Guard: if confirmed text is too short (< 3 CJK chars
+                         * or < 9 raw bytes), it's likely a false boundary from
+                         * tail residue.  Don't commit — fall through to
+                         * candidates path for merge-redecode. */
+                        if (confirmed_text.size() < 9) {
+                            RT_LOG("AsrWorkerLoop sid=%s seq=%lu skip-commit=%s "
+                                   "(too short, %zu bytes, likely tail residue)",
+                                   session->id.c_str(),
+                                   static_cast<unsigned long>(seg.seq),
+                                   confirmed_text.c_str(), confirmed_text.size());
+                            session->candidates.push_back(segment_text);
+                            session->tail_audio.assign(
+                                seg.samples.begin(), seg.samples.end());
+                        } else {
+                          /* Cut at text ratio — full tail for stop drain.
+                              * candidate-strip handles dedup on next decode. */
+                             double ratio = static_cast<double>(boundary) /
+                                            static_cast<double>(segment_text.size());
+                             ratio = std::max(0.15, std::min(0.90, ratio));
+                             int cut_samples = static_cast<int>(n_samples * ratio);
+
                             session->segment_cumulative_samples += cut_samples;
                             session->segments_sample_positions.push_back(
                                 session->segment_cumulative_samples);
                             session->segments_text.push_back(confirmed_text);
-                            RT_LOG("AsrWorkerLoop sid=%s seq=%lu confirmed=%s (boundary=%zu cut=%d/%d)",
+                            /* Clear superseded candidates — their audio has been
+                             * covered by this confirmed segment, so they would
+                             * create duplicates if pushed to the UI. */
+                            session->candidates.clear();
+                            RT_LOG("AsrWorkerLoop sid=%s seq=%lu confirmed=%s (boundary=%zu cut=%d/%d tail=%.2fs)",
                                    session->id.c_str(),
                                    static_cast<unsigned long>(seg.seq),
                                    confirmed_text.c_str(),
-                                   boundary, cut_samples, n_samples);
-                        }
+                                   boundary, cut_samples, n_samples,
+                                     (n_samples - cut_samples) / 16000.0);
 
-                       /* Carry tail audio for next segment re-decode. */
-                         if (cut_samples < n_samples) {
-                             session->tail_audio.assign(
-                                 seg.samples.begin() + cut_samples,
-                                 seg.samples.end());
-                             RT_LOG("AsrWorkerLoop sid=%s tail_carry=%d samples (%.2fs)",
-                                    session->id.c_str(),
-                                    n_samples - cut_samples,
-                                    (n_samples - cut_samples) / 16000.0);
-                         }
-                         /* Track uncommitted tail text so that if this is
-                          * the last segment (eof_stop), the tail doesn't get
-                          * silently dropped — force-finalize pushes it. */
-                         {
-                             session->tail_text = segment_text.substr(boundary);
-                             while (!session->tail_text.empty() &&
-                                    (session->tail_text.front() == ' ' ||
-                                     session->tail_text.front() == '\n' ||
-                                     session->tail_text.front() == '\t')) {
-                                 session->tail_text.erase(session->tail_text.begin());
-                             }
-                         }
+                            if (cut_samples < n_samples) {
+                                session->tail_audio.assign(
+                                    seg.samples.begin() + cut_samples,
+                                    seg.samples.end());
+                                RT_LOG("AsrWorkerLoop sid=%s tail_carry=%d samples (%.2fs)",
+                                       session->id.c_str(),
+                                       n_samples - cut_samples,
+                                       (n_samples - cut_samples) / 16000.0);
+                            }
+                            {
+                                session->tail_text = segment_text.substr(boundary);
+                                while (!session->tail_text.empty() &&
+                                       (session->tail_text.front() == ' ' ||
+                                        session->tail_text.front() == '\n' ||
+                                        session->tail_text.front() == '\t')) {
+                                    session->tail_text.erase(session->tail_text.begin());
+                                }
+                            }
+                        }
                     } else {
                         /* No mid-text boundary.  Two sub-cases:
                          *
@@ -5542,27 +5615,26 @@ int RunServer(const ServerConfig & config) {
                          *    → candidates, cut at 0%, carry FULL audio as tail.
                          *      Text is uncertain; next segment needs full
                          *      acoustic context for re-decode. */
-                        if (EndsWithBoundary(segment_text)) {
-                             session->segment_cumulative_samples += n_samples;
-                             session->candidates.push_back(segment_text);
-                             session->tail_audio.clear();
-                            RT_LOG("AsrWorkerLoop sid=%s seq=%lu candidate+no-tail=%s "
-                                   "(boundary at end)",
-                                   session->id.c_str(),
-                                   static_cast<unsigned long>(seg.seq),
-                                   segment_text.c_str());
-                      } else {
-                             session->segment_cumulative_samples += n_samples;
-                             session->candidates.push_back(segment_text);
-                             session->tail_audio.assign(
-                                 seg.samples.begin(), seg.samples.end());
-                            RT_LOG("AsrWorkerLoop sid=%s seq=%lu candidate+full-tail=%s "
-                                   "tail=%.2fs",
-                                   session->id.c_str(),
-                                   static_cast<unsigned long>(seg.seq),
-                                   segment_text.c_str(),
-                                   seg.samples.size() / 16000.0);
-                        }
+                       /* No mid-text boundary — push to candidates and carry
+                          * FULL audio as tail for next-segment merge-redecode.
+                          * This applies whether text ends with punctuation or not:
+                          * the next VAD segment needs the full acoustic context so
+                          * the model can re-organize across segment boundaries.
+                          * NOTE: do NOT increment segment_cumulative_samples here
+                          * since this audio is unconfirmed — it will be counted
+                          * when the merged segment eventually produces a confirmed
+                          * boundary. */
+                        session->candidates.push_back(segment_text);
+                       session->tail_audio.assign(
+                           seg.samples.begin(), seg.samples.end());
+                       const char *tag = EndsWithBoundary(segment_text)
+                                            ? "candidate+full-tail"
+                                            : "candidate+full-tail";
+                       RT_LOG("AsrWorkerLoop sid=%s seq=%lu %s=%s tail=%.2fs",
+                              session->id.c_str(),
+                              static_cast<unsigned long>(seg.seq),
+                              tag, segment_text.c_str(),
+                              seg.samples.size() / 16000.0);
                     }
                     } /* end: segment_text not empty */
 
@@ -5589,46 +5661,132 @@ int RunServer(const ServerConfig & config) {
           }
       }
 
-     /* Finalize: mark the session state so the UI knows this
-           * is the last text, and free the per-session clone. */
-          {
-              std::lock_guard<std::mutex> lock(session->mu);
-              if (session->error.empty()) {
-                  ApplyStableRealtimeCommit(session->total_samples,
-                                            session->stable_text,
-                                            session->last_inference_ms,
-                                            true, session.get());
-              }
-              /* P1: force-finalize any candidates that didn't get finalized
-                  * by the two-pass finalizer.  Only push candidates whose index
-                  * hasn't been covered by a finalized segment. */
-               std::size_t n_finalized = session->segments_text.size();
-               for (std::size_t i = n_finalized; i < session->candidates.size(); ++i) {
-                   session->segments_text.push_back(session->candidates[i]);
-                   session->segments_sample_positions.push_back(
-                       session->segment_cumulative_samples);
-               }
-              session->candidates.clear();
-               /* Push uncommitted tail text from the last mid-text boundary
-                * case.  When this was the final segment (eof_stop), the tail
-                * audio had no next segment to re-decode, but the ASR already
-                * produced the full text — so push the tail portion now. */
-               if (!session->tail_text.empty()) {
-                   session->segments_text.push_back(session->tail_text);
-                   session->segments_sample_positions.push_back(
-                       session->segment_cumulative_samples);
-                   session->tail_text.clear();
-                   RT_LOG("AsrWorkerLoop sid=%s finalize_tail_text=%s",
-                          session->id.c_str(),
-                          session->segments_text.back().c_str());
-               }
+    /* Drain remaining tail audio after stop: decode once and push the
+         * entire result as a single segment.  No boundary splitting, no
+         * loop — just finalize the last portion of audio. */
+       {
+           std::vector<float> drain_audio;
+           {
+               std::lock_guard<std::mutex> lock(session->mu);
+               drain_audio = session->tail_audio;
                session->tail_audio.clear();
-              session->finalized = true;
-              /* Final wake — SSE will see finalized=true and close
-               * the stream with data: [DONE]. */
-              session->sse_cv.notify_all();
-              session->worker_done = true;
-          }
+           }
+           if (!drain_audio.empty()) {
+               std::string drain_text;
+               int n_drain = static_cast<int>(drain_audio.size());
+
+               if (gpuPipeline && facade) {
+                   GpuScheduler * sched = facade->scheduler();
+                   if (sched) {
+                       SegmentJob job;
+                       job.session_id = static_cast<std::uint64_t>(
+                           reinterpret_cast<std::uintptr_t>(session.get()));
+                       job.segment_id = 0;
+                       job.samples = drain_audio;
+                       job.sample_rate = 16000;
+                       job.realtime = true;
+                       job.language = forced_language;
+                       job.prompt = "";
+                       job.engine_session_id = gpuSessionId;
+                       job.enqueue_time = std::chrono::steady_clock::now();
+                       SegmentResult res = sched->SubmitAndAwait(job);
+                       if (res.status.ok()) drain_text = res.text;
+                   } else if (gpuSessionId) {
+                       AsrEngine * eng = facade->engine();
+                       AsrSegmentResult segRes = eng->TranscribeSegment(
+                           gpuSessionId, drain_audio, 16000);
+                       if (segRes.status.ok()) drain_text = segRes.text;
+                   }
+               } else if (live_ctx) {
+                   char * raw = qwen_transcribe_audio(
+                       live_ctx, drain_audio.data(), n_drain);
+                   if (raw != nullptr) {
+                       drain_text.assign(raw);
+                       std::free(raw);
+                       while (!drain_text.empty() &&
+                              (drain_text.back() == ' ' ||
+                               drain_text.back() == '\n' ||
+                               drain_text.back() == '\t')) {
+                           drain_text.pop_back();
+                       }
+                   }
+               }
+
+               if (!drain_text.empty()) {
+                   std::lock_guard<std::mutex> lock(session->mu);
+                   /* Drain covers everything remaining — clear tail_text
+                    * to prevent the finalize block from duplicating it. */
+                   session->tail_text.clear();
+                   std::string seg_text = drain_text;
+
+                   /* Strip confirmed prefix. */
+                   std::string cp;
+                   for (const auto & s : session->segments_text) cp += s;
+                   if (!cp.empty() && seg_text.size() > cp.size()) {
+                       seg_text = seg_text.substr(cp.size());
+                       while (!seg_text.empty()) {
+                           std::size_t tl = TrimLeadingCharLen(seg_text);
+                           if (tl == 0) break;
+                           seg_text.erase(0, tl);
+                       }
+                   }
+
+                   if (!seg_text.empty()) {
+                       session->segment_cumulative_samples += n_drain;
+                       session->segments_sample_positions.push_back(
+                           session->segment_cumulative_samples);
+                       session->segments_text.push_back(seg_text);
+                       RT_LOG("AsrWorkerLoop sid=%s drain-final=%s (audio=%.2fs)",
+                               session->id.c_str(), seg_text.c_str(),
+                               n_drain / 16000.0);
+                       session->candidates.clear(); /* drain covered everything */
+                   }
+               } else {
+                   /* Even with no drain_text, clear stale tail_text. */
+                   std::lock_guard<std::mutex> lock(session->mu);
+                   session->tail_text.clear();
+               }
+           }
+       }
+       /* Wake SSE so UI receives the drain-final segment. */
+       session->sse_cv.notify_all();
+
+      /* Finalize: mark the session state so the UI knows this
+            * is the last text, and free the per-session clone. */
+       {
+           std::lock_guard<std::mutex> lock(session->mu);
+           if (session->error.empty()) {
+               ApplyStableRealtimeCommit(session->total_samples,
+                                         session->stable_text,
+                                         session->last_inference_ms,
+                                         true, session.get());
+           }
+           /* Push any remaining tail text. */
+           if (!session->tail_text.empty()) {
+               session->segments_text.push_back(session->tail_text);
+               session->segments_sample_positions.push_back(
+                   session->segment_cumulative_samples);
+               session->tail_text.clear();
+               RT_LOG("AsrWorkerLoop sid=%s finalize_tail_text=%s",
+                      session->id.c_str(),
+                      session->segments_text.back().c_str());
+           }
+          session->tail_audio.clear();
+            /* Force-finalize remaining candidates — they represent the last
+             * uncommitted text that the drain didn't cover (e.g. when drain
+             * text was empty or fully overlapped with confirmed prefix). */
+            for (const auto & s : session->candidates) {
+                session->segments_sample_positions.push_back(
+                    session->segment_cumulative_samples);
+                session->segments_text.push_back(s);
+                RT_LOG("AsrWorkerLoop sid=%s finalize-candidate=%s",
+                       session->id.c_str(), s.c_str());
+            }
+            session->candidates.clear();
+            session->finalized = true;
+           session->sse_cv.notify_all();
+           session->worker_done = true;
+       }
         if (live_ctx) qwen_free(live_ctx);
         if (gpuPipeline && facade && gpuSessionId) {
             facade->engine()->CloseSession(gpuSessionId);
@@ -6849,9 +7007,93 @@ int RunServer(const ServerConfig & config) {
             SetErrorResponse(response, status, StatusToHttpCode(status));
             return;
         }
-        Json body = BuildRealtimeJson(session, true, true);
-        SetJsonResponse(response, body);
-    });
+    Json body = BuildRealtimeJson(session, true, true);
+         SetJsonResponse(response, body);
+     });
+
+     /* Translation proxy: browser calls this as same-origin, server
+      * forwards to the configured MTranServer endpoint (which may be
+      * on a different port or unreachable from the browser due to CORS
+      * or mixed-content restrictions). */
+     server.Post("/api/translation/translate",
+         [&](const HttpRequest & request, HttpResponse & response) {
+#ifdef QASR_CURL_AVAILABLE
+         /* Read translation endpoint from env, fallback to default. */
+         const char * env_endpoint = std::getenv("QASR_TRANSLATION_ENDPOINT");
+         const std::string endpoint = env_endpoint ? env_endpoint : "http://127.0.0.1:8989/translate";
+
+         /* Parse request body. */
+         const std::string & body = request.body;
+         if (body.empty()) {
+             SetErrorResponse(response, Status(StatusCode::kInvalidArgument, "request body required"), 400);
+             return;
+         }
+
+         /* Build full URL: endpoint may or may not have trailing path. */
+         std::string url = endpoint;
+         if (!url.empty() && url.back() != '/') {
+             url += "/";
+         }
+         /* Append /translate if not already present. */
+         if (url.find("/translate") == std::string::npos) {
+             url += "translate";
+         }
+
+         CURL * curl = curl_easy_init();
+         if (!curl) {
+             SetErrorResponse(response, Status(StatusCode::kInternal, "curl init failed"), 500);
+             return;
+         }
+
+         std::string resp_body;
+         long http_code = 0;
+         {
+             /* curl write callback must be C-linkage. */
+             struct CurlWriteData { std::string * out; };
+             CurlWriteData wdata;
+             wdata.out = &resp_body;
+
+             curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+             curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
+             curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+                 +[](char * ptr, size_t size, size_t nmemb, void * userdata) -> size_t {
+                     CurlWriteData * wd = static_cast<CurlWriteData *>(userdata);
+                     wd->out->append(ptr, size * nmemb);
+                     return size * nmemb;
+                 });
+             curl_easy_setopt(curl, CURLOPT_WRITEDATA, &wdata);
+             struct curl_slist * headers = nullptr;
+             headers = curl_slist_append(headers, "Content-Type: application/json");
+             curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+             curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+             CURLcode res = curl_easy_perform(curl);
+             if (res != CURLE_OK) {
+         curl_slist_free_all(headers);
+             curl_easy_cleanup(curl);
+                 SetErrorResponse(response,
+                     Status(StatusCode::kInternal, std::string("curl error: ") + curl_easy_strerror(res)),
+                     502);
+                 return;
+             }
+             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+         }
+         curl_easy_cleanup(curl);
+
+         if (http_code < 200 || http_code >= 300) {
+             SetErrorResponse(response,
+                 Status(StatusCode::kInternal,
+                     std::string("translation upstream returned ") + std::to_string(http_code) + ": " + resp_body),
+                 502);
+             return;
+         }
+
+         /* Pass through the response as JSON. */
+         response.set_content(resp_body, "application/json");
+#else
+         SetErrorResponse(response, Status(StatusCode::kInternal, "translation proxy not available (curl not found)"), 501);
+#endif
+     });
 
     server.Post("/api/realtime/eof", [&](const HttpRequest & request, HttpResponse & response) {
         if (!request.has_param("session_id")) {

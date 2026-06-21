@@ -15,7 +15,8 @@ Qwen3-ASR 的 CPU + GPU 推理服务与命令行工具，使用 C/C++17 实现�
 - **离线转写**: 单文件音频 → 文本 / SRT / VTT / JSON
 - **HTTP API**: OpenAI 兼容 `/v1/audio/transcriptions`、Chat `/v1/chat/completions`、异步 `/api/transcriptions/async`
 - **实时转写**: WebSocket `/api/realtime`、SSE 流式输出、VAD 分段
-- **Web UI**: 内置浏览器界面，支持离线/实时转写、词汇表、导出
+- **实时翻译 (POC)**: 每段 ASR 结果自动翻译，集成 MTranServer 侧车服务
+- **Web UI**: 内置浏览器界面，支持离线/实时转写、实时翻译、词汇表、导出
 - **字幕对齐**: 使用 Qwen3-ForcedAligner 生成词级时间戳
 - **流式分段**: 长音频流式推理，分段输出
 - **VAD 段式批量**: Silero VAD 自动分段 + 静音检测 + softcap 截止
@@ -84,6 +85,25 @@ scripts/run_linux_server.sh --detach --https --backend cuda  # GPU 后端
 scripts/run_linux_server.sh --status                     # 健康检查
 scripts/run_linux_server.sh --stop                       # 停止
 ```
+
+### 实时翻译 (POC)
+
+Web UI 支持将每段 ASR 结果通过 MTranServer 翻译为目标语言。
+
+**前置条件**: 本地运行 MTranServer 实例（端口默认 8989）。
+
+```bash
+# 环境变量配置（可选）
+export QASR_TRANSLATION_ENDPOINT=http://127.0.0.1:8989  # 翻译服务地址
+export QASR_TRANSLATION_SOURCE_LANG=auto                  # 源语言
+export QASR_TRANSLATION_TARGET_LANG=en                    # 目标语言
+export QASR_TRANSLATION_TIMEOUT_MS=3000                   # 翻译超时(ms)
+```
+
+> ⚠️ 翻译功能为 POC，临时集成 MTranServer 独立服务。后续计划完善翻译管线：
+> - 支持更多翻译后端（本地模型、云端 API）
+> - 翻译结果缓存与批量处理
+> - Windows / Apple Silicon 平台对齐
 
 ### CLI 转写
 

@@ -26,8 +26,12 @@
   var meterPost = document.getElementById('meterPost');
   var meterSrv = document.getElementById('meterSrv');
  // New elements
-   var liveCaption = document.getElementById('liveCaption');
-  var transcriptBody = document.getElementById('transcriptBody');
+    var liveCaption = document.getElementById('liveCaption');
+   var transcriptBody = document.getElementById('transcriptBody');
+  // Translation elements
+  var translationSourceLang = document.getElementById('translationSourceLang');
+  var translationTargetLang = document.getElementById('translationTargetLang');
+  var translationStatus = document.getElementById('translationStatus');
   var domainSelect = document.getElementById('domainSelect');
   var styleSelect = document.getElementById('styleSelect');
   var glossaryBody = document.getElementById('glossaryBody');
@@ -40,6 +44,28 @@
   var realtimeState = QasrState.createRealtimeState();
   var archiveState = QasrState.createArchiveState();
   var glossaryState = QasrState.createGlossaryState();
+
+  // ───── Translation State ─────
+  var runtimeConfig = window.QASR_RUNTIME_CONFIG || {};
+  var translationConfig = runtimeConfig.translation || {};
+  var translationState = {
+    enabled: translationConfig.enabled !== false,
+    endpoint:
+      translationConfig.endpoint ||
+      localStorage.getItem('qasrTranslationEndpoint') ||
+      'http://127.0.0.1:8989',
+    sourceLang:
+      translationConfig.sourceLang ||
+      localStorage.getItem('qasrTranslationSourceLang') ||
+      'auto',
+    targetLang:
+      translationConfig.targetLang ||
+      localStorage.getItem('qasrTranslationTargetLang') ||
+      'en',
+    timeoutMs: translationConfig.timeoutMs || 3000,
+    byIndex: {},
+    pending: {},
+  };
 
   // Terminal archive (kept for backward compat with terminal.js)
   var terminalArchive = {
@@ -83,15 +109,44 @@
       segmentSamples = data.segmentSamples;
     }
     var isFinalSession = data && (data.finalized || data.event_type === 'transcript.final');
-    /* Each committed segment is a separate row with timestamp from
-     * real audio sample position (tracked per-segment at SSE receive time). */
-    for (var j = 0; j < segments.length; j++) {
+  /* Each committed segment is a separate row with timestamp from
+      * real audio sample position (tracked per-segment at SSE receive time).
+      * Render in reverse chronological order: latest segment first. */
+    for (var j = segments.length - 1; j >= 0; j--) {
       var samplePos = segmentSamples[j] || 0;
       var ts = QasrState.msToTimestamp(samplePos * 1000 / sampleRate);
+
+      /* Build text column: original + translation (if available). */
+      var tr = translationState.byIndex[j];
+      var textHtml = '';
+      textHtml += '<div class="translation-original">' + escapeHtml(segments[j]) + '</div>';
+
+      var statusText = '已确认';
+      var statusClass = 'status-done';
+
+      if (tr && tr.ok) {
+        textHtml += '<div class="translation-text">'
+          + escapeHtml(tr.target || '')
+          + ': '
+          + escapeHtml(tr.text || '')
+          + '</div>';
+        statusText = '已翻译';
+      } else if (tr && !tr.ok) {
+        textHtml += '<div class="translation-error">翻译失败：'
+          + escapeHtml(tr.error || '')
+          + '</div>';
+        statusText = '翻译失败';
+        statusClass = 'status-typing';
+      } else {
+        textHtml += '<div class="translation-pending">译文等待中…</div>';
+        statusText = '翻译中';
+        statusClass = 'status-typing';
+      }
+
       bodyHtml += '<div class="transcript-row done">';
       bodyHtml += '<span class="col-time">' + ts + '</span>';
-      bodyHtml += '<span class="col-text">' + escapeHtml(segments[j]) + '</span>';
-      bodyHtml += '<span class="col-status status-done">已确认</span>';
+      bodyHtml += '<span class="col-text">' + textHtml + '</span>';
+      bodyHtml += '<span class="col-status ' + statusClass + '">' + statusText + '</span>';
       bodyHtml += '</div>';
     }
     if (candidates.length > 0) {
@@ -121,6 +176,142 @@
     var text = data.live_text || data.text || data.stable_text || '';
     if (text) {
       captionText.textContent = text;
+    }
+  }
+
+  // ───── 4.5 Translation ─────
+
+  /* Core translate call — no dedup, no status updates.
+     Used by stop handler for guaranteed await-able translation. */
+  async function doTranslateOne(index, text) {
+    var source = translationState.sourceLang || 'auto';
+    var target = translationState.targetLang || 'en';
+
+    /* Same source and target — no translation needed. */
+    if (source !== 'auto' && source === target) {
+      translationState.byIndex[index] = {
+        ok: true, text: text,
+        source: source, target: target, latencyMs: 0
+      };
+      return;
+    }
+
+    var started = performance.now();
+
+    try {
+      var controller = null;
+      var timeoutId = null;
+      if (typeof AbortController !== 'undefined') {
+        controller = new AbortController();
+        timeoutId = setTimeout(function () { controller.abort(); }, translationState.timeoutMs || 3000);
+      }
+
+      var response = await fetch('/api/translation/translate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller ? controller.signal : undefined,
+        body: JSON.stringify({
+          from: source, to: target, text: text, html: false
+        })
+      });
+
+      if (timeoutId !== null) clearTimeout(timeoutId);
+      var bodyText = await response.text();
+
+      if (!response.ok) {
+        throw new Error('HTTP ' + response.status + ': ' + bodyText.slice(0, 160));
+      }
+
+      var parsed;
+      try { parsed = JSON.parse(bodyText); } catch (_e) { parsed = bodyText; }
+
+      var translated = '';
+      if (typeof parsed === 'string') {
+        translated = parsed;
+      } else if (parsed) {
+        translated = parsed.result || parsed.text || parsed.translation ||
+                     parsed.translated_text || parsed.translatedText || '';
+      }
+      if (!translated) translated = bodyText;
+
+      translationState.byIndex[index] = {
+        ok: true, text: translated,
+        source: source, target: target,
+        latencyMs: performance.now() - started
+      };
+    } catch (error) {
+      translationState.byIndex[index] = {
+        ok: false, text: '', error: error.message,
+        source: source, target: target,
+        latencyMs: performance.now() - started
+      };
+    }
+  }
+
+  /* SSE-path translation with dedup + status updates.
+     Calls doTranslateOne for the actual fetch; adds pending dedup
+     and re-renders the transcript panel. */
+  async function scheduleTranslationForSegment(index, text) {
+    if (!translationState.enabled) return;
+    if (!text || !text.trim()) return;
+
+    var source = translationState.sourceLang || 'auto';
+    var target = translationState.targetLang || 'en';
+
+    /* Same source and target — no translation needed. */
+    if (source !== 'auto' && source === target) {
+      translationState.byIndex[index] = {
+        ok: true, text: text,
+        source: source, target: target, latencyMs: 0
+      };
+      return;
+    }
+
+    var key = index + ':' + source + ':' + target + ':' + text;
+    if (translationState.pending[key]) return;
+    translationState.pending[key] = true;
+
+    if (translationStatus) {
+      translationStatus.textContent = '翻译：请求中';
+    }
+
+    try {
+      await doTranslateOne(index, text);
+      if (translationStatus && translationState.byIndex[index] && translationState.byIndex[index].ok) {
+        translationStatus.textContent = '翻译：已连接 MTranServer';
+      } else if (translationStatus) {
+        translationStatus.textContent = '翻译：失败';
+      }
+    } finally {
+      delete translationState.pending[key];
+      /* Re-render transcript panel with updated translation. */
+      transcriptCache = '';
+      if (realtimeState && realtimeState.sseSegments) {
+        renderTranscriptPanel({
+          segments: realtimeState.sseSegments.slice(),
+          candidates: realtimeState.sseCandidates ? realtimeState.sseCandidates.slice() : [],
+          segmentSamples: realtimeState.sseSegmentSamples ? realtimeState.sseSegmentSamples.slice() : [],
+          event_type: 'translation.final'
+        });
+      }
+    }
+ }
+
+  function clearTranslationCacheAndRerender() {
+    translationState.byIndex = {};
+    translationState.pending = {};
+    transcriptCache = '';
+
+    if (realtimeState && Array.isArray(realtimeState.sseSegments)) {
+      for (var i = 0; i < realtimeState.sseSegments.length; i++) {
+        scheduleTranslationForSegment(i, realtimeState.sseSegments[i]);
+      }
+      renderTranscriptPanel({
+        segments: realtimeState.sseSegments.slice(),
+        candidates: realtimeState.sseCandidates ? realtimeState.sseCandidates.slice() : [],
+        segmentSamples: realtimeState.sseSegmentSamples ? realtimeState.sseSegmentSamples.slice() : [],
+        event_type: 'translation.refresh'
+      });
     }
   }
 
@@ -626,13 +817,19 @@
       try { data = JSON.parse(ev.data); } catch { return; }
       if (data.type === 'update') {
         if (!realtimeState.sseLastFull) return;
-        if (data.reconciled) {
-          /* Retranscription result: REPLACE everything with the new
-           * single high-quality segment.  Old candidates and segments
-           * are stale — the batch decoder re-decoded the full audio. */
-          realtimeState.sseSegments = Array.isArray(data.new_segments)
-            ? data.new_segments.slice() : [];
-          realtimeState.sseCandidates = [];
+      if (data.reconciled) {
+           /* Retranscription result: REPLACE everything with the new
+            * single high-quality segment.  Old candidates and segments
+            * are stale — the batch decoder re-decoded the full audio. */
+           realtimeState.sseSegments = Array.isArray(data.new_segments)
+             ? data.new_segments.slice() : [];
+           realtimeState.sseCandidates = [];
+           /* Re-translate reconciled segments. */
+           translationState.byIndex = {};
+           translationState.pending = {};
+           for (var ri = 0; ri < realtimeState.sseSegments.length; ri++) {
+             scheduleTranslationForSegment(ri, realtimeState.sseSegments[ri]);
+           }
           } else if (data.partial_version && !data.new_segments && !data.new_candidates) {
             /* Live partial update (no new VAD segment yet).  Show the
              * current ASR live text in the caption panel only.  Don't
@@ -659,28 +856,43 @@
               realtimeState.sseCandidates.push(data.new_candidates[i]);
             }
           }
-        } else if (data.event_type === 'transcript.final' &&
-                   Array.isArray(data.new_segments) && data.new_segments.length > 0) {
-          /* P1: Two-pass final — confirmed text replaces candidates. */
-          var currentSamples = data.total_samples || data.decoded_samples || 0;
-          for (var i = 0; i < data.new_segments.length; i++) {
-            if (typeof data.new_segments[i] === 'string' && data.new_segments[i].length > 0) {
-              realtimeState.sseSegments.push(data.new_segments[i]);
-              realtimeState.sseSegmentSamples.push(currentSamples);
-            }
-          }
-          /* Remove newly-finalized candidates (first N oldest). */
-          var toRemove = Math.min(data.new_segments.length, realtimeState.sseCandidates.length);
-          if (toRemove > 0) realtimeState.sseCandidates.splice(0, toRemove);
-        } else if (Array.isArray(data.new_segments) && data.new_segments.length > 0) {
-          /* Fallback: legacy behavior for compatibility. */
-          var currentSamples = data.total_samples || data.decoded_samples || 0;
-          for (var i = 0; i < data.new_segments.length; i++) {
-            if (typeof data.new_segments[i] === 'string' && data.new_segments[i].length > 0) {
-              realtimeState.sseSegments.push(data.new_segments[i]);
-              realtimeState.sseSegmentSamples.push(currentSamples);
-            }
-          }
+       } else if (data.event_type === 'transcript.final' &&
+                    Array.isArray(data.new_segments) && data.new_segments.length > 0) {
+           /* P1: Two-pass final — confirmed text replaces candidates.
+            * Use per-segment sample positions from server when available. */
+           var positions = Array.isArray(data.new_segment_positions)
+             ? data.new_segment_positions : null;
+           for (var i = 0; i < data.new_segments.length; i++) {
+             if (typeof data.new_segments[i] === 'string' && data.new_segments[i].length > 0) {
+               var pos = positions && i < positions.length
+                 ? positions[i] : (data.total_samples || data.decoded_samples || 0);
+               var finalIndex = realtimeState.sseSegments.length;
+               var finalText = data.new_segments[i];
+               realtimeState.sseSegments.push(finalText);
+               realtimeState.sseSegmentSamples.push(pos);
+               /* Trigger translation for this newly confirmed segment. */
+               scheduleTranslationForSegment(finalIndex, finalText);
+             }
+           }
+           /* Remove newly-finalized candidates (first N oldest). */
+           var toRemove = Math.min(data.new_segments.length, realtimeState.sseCandidates.length);
+           if (toRemove > 0) realtimeState.sseCandidates.splice(0, toRemove);
+     } else if (Array.isArray(data.new_segments) && data.new_segments.length > 0) {
+           /* Fallback: legacy behavior for compatibility. */
+           var positions = Array.isArray(data.new_segment_positions)
+             ? data.new_segment_positions : null;
+           var currentSamples = data.total_samples || data.decoded_samples || 0;
+           for (var i = 0; i < data.new_segments.length; i++) {
+             if (typeof data.new_segments[i] === 'string' && data.new_segments[i].length > 0) {
+               var pos = positions && i < positions.length
+                 ? positions[i] : currentSamples;
+               var fallbackIdx = realtimeState.sseSegments.length;
+               var fallbackText = data.new_segments[i];
+               realtimeState.sseSegments.push(fallbackText);
+               realtimeState.sseSegmentSamples.push(pos);
+               scheduleTranslationForSegment(fallbackIdx, fallbackText);
+             }
+           }
         }
         /* Merge: candidates are tentative, segments are confirmed. */
         var allText = realtimeState.sseSegments.concat(realtimeState.sseCandidates);
@@ -705,16 +917,25 @@
       } else {
         realtimeState.sseLastFull = data;
         realtimeState.sseSegments = Array.isArray(data.segments) ? data.segments.slice() : [];
-        realtimeState.sseCandidates = Array.isArray(data.candidates) ? data.candidates.slice() : [];
-        /* Initialize segment sample positions from the full snapshot.
-         * Without per-segment timestamps from the server, use the
-         * decoded_samples as an approximate cumulative offset. */
-        realtimeState.sseSegmentSamples = [];
-        var initSamples = data.decoded_samples || data.total_samples || 0;
-        for (var i = 0; i < realtimeState.sseSegments.length; i++) {
-          realtimeState.sseSegmentSamples.push(initSamples);
+          realtimeState.sseCandidates = Array.isArray(data.candidates) ? data.candidates.slice() : [];
+          /* Initialize segment sample positions from the full snapshot.
+           * Use server-provided per-segment positions when available,
+           * otherwise fall back to decoded_samples for all segments. */
+          realtimeState.sseSegmentSamples = Array.isArray(data.segmentSamples)
+            ? data.segmentSamples.slice() : [];
+          if (realtimeState.sseSegmentSamples.length === 0) {
+            var initSamples = data.decoded_samples || data.total_samples || 0;
+            for (var i = 0; i < realtimeState.sseSegments.length; i++) {
+              realtimeState.sseSegmentSamples.push(initSamples);
+            }
+          }
+       applyUpdate(data);
+        /* Translate segments from the initial snapshot. */
+        translationState.byIndex = {};
+        translationState.pending = {};
+        for (var si = 0; si < realtimeState.sseSegments.length; si++) {
+          scheduleTranslationForSegment(si, realtimeState.sseSegments[si]);
         }
-        applyUpdate(data);
       }
     };
     es.onerror = function () {}; // Auto-reconnect
@@ -825,26 +1046,88 @@
       realtimeState.source.disconnect();
       realtimeState.mediaStream.getTracks().forEach(function (t) { t.stop(); });
       await realtimeState.audioContext.close();
-      /* Send stop AFTER mic is closed and audio flushed. */
-      var response = await fetch('/api/realtime/stop?session_id=' + encodeURIComponent(sessionId), { method: 'POST', body: '' });
-      var data = await response.json();
-      /* Now SSE can be safely closed — server has finished and pushed [DONE]. */
-      if (realtimeState.sse) { try { realtimeState.sse.close(); } catch {} realtimeState.sse = null; }
-      var prevStats = realtimeStatus.textContent;
-      if (response.ok) {
-        renderTranscript(realtimeResult, data, '尚无结果');
-        syncArchive(data);
-        var stopLabel = data.text ? '已停止，终稿已出' : '已停止';
-        realtimeStatus.textContent = prevStats ? (prevStats + ' / ' + stopLabel) : ('会话 ' + sessionId + ' ' + stopLabel);
+    /* Send stop AFTER mic is closed and audio flushed. */
+       var response = await fetch('/api/realtime/stop?session_id=' + encodeURIComponent(sessionId), { method: 'POST', body: '' });
+       var data = await response.json();
+       /* Sync stop response segments into SSE state and collect any
+        * that still lack a translation result.  The stop response is
+        * the authoritative snapshot — it may contain segments that SSE
+        * never pushed (connection closed during finalization). */
+       var pendingTranslations = [];
+       if (response.ok && Array.isArray(data.segments)) {
+         var stopSegments = data.segments.slice();
+         var stopSamples = (Array.isArray(data.segmentSamples) && data.segmentSamples.length > 0)
+           ? data.segmentSamples.slice() : [];
+         var totalSamples = data.total_samples || data.decoded_samples || 0;
+
+         /* Extend SSE state with segments from stop response. */
+         while (realtimeState.sseSegments.length < stopSegments.length) {
+           var idx = realtimeState.sseSegments.length;
+           realtimeState.sseSegments.push(stopSegments[idx]);
+           realtimeState.sseSegmentSamples.push(
+             (stopSamples.length > 0)
+               ? (stopSamples[idx] || stopSamples[stopSamples.length - 1])
+               : totalSamples
+           );
+         }
+
+         /* For every segment, if there's no translation yet, queue it. */
+         for (var si = 0; si < stopSegments.length; si++) {
+           if (!translationState.byIndex[si] && stopSegments[si]) {
+             pendingTranslations.push({ index: si, text: stopSegments[si] });
+           }
+         }
+       }
+       /* Now SSE can be safely closed — server has finished and pushed [DONE]. */
+       if (realtimeState.sse) { try { realtimeState.sse.close(); } catch {} realtimeState.sse = null; }
+       var prevStats = realtimeStatus.textContent;
+       if (response.ok) {
+         renderTranscript(realtimeResult, data, '尚无结果');
+         /* Also render the transcript panel so new segments from
+          * the stop response are visible immediately (before translation). */
+         renderTranscriptPanel({
+           segments: realtimeState.sseSegments.slice(),
+           candidates: realtimeState.sseCandidates ? realtimeState.sseCandidates.slice() : [],
+           segmentSamples: realtimeState.sseSegmentSamples ? realtimeState.sseSegmentSamples.slice() : [],
+           event_type: 'transcript.final'
+         });
+         syncArchive(data);
+         var stopLabel = data.text ? '已停止，终稿已出' : '已停止';
+         realtimeStatus.textContent = prevStats ? (prevStats + ' / ' + stopLabel) : ('会话 ' + sessionId + ' ' + stopLabel);
       } else {
         realtimeStatus.textContent = (data.error ? data.error.message : '停止失败');
       }
     } finally {
-      realtimeState = QasrState.createRealtimeState();
-      if (uiState.activeFeature === QasrState.REALTIME_FEATURE) uiState.activeFeature = '';
-      archiveState.sessionId = '';
-      updateControlAvailability();
+       /* Minimal cleanup — defer full state reset until translations complete. */
+       archiveState.sessionId = '';
     }
+
+    /* Await translation of any segments added during stop before
+     * resetting state and re-enabling the start button.  We do NOT
+     * use scheduleTranslationForSegment here — it has SSE-side
+     * pending dedup that would skip already-in-flight translations.
+     * Instead, for each segment without a translation result, we
+     * directly call the translation API. */
+    if (pendingTranslations.length > 0) {
+      var stopTransPromises = pendingTranslations.map(function (pt) {
+        return doTranslateOne(pt.index, pt.text);
+      });
+      await Promise.all(stopTransPromises);
+    }
+
+    /* Final render after translations — ensures the transcript panel
+     * shows the latest translation results before we reset state. */
+    renderTranscriptPanel({
+      segments: realtimeState.sseSegments ? realtimeState.sseSegments.slice() : [],
+      candidates: realtimeState.sseCandidates ? realtimeState.sseCandidates.slice() : [],
+      segmentSamples: realtimeState.sseSegmentSamples ? realtimeState.sseSegmentSamples.slice() : [],
+      event_type: 'transcript.final'
+    });
+
+    /* Now safe to fully reset. */
+    realtimeState = QasrState.createRealtimeState();
+    if (uiState.activeFeature === QasrState.REALTIME_FEATURE) uiState.activeFeature = '';
+    updateControlAvailability();
   }
 
   // ───── Event Handlers ─────
@@ -906,14 +1189,16 @@
   });
 
   clearRealtime.addEventListener('click', function () {
-    if (uiState.realtimeStarting || uiState.realtimeStopping) { realtimeStatus.textContent = '正在启动/停止, 请稍候...'; return; }
-    if (uiState.activeFeature === QasrState.REALTIME_FEATURE) { realtimeStatus.textContent = '实时转写进行中, 请先停止'; return; }
-    if (hasOfflineJob()) { realtimeStatus.textContent = '离线转写进行中, 请先停止'; return; }
-    resetTerminal(realtimeResult, '尚无结果');
-    resetArchive();
-    realtimeStatus.textContent = '未开始';
-    updateControlAvailability();
-  });
+     if (uiState.realtimeStarting || uiState.realtimeStopping) { realtimeStatus.textContent = '正在启动/停止, 请稍候...'; return; }
+     if (uiState.activeFeature === QasrState.REALTIME_FEATURE) { realtimeStatus.textContent = '实时转写进行中, 请先停止'; return; }
+     if (hasOfflineJob()) { realtimeStatus.textContent = '离线转写进行中, 请先停止'; return; }
+     resetTerminal(realtimeResult, '尚无结果');
+     resetArchive();
+     /* Also clear the live caption panel. */
+     if (captionText) captionText.textContent = '';
+     realtimeStatus.textContent = '未开始';
+     updateControlAvailability();
+   });
 
   exportRealtimeText.addEventListener('click', function () { exportTranscript('txt'); });
   exportRealtimeJson.addEventListener('click', function () { exportTranscript('json'); });
@@ -926,6 +1211,25 @@
   customPrompt.addEventListener('change', function () {
     glossaryState.customPrompt = customPrompt.value;
   });
+
+  /* Translation language selectors. */
+  if (translationSourceLang) {
+    translationSourceLang.value = translationState.sourceLang;
+    translationSourceLang.addEventListener('change', function () {
+      translationState.sourceLang = translationSourceLang.value || 'auto';
+      localStorage.setItem('qasrTranslationSourceLang', translationState.sourceLang);
+      clearTranslationCacheAndRerender();
+    });
+  }
+
+  if (translationTargetLang) {
+    translationTargetLang.value = translationState.targetLang;
+    translationTargetLang.addEventListener('change', function () {
+      translationState.targetLang = translationTargetLang.value || 'en';
+      localStorage.setItem('qasrTranslationTargetLang', translationState.targetLang);
+      clearTranslationCacheAndRerender();
+    });
+  }
 
   // ───── Init ─────
 
