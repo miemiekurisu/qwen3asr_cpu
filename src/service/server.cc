@@ -680,26 +680,30 @@ Status PrepareAudioLocator(std::string_view locator, PreparedAudioInput * prepar
     return OkStatus();
 }
 
-std::vector<float> DecodePcm16Le(const std::string & body) {
-    std::vector<float> samples;
-    if ((body.size() % 2U) != 0U) {
-        return samples;
-    }
-    samples.resize(body.size() / 2U);
-    for (std::size_t index = 0; index < samples.size(); ++index) {
-        const unsigned char low = static_cast<unsigned char>(body[index * 2U]);
-        const unsigned char high = static_cast<unsigned char>(body[index * 2U + 1U]);
-        const std::int16_t value = static_cast<std::int16_t>(static_cast<std::uint16_t>(low) |
-            (static_cast<std::uint16_t>(high) << 8U));
-        samples[index] = static_cast<float>(value) / 32768.0f;
-    }
-    return samples;
-}
+Status DecodePcm16Le(const std::string & body, std::vector<float> * samples) {
+     if (!samples) {
+         return Status(StatusCode::kInvalidArgument, "samples output must not be null");
+     }
+     if ((body.size() % 2U) != 0U) {
+         return Status(StatusCode::kInvalidArgument,
+             "pcm16le audio must contain an even number of bytes (got " +
+             std::to_string(body.size()) + ")");
+     }
+     samples->resize(body.size() / 2U);
+     for (std::size_t index = 0; index < samples->size(); ++index) {
+         const unsigned char low = static_cast<unsigned char>(body[index * 2U]);
+         const unsigned char high = static_cast<unsigned char>(body[index * 2U + 1U]);
+         const std::int16_t value = static_cast<std::int16_t>(static_cast<std::uint16_t>(low) |
+             (static_cast<std::uint16_t>(high) << 8U));
+         (*samples)[index] = static_cast<float>(value) / 32768.0f;
+     }
+     return OkStatus();
+ }
 
 #if defined(QASR_CPU_BACKEND_ENABLED)
-std::vector<float> DecodePcm16Le(const char * data, std::size_t size) {
-    return DecodePcm16Le(std::string(data, size));
-}
+ Status DecodePcm16Le(const char * data, std::size_t size, std::vector<float> * samples) {
+     return DecodePcm16Le(std::string(data, size), samples);
+ }
 #endif
 
 std::string LoadTextFile(const fs::path & path) {
@@ -6977,10 +6981,17 @@ int RunServer(const ServerConfig & config) {
             return;
         }
         const std::string session_id = request.get_param_value("session_id");
-        const std::vector<float> chunk = DecodePcm16Le(request.body);
-        if (chunk.empty()) {
-            SetErrorResponse(response, Status(StatusCode::kInvalidArgument, "pcm16le body is required"), 400);
-            return;
+        std::vector<float> chunk;
+        {
+            const Status decode_st = DecodePcm16Le(request.body, &chunk);
+            if (!decode_st.ok()) {
+                SetErrorResponse(response, decode_st, 400);
+                return;
+            }
+            if (chunk.empty()) {
+                SetErrorResponse(response, Status(StatusCode::kInvalidArgument, "pcm16le body is required"), 400);
+                return;
+            }
         }
 
         RealtimeSessionSnapshot session;
@@ -7487,10 +7498,16 @@ int RunServer(const ServerConfig & config) {
                 const std::size_t n_read = static_cast<std::size_t>(raw_read);
 #endif
 
-                const std::vector<float> chunk = DecodePcm16Le(buffer.data(), static_cast<std::size_t>(n_read));
-                if (chunk.empty()) {
-                    continue;
-                }
+              std::vector<float> chunk;
+                 {
+                     const Status decode_st = DecodePcm16Le(buffer.data(), static_cast<std::size_t>(n_read), &chunk);
+                     if (!decode_st.ok()) {
+                         RT_LOG("HostCaptureLoop sid=%s decode failed: %s",
+                                capture->id.c_str(), decode_st.message().c_str());
+                         continue;
+                     }
+                     if (chunk.empty()) continue;
+                 }
 
                 RealtimeLiveWorker * worker = nullptr;
                 {

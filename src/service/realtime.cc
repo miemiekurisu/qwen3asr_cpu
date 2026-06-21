@@ -264,7 +264,30 @@ void DrainStableSegments(bool force_finalize, RealtimeDisplayState * state) {
             // repeated dots after a period are not meaningful lookahead.
             while (!tail.empty()) {
                 if (EndsWithTerminalPunctuation(tail)) {
-                    tail.remove_suffix(1);
+                    /* CJK punctuation is multi-byte UTF-8 — remove
+                     * the full character length, not just 1 byte. */
+                    std::size_t n = 1;
+                    /* ASCII terminal: 1 byte. */
+                    if (!tail.empty() && static_cast<unsigned char>(tail.back()) < 0x80) {
+                        n = 1;
+                    } else if (tail.size() >= 3) {
+                        unsigned char c2 = static_cast<unsigned char>(tail.back());
+                        unsigned char c1 = static_cast<unsigned char>(tail[tail.size() - 2]);
+                        unsigned char c0 = static_cast<unsigned char>(tail[tail.size() - 3]);
+                        if ((c0 == 0xE3 && c1 == 0x80 && c2 == 0x82) || /* 。 */
+                            (c0 == 0xEF && c1 == 0xBC && c2 == 0x9F) || /* ？ */
+                            (c0 == 0xEF && c1 == 0xBC && c2 == 0x81)) { /* ！ */
+                            n = 3;
+                        } else if ((c0 == 0xE2 && c1 == 0x80 && c2 == 0xA6)) { /* … */
+                            n = 3;
+                        } else {
+                            /* Multi-byte continuation — strip safely. */
+                            n = 3;
+                        }
+                    } else {
+                        n = tail.size(); /* strip remainder */
+                    }
+                    tail.remove_suffix(std::min(n, tail.size()));
                     tail = TrimAsciiWhitespace(tail);
                 } else {
                     break;
