@@ -114,11 +114,6 @@ extern "C" {
  *   - Must be multiple of 32 (warp size) for optimal efficiency
  *   - Environment variable QASR_ATTENTION_THREADS can override (must be 32-1024)
  *
- * Performance impact (3s audio, 39 tokens):
- *   - threads=1 (VIOLATES NVIDIA guidelines): 24,365ms (24.4s)
- *   - threads=256 (FOLLOWS NVIDIA guidelines): 140ms
- *   - Improvement: 174x faster
- *
  * The kernel layout (blockIdx.y * blockDim.x + threadIdx.x) already supports
  * multiple threads per block. Each thread handles one (head, pos) pair independently.
  * Stack allocation (local_out[64]) is safe for head_dim<=64 (encoder uses 64).
@@ -139,7 +134,7 @@ void launch_bidir_attention(cudaStream_t stream,
     /* Default: 256 threads per block (NVIDIA recommended range: 128-256) */
     int threads_per_block = 256;
     
-    /* Allow runtime override via environment variable */
+    /* Allow runtime override via environment variable for benchmarking */
     const char * env_threads = std::getenv("QASR_ATTENTION_THREADS");
     if (env_threads) {
         int override = std::atoi(env_threads);
