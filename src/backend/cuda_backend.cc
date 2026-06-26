@@ -1,6 +1,7 @@
 #include "qasr/backend/cuda_backend.h"
 #include <cstdio>
 #include <cmath>
+#include <vector>
 
 extern "C" {
 #include "qwen_asr.h"
@@ -429,8 +430,7 @@ Status CudaBackend::AllocateSession(CudaSessionState * session,
     workspace_size += max_seq_len * hidden * sizeof(float);        /* post_norm */
     workspace_size += max_seq_len * (2 * intermediate) * sizeof(float); /* gate_up */
     workspace_size += max_seq_len * hidden * sizeof(float);        /* ffn_out */
-    workspace_size += cuda_weights_->vocab_size * hidden * sizeof(float); /* tok_embeddings fp32 */
-    workspace_size += max_seq_len * hidden * sizeof(float);        /* encoder output */
+
     /* DecodeStep lm_head: only logits[vocab] needed (W_T is pre-transposed in lm_head_T_fp32) */
     workspace_size += cuda_weights_->vocab_size * sizeof(float);   /* lm_head logits */
     session->workspace.Allocate(workspace_size);
@@ -669,14 +669,40 @@ Status CudaBackend::PrepareWeights(const std::string & model_dir) {
         cudaFree(tmp_bf16);
     }
 
-    /* tok_embeddings: bf16→fp32 for embedding lookup */
+    /* tok_embeddings: bf16→fp32 for embedding lookup.
+     * tok_embeddings_bf16/lm_head_bf16 are host pointers — CUDA kernels
+     * cannot access CPU memory on discrete GPUs (e.g. RTX 3070).
+     * Copy to a temp GPU buffer first, then launch. */
     {
+        size_t emb_bf16_size = (size_t)cfg.vocab_size * cfg.dec_hidden * sizeof(uint16_t);
         size_t emb_fp32_size = (size_t)cfg.vocab_size * cfg.dec_hidden * sizeof(float);
+        void * tmp_emb_bf16 = nullptr;
+        cudaMalloc(&tmp_emb_bf16, emb_bf16_size);
+        cudaMemcpy(tmp_emb_bf16, qwen_ctx->decoder.tok_embeddings_bf16, emb_bf16_size,
+                    cudaMemcpyHostToDevice);
         cuda_weights_->tok_embeddings_fp32.Allocate(emb_fp32_size);
         launch_bf16_to_fp32(compute_stream_.stream(),
                               static_cast<float *>(cuda_weights_->tok_embeddings_fp32.data()),
-                              qwen_ctx->decoder.tok_embeddings_bf16,
+                              static_cast<const uint16_t *>(tmp_emb_bf16),
                               cfg.vocab_size * cfg.dec_hidden);
+
+        /* lm_head: tied with tok_embeddings for ASR, separate for Aligner.
+         * If lm_head_bf16 exists, overwrite tmp_emb_bf16 with its data;
+         * otherwise reuse tok_embeddings data already on GPU. */
+        if (qwen_ctx->decoder.lm_head_bf16) {
+            cuda_weights_->lm_head_ready = true;
+            cudaMemcpy(tmp_emb_bf16, qwen_ctx->decoder.lm_head_bf16, emb_bf16_size,
+                        cudaMemcpyHostToDevice);
+        } else {
+            cuda_weights_->lm_head_ready = false;
+        }
+        size_t lm_T_size = (size_t)cfg.dec_hidden * cfg.vocab_size * sizeof(float);
+        cuda_weights_->lm_head_T_fp32.Allocate(lm_T_size);
+        launch_bf16_transpose(compute_stream_.stream(),
+                                static_cast<float *>(cuda_weights_->lm_head_T_fp32.data()),
+                                static_cast<const uint16_t *>(tmp_emb_bf16),
+                                cfg.vocab_size, cfg.dec_hidden);
+        cudaFree(tmp_emb_bf16);
     }
 
     /* final_norm (fp32) */
@@ -686,24 +712,6 @@ Status CudaBackend::PrepareWeights(const std::string & model_dir) {
         cudaMemcpyAsync(cuda_weights_->final_norm.data(),
                         qwen_ctx->decoder.norm, norm_size,
                         cudaMemcpyHostToDevice, compute_stream_.stream());
-    }
-
-    /* lm_head: tied with tok_embeddings for ASR, separate for Aligner
-     * Pre-transpose to fp32 [hidden, vocab] for cuBLAS */
-    if (qwen_ctx->decoder.lm_head_bf16) {
-        cuda_weights_->lm_head_ready = true;
-    } else {
-        cuda_weights_->lm_head_ready = false;
-    }
-    {
-        size_t lm_T_size = (size_t)cfg.dec_hidden * cfg.vocab_size * sizeof(float);
-        cuda_weights_->lm_head_T_fp32.Allocate(lm_T_size);
-        launch_bf16_transpose(compute_stream_.stream(),
-                                static_cast<float *>(cuda_weights_->lm_head_T_fp32.data()),
-                                cuda_weights_->lm_head_ready
-                                    ? qwen_ctx->decoder.lm_head_bf16
-                                    : qwen_ctx->decoder.tok_embeddings_bf16,
-                                cfg.vocab_size, cfg.dec_hidden);
     }
 
     /* Pre-compute inv_freq for RoPE (invariant across all inference) */
@@ -1157,10 +1165,10 @@ Status CudaBackend::EncoderForward(void * session_ptr,
     size_t int_off = (off + 3) / 4 * 4; /* 4-byte align */
     int * d_window_starts = reinterpret_cast<int *>(enc_ws + int_off);
     {
-        int h_ws[n_windows + 1];
+        std::vector<int> h_ws(n_windows + 1);
         for (int w = 0; w < n_windows; w++) h_ws[w] = w * window_token_size;
         h_ws[n_windows] = total_tokens;
-        cudaMemcpyAsync(d_window_starts, h_ws, (n_windows + 1) * sizeof(int),
+        cudaMemcpyAsync(d_window_starts, h_ws.data(), (n_windows + 1) * sizeof(int),
                          cudaMemcpyHostToDevice, compute_stream_.stream());
     }
 
@@ -1425,8 +1433,7 @@ Status CudaBackend::DecodeStep(void * workspace_ptr, std::int32_t & out_token) {
             off += max_seq_len * hidden;
             off += max_seq_len * (2 * intermediate);
             off += max_seq_len * hidden;
-            off += cuda_weights_->vocab_size * hidden;
-            off += max_seq_len * hidden;
+
             float * logits = workspace + off;
             int best_idx = -1;
             float best_val = 0.0f;
