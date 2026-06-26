@@ -33,7 +33,6 @@ add_library(qasr_core STATIC
     src/runtime/task.cc
     src/runtime/engine.cc
     src/runtime/model_bridge.cc
-    src/runtime/cpu_backend.cc
     src/runtime/session_manager.cc
     src/runtime/task_queue.cc
     src/runtime/job_pool.cc
@@ -102,6 +101,9 @@ find_package(CURL QUIET)
 if(CURL_FOUND)
     message(STATUS "libcurl: found (${CURL_INCLUDE_DIRS})")
     target_include_directories(qasr_core PRIVATE ${CURL_INCLUDE_DIRS})
+    # server.cc (compiled in qasr_server and qasr_unit_tests) also includes curl.
+    # Use a variable so both targets get the include path.
+    set(QASR_CURL_INCLUDE_DIRS ${CURL_INCLUDE_DIRS})
     target_link_libraries(qasr_core PRIVATE ${CURL_LIBRARIES})
     target_compile_definitions(qasr_core PUBLIC QASR_CURL_AVAILABLE=1)
     target_sources(qasr_core PRIVATE src/engine/translation.cc)
@@ -372,6 +374,7 @@ if(QASR_ENABLE_CPU_BACKEND OR WIN32)
     target_link_libraries(qasr_server PRIVATE qasr_core)
     target_include_directories(qasr_server PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${QASR_CURL_INCLUDE_DIRS}
     )
 
     if(MSVC)
@@ -446,6 +449,7 @@ if(QASR_ENABLE_TESTS)
         tests/audit_bug_replay_scheduler_race_test.cc
         tests/audit_bug_replay_integer_overflow_test.cc
         tests/audit_bug_replay_c_alloc_test.cc
+        tests/audit_bug_replay_gpu_diagnose_test.cc
         tests/sentence_boundary_test.cc
     )
 
@@ -465,6 +469,10 @@ if(QASR_ENABLE_TESTS)
     target_link_libraries(qasr_unit_tests PRIVATE qasr_core qasr_cpu_c)
     target_include_directories(qasr_unit_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
+        ${QASR_CURL_INCLUDE_DIRS}
+    )
+    target_compile_definitions(qasr_unit_tests PRIVATE
+        QASR_TEST_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
     )
 
     if(MSVC)
