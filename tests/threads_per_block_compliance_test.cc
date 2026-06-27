@@ -15,7 +15,6 @@
 
 #include "tests/test_registry.h"
 #include "qasr/backend/cuda_backend.h"
-#include <cuda_runtime.h>
 #include <cstdio>
 #include <vector>
 #include <chrono>
@@ -25,10 +24,8 @@
 #include <sstream>
 
 #ifdef QASR_CUDA_BACKEND_ENABLED
-
-extern "C" {
-#include "qwen_asr_audio.h"
-}
+#include <cuda_runtime.h>
+#endif
 
 /* ============================================================================
  * STATIC VERIFICATION: 静态验证代码是否符合 NVIDIA 官方建议
@@ -117,6 +114,8 @@ QASR_TEST(ThreadsPerBlockStaticCompliance) {
     fprintf(stderr, "\n===== Static Compliance: %s =====\n\n", 
             (rule1_pass && rule2_pass && rule3_pass) ? "FULLY COMPLIANT" : "PARTIAL");
 }
+
+#ifdef QASR_CUDA_BACKEND_ENABLED
 
 /* ============================================================================
  * DYNAMIC VERIFICATION: 动态测试不同配置下的性能

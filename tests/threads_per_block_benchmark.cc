@@ -14,11 +14,14 @@
 
 #include "tests/test_registry.h"
 #include "qasr/backend/cuda_backend.h"
-#include <cuda_runtime.h>
 #include <cstdio>
 #include <vector>
 #include <chrono>
 #include <cstdlib>
+
+#ifdef QASR_CUDA_BACKEND_ENABLED
+#include <cuda_runtime.h>
+#endif
 
 #ifdef QASR_CUDA_BACKEND_ENABLED
 
