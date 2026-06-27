@@ -12,11 +12,6 @@ REM
 REM This script sets QASR_ATTENTION_THREADS=256, which follows NVIDIA's
 REM official recommendations for optimal GPU occupancy and performance.
 REM
-REM Performance impact (3s audio, 39 tokens):
-REM   - threads=1 (VIOLATES NVIDIA guidelines): 24,365ms (24.4 seconds)
-REM   - threads=256 (FOLLOWS NVIDIA guidelines):   140ms (0.14 seconds)
-REM   - Improvement: 174x faster
-REM
 REM This configuration is optimal for ALL CUDA platforms:
 REM   - DGX Spark / GB10 (sm_121 Blackwell)
 REM   - RTX 3070/4090/3060 (sm_86/89 Ampere/Ada)
@@ -41,7 +36,6 @@ echo ========================================
 echo Model: %QASR_MODEL_DIR%
 echo CUDA Best Practices: QASR_ATTENTION_THREADS=%QASR_ATTENTION_THREADS%
 echo Threads per block: 256 (NVIDIA recommended range: 128-256)
-echo Performance: 174x faster than non-compliant configuration
 echo Compatible: All CUDA GPUs (DGX, RTX 3070/4090, etc.)
 echo ========================================
 echo.

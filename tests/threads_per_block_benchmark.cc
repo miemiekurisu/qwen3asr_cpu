@@ -73,9 +73,9 @@ static double BenchmarkAttentionKernel(
 }
 
 /* Simple environment variable guard */
-class std::char_env_guard {
+class char_env_guard {
 public:
-    std::char_env_guard(const char *name, const char *value) 
+    char_env_guard(const char *name, const char *value) 
         : name_(name), old_value_(std::getenv(name)) {
         if (value) {
             std::setenv(name, value, 1);
@@ -83,7 +83,7 @@ public:
             std::unsetenv(name);
         }
     }
-    ~std::char_env_guard() {
+    ~char_env_guard() {
         if (old_value_) {
             std::setenv(name_, old_value_, 1);
         } else {
