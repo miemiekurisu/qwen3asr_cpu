@@ -84,3 +84,18 @@ docs/INCIDENTS.md
 docs/SECURITY.md
 ui/config.runtime.js
 docs-internal/
+
+# Temporary work files (never commit)
+_tmp/
+
+# Windows build/test scripts (generated locally)
+scripts/build_windows_*.bat
+scripts/build_windows_*.ps1
+scripts/start_windows_*.bat
+scripts/start_windows_*.ps1
+scripts/run_win_*.bat
+scripts/run_win_*.ps1
+scripts/e2e_*.ps1
+scripts/test_windows_*.ps1
+stderr.txt
+stdout.txt
