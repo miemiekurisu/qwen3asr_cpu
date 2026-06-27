@@ -3080,7 +3080,8 @@ static void stream_bg_encoder_wait_idle(stream_bg_encoder_t *bg) {
                                     (float)coalesce_step / QWEN_SAMPLE_RATE,
                                     (long long)coalesce_step,
                                     (long long)lag_moderate,
-                                    (long long)lag_slow);
+                                    (long long)lag_slow,
+                                    (long long)prev_partial);
                         }
                         goto chunk_end;
                     }
