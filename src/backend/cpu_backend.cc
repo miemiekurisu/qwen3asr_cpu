@@ -1,5 +1,6 @@
 #include "qasr/backend/cpu_backend.h"
 #include "qasr/core/status.h"
+#include <cstring>
 
 extern "C" {
 #include "qwen_cpu/qwen_asr.h"
