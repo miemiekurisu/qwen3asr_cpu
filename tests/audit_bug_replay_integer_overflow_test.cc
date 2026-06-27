@@ -79,30 +79,17 @@ QASR_TEST(ProveIntegerOverflowPossible) {
         QASR_EXPECT(alloc_size > 0xFFFFFFFFULL);
     }
 
-    /* If by chance total wraps to a small positive (e.g. overflow wraps
-     * to a small number), the vector allocation succeeds but subsequent
-     * writes to tokens[idx] at idx >= total go out of bounds.
-     * This is the more dangerous scenario because it doesn't crash
-     * immediately — it corrupts heap memory silently. */
-
-    /* Proof: for total_tokens = 100 (but actual enc required more slots):
-     * vector size = 100, but enc_seq_len+15 slots will be written. */
-    int false_small = 100;
-    std::vector<std::int32_t> tokens(static_cast<size_t>(false_small));
-    int off = 0;
-    tokens[off++] = 151645;  /* <|begin_of_text|> */
-    tokens[off++] = 151638;  /* <|im_start|> */
-    tokens[off++] = 8948;    /* "system" */
-
-    /* With overflow, if false_small is say 100 but enc_seq_len overflowed
-     * to 85, we'd have total=100 with enc_seq_len really requiring more.
-     * The loop would write beyond vector capacity. */
-    int simulated_overflow_enc_small = 85;
-    int simulated_total = prefix_len + simulated_overflow_enc_small + suffix_len;
-    QASR_EXPECT(simulated_total < simulated_overflow_enc_small); /* overflow check */
+    /* Demonstrate that overflow wraps to a NEGATIVE total when
+     * enc_seq_len > INT_MAX - (prefix_len + suffix_len).
+     * The "wraps small positive" scenario is not possible because
+     * enc_seq_len is int32: the sum (prefix + enc + suffix) fits in
+     * int32 only below 2^31; above that it wraps to negative. */
+    int overflow_big = INT_MAX - 3;  /* > safe_max by 12 */
+    int overflow_total = prefix_len + overflow_big + suffix_len;
     std::fprintf(stderr,
-        "  simulated_overflow_enc=%d  total=%d  (wraps small -> silent heap corruption)\n",
-        simulated_overflow_enc_small, simulated_total);
+        "  overflow_big_enc=%d  total=%d  (wraps negative -> would OOM or bad_alloc)\n",
+        overflow_big, overflow_total);
+    QASR_EXPECT(overflow_total < 0);  /* overflow confirmed: wrapped to negative */
 
     std::fprintf(stderr,
         "  CONFIRMED: integer overflow in total_tokens computation is "
@@ -186,8 +173,8 @@ QASR_TEST(IntOverflowTranscribeSegmentPrefixSuffix) {
     int total = 9 + normal_enc + 6;
     std::fprintf(stderr, "  normal: enc=%d total=%d OK\n", normal_enc, total);
 
-    /* Overflow case */
-    int big_enc = 2147483630; /* > INT_MAX - 15 */
+    /* Overflow case: enc > INT_MAX - 15 wraps to negative */
+    int big_enc = INT_MAX - 3; /* = 2147483644, > safe_max by 12 */
     total = 9 + big_enc + 6;
     std::fprintf(stderr, "  overflow: enc=%d total=%d\n", big_enc, total);
     QASR_EXPECT(total < 0 || total < big_enc);

@@ -44,12 +44,20 @@ Status CpuBackend::EncodeMel(void *,
                                int mel_frames,
                                float * output,
                                int & out_tokens) {
-    (void)mel_features;
-    (void)mel_frames;
-    (void)output;
-    (void)out_tokens;
-    return Status(StatusCode::kUnimplemented,
-                  "EncodeMel not exposed via CPU backend; use TranscribeSegment directly");
+    if (!weights_ || !weights_->ctx) {
+        return Status(StatusCode::kFailedPrecondition,
+                      "EncodeMel: weights not loaded");
+    }
+    auto * ctx = static_cast<qwen_ctx_t *>(weights_->ctx);
+    float * enc_out = qwen_encoder_forward(ctx, mel_features, mel_frames, &out_tokens);
+    if (!enc_out || out_tokens <= 0) {
+        return Status(StatusCode::kInternal, "qwen_encoder_forward failed");
+    }
+    if (output) {
+        std::memcpy(output, enc_out,
+                    static_cast<size_t>(out_tokens) * ctx->config.enc_output_dim * sizeof(float));
+    }
+    return OkStatus();
 }
 
 Status CpuBackend::DecoderPrefill(void *,

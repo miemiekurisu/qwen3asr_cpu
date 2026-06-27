@@ -34,8 +34,9 @@ std::size_t FindLastSentenceBoundary(std::string_view text) {
     std::size_t last_boundary = 0;
     for (std::size_t i = 0; i < text.size(); ++i) {
         unsigned char c = static_cast<unsigned char>(text[i]);
+        std::size_t boundary_after = 0;
         if (c == '?' || c == '!') {
-            last_boundary = i + 1;
+            boundary_after = i + 1;
         }
         else if (c == '.') {
             if (i + 1 >= text.size() ||
@@ -43,7 +44,7 @@ std::size_t FindLastSentenceBoundary(std::string_view text) {
                 static_cast<unsigned char>(text[i + 1]) == '\n' ||
                 static_cast<unsigned char>(text[i + 1]) == ',' ||
                 static_cast<unsigned char>(text[i + 1]) == '!') {
-                last_boundary = i + 1;
+                boundary_after = i + 1;
             }
         }
         else if (i + 2 < text.size()) {
@@ -52,8 +53,11 @@ std::size_t FindLastSentenceBoundary(std::string_view text) {
             if ((c == 0xEF && c1 == 0xBC && c2 == 0x9F) ||   // ？ U+FF1F
                 (c == 0xEF && c1 == 0xBC && c2 == 0x81) ||   // ！ U+FF01
                 (c == 0xE3 && c1 == 0x80 && c2 == 0x82)) {    // 。 U+3002
-                last_boundary = i + 3;
+                boundary_after = i + 3;
             }
+        }
+        if (boundary_after > 0 && boundary_after < text.size()) {
+            last_boundary = boundary_after;
         }
     }
     return last_boundary;
@@ -77,15 +81,15 @@ QASR_TEST(SentenceBoundaryEmpty) {
 }
 
 QASR_TEST(SentenceBoundaryAsciiQuestion) {
-    QASR_EXPECT_EQ(FindLastSentenceBoundary("Hello?"), 6u);
+    QASR_EXPECT_EQ(FindLastSentenceBoundary("Hello?"), 0u);
 }
 
 QASR_TEST(SentenceBoundaryAsciiExclamation) {
-    QASR_EXPECT_EQ(FindLastSentenceBoundary("Hello!"), 6u);
+    QASR_EXPECT_EQ(FindLastSentenceBoundary("Hello!"), 0u);
 }
 
 QASR_TEST(SentenceBoundaryAsciiPeriodEnd) {
-    QASR_EXPECT_EQ(FindLastSentenceBoundary("Hello."), 6u);
+    QASR_EXPECT_EQ(FindLastSentenceBoundary("Hello."), 0u);
 }
 
 QASR_TEST(SentenceBoundaryAsciiPeriodSpace) {
@@ -102,7 +106,7 @@ QASR_TEST(SentenceBoundaryAsciiPeriodComma) {
 }
 
 QASR_TEST(SentenceBoundaryAsciiPeriodExclamation) {
-    QASR_EXPECT_EQ(FindLastSentenceBoundary("Hello.!!"), 6u);
+    QASR_EXPECT_EQ(FindLastSentenceBoundary("Hello.!!"), 7u);
 }
 
 QASR_TEST(SentenceBoundaryAsciiPeriodNewline) {
@@ -112,30 +116,30 @@ QASR_TEST(SentenceBoundaryAsciiPeriodNewline) {
 QASR_TEST(SentenceBoundaryCjkQuestion) {
     /* ？ = 0xEF 0xBC 0x9F (3 bytes) */
     std::string text = "\xEF\xBC\x9F";  // ？
-    QASR_EXPECT_EQ(FindLastSentenceBoundary(text), 3u);
+    QASR_EXPECT_EQ(FindLastSentenceBoundary(text), 0u);
 }
 
 QASR_TEST(SentenceBoundaryCjkExclamation) {
     /* ！ = 0xEF 0xBC 0x81 (3 bytes) */
     std::string text = "\xEF\xBC\x81";  // ！
-    QASR_EXPECT_EQ(FindLastSentenceBoundary(text), 3u);
+    QASR_EXPECT_EQ(FindLastSentenceBoundary(text), 0u);
 }
 
 QASR_TEST(SentenceBoundaryCjkPeriod) {
     /* 。 = 0xE3 0x80 0x82 (3 bytes) */
     std::string text = "\xE3\x80\x82";  // 。
-    QASR_EXPECT_EQ(FindLastSentenceBoundary(text), 3u);
+    QASR_EXPECT_EQ(FindLastSentenceBoundary(text), 0u);
 }
 
 QASR_TEST(SentenceBoundaryMixedChinese) {
-    /* "你好吗？" — boundary at ？ (byte 10) */
+    /* "你好吗？" — ？ at end, no tail → no boundary */
     std::string text = "\xE4\xBD\xA0\xE5\xA5\xBD\xE5\x90\x97\xEF\xBC\x9F";
-    QASR_EXPECT_EQ(FindLastSentenceBoundary(text), 12u);
+    QASR_EXPECT_EQ(FindLastSentenceBoundary(text), 0u);
 }
 
 QASR_TEST(SentenceBoundaryMultipleBoundaries) {
     /* "Hello? World!" — last boundary is ! (byte 12) */
-    QASR_EXPECT_EQ(FindLastSentenceBoundary("Hello? World!"), 13u);
+    QASR_EXPECT_EQ(FindLastSentenceBoundary("Hello? World!"), 6u);
 }
 
 QASR_TEST(SentenceBoundaryNoBoundary) {
@@ -200,6 +204,6 @@ QASR_TEST(SentenceBoundaryRealChineseSentence) {
     text += "\xEF\xBC\x9F";
     
     std::size_t boundary = FindLastSentenceBoundary(text);
-    QASR_EXPECT(boundary > 0);
-    QASR_EXPECT_EQ(boundary, text.size());
+    /* ？at end, not a mid-text boundary per FindLastMidTextBoundary guard. */
+    QASR_EXPECT_EQ(boundary, 0u);
 }

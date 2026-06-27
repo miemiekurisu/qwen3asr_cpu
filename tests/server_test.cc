@@ -283,7 +283,7 @@ QASR_TEST(ServeStaticTextFileHandlesAllUiAssets) {
      * at the old name (the bug class that produced the
      * "404 on /app.js" 90s-after-deploy outage). */
     namespace fs = std::filesystem;
-    const fs::path ui = std::filesystem::current_path() / "ui";
+    const fs::path ui = fs::path(QASR_TEST_SOURCE_DIR) / "ui";
     struct Asset { const char * path; const char * mime; };
     const Asset assets[] = {
         {"index.html", "text/html; charset=utf-8"},

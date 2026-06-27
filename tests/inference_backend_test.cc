@@ -1,7 +1,6 @@
 #include "tests/test_registry.h"
-#include "qasr/core/inference_backend.h"
-
-// --- Factory ---
+#include "qasr/backend/device_backend.h"
+#include "qasr/backend/cpu_backend.h"
 
 QASR_TEST(CreateCpuBackendReturnsNonNull) {
     auto backend = qasr::CreateCpuBackend();
@@ -14,63 +13,48 @@ QASR_TEST(CreateCpuBackendReturnsNonNull) {
 
 QASR_TEST(CpuBackendNotLoadedInitially) {
     auto backend = qasr::CreateCpuBackend();
-    if (!backend) return;  // CPU backend not compiled
-    QASR_EXPECT(!backend->IsLoaded());
-    QASR_EXPECT_EQ(backend->EncoderOutputDim(), std::int32_t(0));
-    QASR_EXPECT_EQ(backend->DecoderHiddenDim(), std::int32_t(0));
+    if (!backend) return;
+    QASR_EXPECT(!backend->PrepareWeights("/nonexistent").ok());
 }
 
-QASR_TEST(CpuBackendLoadFailsOnBadDir) {
+QASR_TEST(CpuBackendInitializeStub) {
     auto backend = qasr::CreateCpuBackend();
     if (!backend) return;
-    qasr::Status s = backend->Load("/tmp/qasr-nonexistent-model-dir", 1);
-    QASR_EXPECT(!s.ok());
-    QASR_EXPECT(!backend->IsLoaded());
+    QASR_EXPECT(backend->Initialize().ok());
 }
 
 QASR_TEST(CpuBackendEncodeFailsWhenNotLoaded) {
     auto backend = qasr::CreateCpuBackend();
     if (!backend) return;
-    std::vector<float> output;
-    std::int32_t seq_len = 0;
+    backend->Initialize();
+    int out_tokens = 0;
     float dummy = 0.0f;
-    qasr::Status s = backend->Encode(&dummy, 1, &output, &seq_len);
-    QASR_EXPECT(!s.ok());
+    QASR_EXPECT(!backend->EncodeMel(nullptr, &dummy, 1, nullptr, out_tokens).ok());
 }
 
 QASR_TEST(CpuBackendPrefillFailsWhenNotLoaded) {
     auto backend = qasr::CreateCpuBackend();
     if (!backend) return;
-    float dummy = 0.0f;
-    qasr::Status s = backend->Prefill(&dummy, 1);
-    QASR_EXPECT(!s.ok());
+    backend->Initialize();
+    QASR_EXPECT(!backend->DecoderPrefill(nullptr, nullptr, 0, nullptr, 0).ok());
 }
 
 QASR_TEST(CpuBackendDecodeStepFailsWhenNotLoaded) {
     auto backend = qasr::CreateCpuBackend();
     if (!backend) return;
-    float dummy = 0.0f;
+    backend->Initialize();
     std::int32_t token = -1;
-    qasr::Status s = backend->DecodeStep(&dummy, &token);
-    QASR_EXPECT(!s.ok());
+    QASR_EXPECT(!backend->DecodeStep(nullptr, token).ok());
 }
 
 QASR_TEST(CpuBackendResetDecoderSafeWhenNotLoaded) {
     auto backend = qasr::CreateCpuBackend();
     if (!backend) return;
-    backend->ResetDecoder();  // Must not crash
+    QASR_EXPECT(backend->ResetDecoder(nullptr).ok());
 }
 
-QASR_TEST(CpuBackendEncodeRejectsNull) {
+QASR_TEST(CpuBackendKindReturnsCpu) {
     auto backend = qasr::CreateCpuBackend();
     if (!backend) return;
-    qasr::Status s = backend->Encode(nullptr, 1, nullptr, nullptr);
-    QASR_EXPECT(!s.ok());
-}
-
-QASR_TEST(CpuBackendDecodeStepRejectsNull) {
-    auto backend = qasr::CreateCpuBackend();
-    if (!backend) return;
-    qasr::Status s = backend->DecodeStep(nullptr, nullptr);
-    QASR_EXPECT(!s.ok());
+    QASR_EXPECT_EQ(backend->kind(), qasr::BackendKind::kCpu);
 }

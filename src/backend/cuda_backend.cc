@@ -1499,8 +1499,6 @@ Status CudaBackend::DecodeStep(void * workspace_ptr, std::int32_t & out_token) {
         off += max_seq_len * hidden;
         off += max_seq_len * (2 * intermediate);
         off += max_seq_len * hidden;
-        off += cuda_weights_->vocab_size * hidden;
-        off += max_seq_len * hidden;
         float * logits = workspace + off;
         launch_gemv(compute_stream_.stream(),
                       logits, x,
@@ -1523,8 +1521,6 @@ Status CudaBackend::DecodeStep(void * workspace_ptr, std::int32_t & out_token) {
         off += max_seq_len * hidden;
         off += max_seq_len * hidden;
         off += max_seq_len * (2 * intermediate);
-        off += max_seq_len * hidden;
-        off += cuda_weights_->vocab_size * hidden;
         off += max_seq_len * hidden;
         float * logits = workspace + off;
         ArgMax(logits, cuda_weights_->vocab_size, &best_idx, &best_val);
@@ -1750,8 +1746,6 @@ Status CudaBackend::CaptureDecodeGraph(CudaSessionState * session) {
         off += max_seq_len * hidden;
         off += max_seq_len * (2 * intermediate);
         off += max_seq_len * hidden;
-        off += cuda_weights_->vocab_size * hidden;
-        off += max_seq_len * hidden;
         float * logits = workspace + off;
 
         launch_rms_norm(stream,
@@ -1794,7 +1788,12 @@ Status CudaBackend::CaptureDecodeGraph(CudaSessionState * session) {
 #endif
 }
 
-Status CudaBackend::ResetDecoder(void *) {
+Status CudaBackend::ResetDecoder(void * session_ptr) {
+    if (!session_ptr) return OkStatus();
+    auto * session = static_cast<CudaSessionState *>(session_ptr);
+    session->current_seq_len = 0;
+    session->prev_token = 0;
+    session->enc_output_tokens = 0;
     return OkStatus();
 }
 

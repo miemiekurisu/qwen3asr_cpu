@@ -51,7 +51,7 @@ private:
 
 class QwenSession {
 public:
-    std::uint64_t session_id;
+    std::uint64_t session_id = 0;
     std::shared_ptr<QwenModel> model;
     std::unique_ptr<DeviceBackend> backend;
 

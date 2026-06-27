@@ -35,6 +35,7 @@ QASR_TEST(CpuSessionClonesIndependentCtx) {
     qasr::V2EngineConfig config;
     config.model_dir = model_dir;
     config.backend = qasr::BackendKind::kCpu;
+    config.max_sessions = 3;
 
     auto status = engine.LoadModel(config);
     if (!status.ok()) {

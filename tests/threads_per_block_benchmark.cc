@@ -29,6 +29,46 @@ extern "C" {
 #include "qwen_asr_audio.h"
 }
 
+#ifdef _WIN32
+#include <stdlib.h>
+static inline void portable_setenv(const char* name, const char* value) {
+    _putenv_s(name, value);
+}
+static inline void portable_unsetenv(const char* name) {
+    _putenv_s(name, "");
+}
+#else
+static inline void portable_setenv(const char* name, const char* value) {
+    setenv(name, value, 1);
+}
+static inline void portable_unsetenv(const char* name) {
+    unsetenv(name);
+}
+#endif
+
+/* Simple environment variable guard */
+class char_env_guard {
+public:
+    char_env_guard(const char *name, const char *value) 
+        : name_(name), old_value_(std::getenv(name)) {
+        if (value) {
+            portable_setenv(name, value);
+        } else {
+            portable_unsetenv(name);
+        }
+    }
+    ~char_env_guard() {
+        if (old_value_) {
+            portable_setenv(name_, old_value_);
+        } else {
+            portable_unsetenv(name_);
+        }
+    }
+private:
+    const char *name_;
+    const char *old_value_;
+};
+
 /* Benchmark a single configuration */
 static double BenchmarkAttentionKernel(
     qasr::CudaBackend &backend,
@@ -39,7 +79,7 @@ static double BenchmarkAttentionKernel(
     int iterations = 20) {
     
     /* Set environment variable to override threads_per_block */
-    std::char_env_guard guard("QASR_ATTENTION_THREADS", std::to_string(threads_per_block).c_str());
+    char_env_guard guard("QASR_ATTENTION_THREADS", std::to_string(threads_per_block).c_str());
     
     /* Re-load weights with new configuration (this is expensive, do once per threads config) */
     /* For now, we just call EncoderForward which internally calls launch_bidir_attention */
@@ -75,28 +115,16 @@ static double BenchmarkAttentionKernel(
     return total_time / iterations;
 }
 
-/* Simple environment variable guard */
-class char_env_guard {
-public:
-    char_env_guard(const char *name, const char *value) 
-        : name_(name), old_value_(std::getenv(name)) {
-        if (value) {
-            std::setenv(name, value, 1);
-        } else {
-            std::unsetenv(name);
-        }
+static bool SetupCudaSession(qasr::CudaBackend &backend,
+                              qasr::CudaSessionState &session,
+                              int max_seq_len = 4096) {
+    auto status = backend.AllocateSession(&session, max_seq_len);
+    if (!status.ok()) {
+        fprintf(stderr, "  AllocateSession failed: %s\n", status.ToString().c_str());
+        return false;
     }
-    ~char_env_guard() {
-        if (old_value_) {
-            std::setenv(name_, old_value_, 1);
-        } else {
-            std::unsetenv(name_);
-        }
-    }
-private:
-    const char *name_;
-    const char *old_value_;
-};
+    return true;
+}
 
 QASR_TEST(ThreadsPerBlockBenchmark) {
     const char *model_dir = std::getenv("QASR_MODEL_DIR");

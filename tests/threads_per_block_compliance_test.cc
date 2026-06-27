@@ -25,6 +25,38 @@
 
 #ifdef QASR_CUDA_BACKEND_ENABLED
 #include <cuda_runtime.h>
+
+extern "C" {
+#include "qwen_asr_audio.h"
+}
+
+#ifdef _WIN32
+#include <stdlib.h>
+static inline void portable_setenv(const char* name, const char* value) {
+    _putenv_s(name, value);
+}
+static inline void portable_unsetenv(const char* name) {
+    _putenv_s(name, "");
+}
+#else
+static inline void portable_setenv(const char* name, const char* value) {
+    setenv(name, value, 1);
+}
+static inline void portable_unsetenv(const char* name) {
+    unsetenv(name);
+}
+#endif
+
+static bool SetupCudaSession(qasr::CudaBackend &backend,
+                              qasr::CudaSessionState &session,
+                              int max_seq_len = 4096) {
+    auto status = backend.AllocateSession(&session, max_seq_len);
+    if (!status.ok()) {
+        fprintf(stderr, "  AllocateSession failed: %s\n", status.ToString().c_str());
+        return false;
+    }
+    return true;
+}
 #endif
 
 /* ============================================================================
@@ -164,8 +196,7 @@ static double BenchmarkWithThreads(const char* model_dir,
                                     int threads_per_block,
                                     int iterations = 10) {
     /* Set environment variable */
-    std::string env_var = "QASR_ATTENTION_THREADS=" + std::to_string(threads_per_block);
-    setenv("QASR_ATTENTION_THREADS", std::to_string(threads_per_block).c_str(), 1);
+    portable_setenv("QASR_ATTENTION_THREADS", std::to_string(threads_per_block).c_str());
     
     /* Re-initialize backend to pick up new config */
     qasr::CudaBackend backend;

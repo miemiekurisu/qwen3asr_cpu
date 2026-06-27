@@ -65,6 +65,8 @@ public:
 
     /* Check if session has a pending job (backpressure). */
     bool SessionHasPending(std::uint64_t session_id) const;
+    /* Return pending count for a given session. Thread-safe. */
+    int SessionPendingCount(std::uint64_t session_id) const;
 
 private:
     std::queue<SegmentJob> queue_;

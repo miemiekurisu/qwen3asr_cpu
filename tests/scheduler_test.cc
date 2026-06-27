@@ -159,19 +159,23 @@ QASR_TEST(SchedulerBoundedQueueBackpressure) {
     QASR_EXPECT_EQ(scheduler.max_sessions(), 3);
     QASR_EXPECT_EQ(scheduler.max_sessions() * 4, 12);
 
-    // Fill the realtime queue up to the limit: max_pending_per_session * max_sessions
-    for (int i = 0; i < 12; i++) {
-        qasr::SegmentJob job;
-        job.session_id = 1;
-        job.segment_id = static_cast<std::uint64_t>(i);
-        job.realtime = true;
-        job.enqueue_time = std::chrono::steady_clock::now();
-        QASR_EXPECT(scheduler.Submit(job).ok());
+    // Fill each of 3 sessions up to max_pending_per_session_ (4).
+    // Total realtime capacity = 4 * 3 = 12.
+    for (int s = 1; s <= 3; s++) {
+        for (int j = 0; j < 4; j++) {
+            qasr::SegmentJob job;
+            job.session_id = static_cast<std::uint64_t>(s);
+            job.segment_id = static_cast<std::uint64_t>(j);
+            job.realtime = true;
+            job.enqueue_time = std::chrono::steady_clock::now();
+            QASR_EXPECT(scheduler.Submit(job).ok());
+        }
     }
+    QASR_EXPECT_EQ(scheduler.queue_depth(), 12);
 
-    // 13th should fail with ResourceExhausted
+    // 13th (new session) should fail with ResourceExhausted
     qasr::SegmentJob overflow_job;
-    overflow_job.session_id = 1;
+    overflow_job.session_id = 4;
     overflow_job.segment_id = 99;
     overflow_job.realtime = true;
     overflow_job.enqueue_time = std::chrono::steady_clock::now();
@@ -184,18 +188,22 @@ QASR_TEST(SchedulerBatchQueueBackpressure) {
     qasr::GpuScheduler scheduler;
 
     // Fill batch queue: max_batch_queue_ = 16
-    for (int i = 0; i < 16; i++) {
-        qasr::SegmentJob job;
-        job.session_id = 1;
-        job.segment_id = static_cast<std::uint64_t>(i);
-        job.realtime = false;
-        job.enqueue_time = std::chrono::steady_clock::now();
-        QASR_EXPECT(scheduler.Submit(job).ok());
+    // Each session can have up to max_pending_per_session_ (4).
+    for (int s = 1; s <= 4; s++) {
+        for (int j = 0; j < 4; j++) {
+            qasr::SegmentJob job;
+            job.session_id = static_cast<std::uint64_t>(s);
+            job.segment_id = static_cast<std::uint64_t>(j);
+            job.realtime = false;
+            job.enqueue_time = std::chrono::steady_clock::now();
+            QASR_EXPECT(scheduler.Submit(job).ok());
+        }
     }
+    QASR_EXPECT_EQ(scheduler.queue_depth(), 16);
 
-    // 17th should fail
+    // 17th (new session) should fail
     qasr::SegmentJob overflow_job;
-    overflow_job.session_id = 1;
+    overflow_job.session_id = 5;
     overflow_job.segment_id = 99;
     overflow_job.realtime = false;
     overflow_job.enqueue_time = std::chrono::steady_clock::now();

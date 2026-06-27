@@ -59,8 +59,4 @@ public:
     virtual std::int32_t DecoderHiddenDim() const noexcept = 0;
 };
 
-/// Create the built-in CPU inference backend.
-/// Returns nullptr when the CPU backend was not compiled in.
-std::unique_ptr<InferenceBackend> CreateCpuBackend();
-
 }  // namespace qasr

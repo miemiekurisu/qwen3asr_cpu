@@ -30,6 +30,12 @@ bool SessionFairQueue::SessionHasPending(std::uint64_t session_id) const {
     return session_count_.count(session_id) > 0;
 }
 
+int SessionFairQueue::SessionPendingCount(std::uint64_t session_id) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = session_count_.find(session_id);
+    return it != session_count_.end() ? it->second : 0;
+}
+
 GpuScheduler::GpuScheduler() = default;
 
 GpuScheduler::~GpuScheduler() {
@@ -45,29 +51,33 @@ Status GpuScheduler::Submit(const SegmentJob & job) {
         return Status(StatusCode::kFailedPrecondition, "scheduler shut down");
     }
 
-    /* Backpressure: reject if session already has a pending job in queue.
-     * This ensures per-session ordering: at most one queued job per session,
-     * plus at most one inflight.  When inflight completes, the next queued
-     * job is picked up by the worker. */
+    /* Multi-pending backpressure: allow up to max_pending_per_session_ jobs
+     * per session.  Check + Push are atomic under mu_ to prevent races
+     * between concurrent callers submitting for the same session. */
     {
         std::lock_guard<std::mutex> lock(mu_);
-        if (realtime_queue_.SessionHasPending(job.session_id) ||
-            batch_queue_.SessionHasPending(job.session_id)) {
-            return Status(StatusCode::kResourceExhausted,
-                          "session already has pending job in queue");
-        }
-    }
 
-    if (job.realtime) {
-        if (realtime_queue_.Full(max_pending_per_session_ * max_sessions_)) {
-            return Status(StatusCode::kResourceExhausted, "realtime queue full");
+        const int session_pending =
+            realtime_queue_.SessionPendingCount(job.session_id) +
+            batch_queue_.SessionPendingCount(job.session_id);
+        if (session_pending >= max_pending_per_session_) {
+            return Status(StatusCode::kResourceExhausted,
+                          "session has too many pending jobs");
         }
-        realtime_queue_.Push(job);
-    } else {
-        if (batch_queue_.Full(max_batch_queue_)) {
-            return Status(StatusCode::kResourceExhausted, "batch queue full");
+
+        if (job.realtime) {
+            if (realtime_queue_.Full(max_pending_per_session_ * max_sessions_)) {
+                return Status(StatusCode::kResourceExhausted,
+                              "realtime queue full");
+            }
+            realtime_queue_.Push(job);
+        } else {
+            if (batch_queue_.Full(max_batch_queue_)) {
+                return Status(StatusCode::kResourceExhausted,
+                              "batch queue full");
+            }
+            batch_queue_.Push(job);
         }
-        batch_queue_.Push(job);
     }
     cv_.notify_one();
     return OkStatus();

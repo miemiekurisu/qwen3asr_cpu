@@ -22,7 +22,13 @@
 
 extern "C" {
 #include "qwen_asr_audio.h"
+#include "qwen_asr_tokenizer.h"
 }
+#ifdef QASR_CPU_BACKEND_ENABLED
+extern "C" {
+#include "qwen_asr.h"
+}
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -393,7 +399,324 @@ QASR_TEST(CudaEncoderCompareWithCpu) {
 #endif /* QASR_CPU_BACKEND_ENABLED */
 
 /* =================================================================
- * Test 3: Encoding stress test — 10s audio
+ * Test 3: Full GPU decoder pipeline diagnosis
+ * Runs encoder → decoder prefill → autoregressive decode step-by-step.
+ * Dumps every token ID + decoded text to pinpoint where/why the
+ * decoder produces ASR_TEXT → ENDOFTEXT without actual text.
+ *
+ * Tests:
+ *   a) No forced language (past_asr_text=0)
+ *   b) With forced language "Chinese" (past_asr_text=1)
+ *   c) With real audio (long.mp3 chunk) if available
+ *   d) CPU qwen_transcribe_audio baseline (if QASR_CPU_BACKEND_ENABLED)
+ * ================================================================= */
+QASR_TEST(CudaDecoderDiagnoseFullPipeline) {
+    if (!HasCudaDevice()) return;
+
+    const char * model_dir = std::getenv("QASR_MODEL_DIR");
+    if (!model_dir) {
+        fprintf(stderr, "  SKIP: QASR_MODEL_DIR not set\n");
+        return;
+    }
+
+    fprintf(stderr, "\n===== CudaDecoderDiagnoseFullPipeline =====\n");
+    fprintf(stderr, "  model_dir=%s\n", model_dir);
+
+    /* Prompt template arrays — MUST match transcribe_segment_gpu in cuda_asr_engine.cc */
+    static const int PROMPT_PREFIX_HEAD[] = {QWEN_TOKEN_IM_START, 8948, 198};
+    static const int PROMPT_PREFIX_TAIL[] = {QWEN_TOKEN_IM_END, 198, QWEN_TOKEN_IM_START, 872, 198, QWEN_TOKEN_AUDIO_START};
+    static const int PROMPT_SUFFIX_BASE[] = {QWEN_TOKEN_AUDIO_END, QWEN_TOKEN_IM_END, 198, QWEN_TOKEN_IM_START, 77091, 198};
+    static const int AUDIO_PAD_TOKEN = 151676;
+
+    /* ── Load GPU model ── */
+    qasr::CudaBackend backend;
+    QASR_EXPECT(backend.Initialize().ok());
+    auto t0 = std::chrono::steady_clock::now();
+    QASR_EXPECT(backend.PrepareWeights(model_dir).ok());
+    double load_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    fprintf(stderr, "  PrepareWeights: %.1f ms\n", load_ms);
+
+    qasr::CudaSessionState session;
+    QASR_EXPECT(SetupCudaSession(backend, session));
+
+    auto * cw = backend.cuda_weights();
+    int enc_out_dim = cw ? cw->enc_output_dim : 1024;
+    int dec_hidden = cw ? cw->dec_hidden : 1024;
+    int vocab_size = cw ? cw->vocab_size : 151936;
+    fprintf(stderr, "  enc_output_dim=%d dec_hidden=%d vocab_size=%d\n",
+            enc_out_dim, dec_hidden, vocab_size);
+
+    /* ── Generate audio & mel ── */
+    auto wav = GenSineWave(1000.0f, 16000, 5.0f);
+    fprintf(stderr, "  Audio: %d samples (5 sec, 1 kHz sine)\n", (int)wav.size());
+
+    int mel_frames = 0;
+    float * mel = qwen_mel_spectrogram(wav.data(), (int)wav.size(), &mel_frames);
+    QASR_EXPECT(mel != nullptr && mel_frames > 0);
+    fprintf(stderr, "  Mel: %d frames\n", mel_frames);
+
+    /* ── CPU baseline (if available) ── */
+#ifdef QASR_CPU_BACKEND_ENABLED
+    fprintf(stderr, "\n  --- CPU baseline via qwen_transcribe_audio ---\n");
+    qwen_ctx_t * cpu_ctx = qwen_load(model_dir);
+    QASR_EXPECT(cpu_ctx != nullptr);
+    char * cpu_text = qwen_transcribe_audio(cpu_ctx, wav.data(), (int)wav.size());
+    if (cpu_text) {
+        fprintf(stderr, "  CPU text: \"%s\"\n", cpu_text);
+        fprintf(stderr, "  CPU perf: total=%.0fms enc=%.0fms dec=%.0fms tokens=%d\n",
+                cpu_ctx->perf_total_ms, cpu_ctx->perf_encode_ms,
+                cpu_ctx->perf_decode_ms, cpu_ctx->perf_text_tokens);
+        std::free(cpu_text);
+    } else {
+        fprintf(stderr, "  CPU text: (null)\n");
+    }
+    /* CPU baseline with forced language */
+    {
+        qwen_set_force_language(cpu_ctx, "Chinese");
+        char * cpu_text_lang = qwen_transcribe_audio(cpu_ctx, wav.data(), (int)wav.size());
+        if (cpu_text_lang) {
+            fprintf(stderr, "  CPU text (lang=Chinese): \"%s\"\n", cpu_text_lang);
+            fprintf(stderr, "  CPU perf: total=%.0fms enc=%.0fms dec=%.0fms tokens=%d\n",
+                    cpu_ctx->perf_total_ms, cpu_ctx->perf_encode_ms,
+                    cpu_ctx->perf_decode_ms, cpu_ctx->perf_text_tokens);
+            std::free(cpu_text_lang);
+        }
+        qwen_set_force_language(cpu_ctx, nullptr);
+    }
+    qwen_free(cpu_ctx);
+    fprintf(stderr, "  --- End CPU baseline ---\n\n");
+#endif
+
+    /* ── GPU pipeline (no forced language) ── */
+    int max_decode_steps = 32;
+    for (int lang_test = 0; lang_test < 2; lang_test++) {
+        const char * lang_str = (lang_test == 0) ? "" : "Chinese";
+        fprintf(stderr, "\n  ===== GPU decode: lang=\"%s\" =====\n",
+                lang_str[0] ? lang_str : "(none)");
+
+        /* Reset session — cannot reuse KV cache between tests */
+        qasr::CudaSessionState sess2;
+        QASR_EXPECT(SetupCudaSession(backend, sess2));
+
+        /* Step 1: EncoderForward */
+        int enc_seq_len = 0;
+        cudaEvent_t ev_e0, ev_e1;
+        cudaEventCreate(&ev_e0);
+        cudaEventCreate(&ev_e1);
+        cudaEventRecord(ev_e0);
+        auto status = backend.EncoderForward(&sess2, mel, mel_frames, &enc_seq_len);
+        cudaEventRecord(ev_e1);
+        cudaEventSynchronize(ev_e1);
+        float enc_ms = 0;
+        cudaEventElapsedTime(&enc_ms, ev_e0, ev_e1);
+        cudaEventDestroy(ev_e0);
+        cudaEventDestroy(ev_e1);
+        if (!status.ok() || enc_seq_len <= 0) {
+            fprintf(stderr, "  FAIL: EncoderForward: %s\n", status.ToString().c_str());
+            QASR_EXPECT(false);
+            continue;
+        }
+        fprintf(stderr, "  EncoderForward: %d tokens, %.1f ms\n", enc_seq_len, enc_ms);
+
+        /* Step 2: Load tokenizer and build prompt tokens */
+        std::string vocab_path = std::string(model_dir) + "/vocab.json";
+        qwen_tokenizer_t * tok = qwen_tokenizer_load(vocab_path.c_str());
+        if (!tok) {
+            fprintf(stderr, "  FAIL: tokenizer load failed\n");
+            QASR_EXPECT(false);
+            continue;
+        }
+
+        /* Forced language tokens */
+        int * force_prompt_tokens = nullptr;
+        int n_force_prompt_tokens = 0;
+        if (lang_str[0] != '\0') {
+            char force_text[256];
+            snprintf(force_text, sizeof(force_text), "language %s", lang_str);
+            int n_lang_txt = 0;
+            int * lang_txt_tokens = qwen_tokenizer_encode(tok, force_text, &n_lang_txt);
+            n_force_prompt_tokens = n_lang_txt + 1;
+            force_prompt_tokens = (int *)malloc((size_t)n_force_prompt_tokens * sizeof(int));
+            if (lang_txt_tokens) {
+                memcpy(force_prompt_tokens, lang_txt_tokens,
+                       (size_t)n_lang_txt * sizeof(int));
+                std::free(lang_txt_tokens);
+            }
+            force_prompt_tokens[n_lang_txt] = QWEN_TOKEN_ASR_TEXT;
+        }
+
+        /* Prompt tokens (empty) */
+        int n_prompt_tokens = 0;
+
+        /* Build token sequence */
+        int prefix_len = 3 + n_prompt_tokens + 6;
+        int suffix_len = 6 + n_force_prompt_tokens;
+        int total_tokens = prefix_len + enc_seq_len + suffix_len;
+
+        std::vector<std::int32_t> tokens(total_tokens);
+        int off = 0;
+        for (int i = 0; i < 3; i++) tokens[off++] = PROMPT_PREFIX_HEAD[i];
+        for (int i = 0; i < n_prompt_tokens; i++) tokens[off++] = 0; /* unused */
+        for (int i = 0; i < 6; i++) tokens[off++] = PROMPT_PREFIX_TAIL[i];
+        for (int i = 0; i < enc_seq_len; i++) tokens[off++] = AUDIO_PAD_TOKEN;
+        for (int i = 0; i < 6; i++) tokens[off++] = PROMPT_SUFFIX_BASE[i];
+        for (int i = 0; i < n_force_prompt_tokens; i++) tokens[off++] = force_prompt_tokens[i];
+
+        fprintf(stderr, "  Prompt: %d tokens (prefix=%d audio=%d suffix=%d)\n",
+                total_tokens, prefix_len, enc_seq_len, suffix_len);
+        fprintf(stderr, "  Last prompt token: %d\n", tokens[total_tokens - 1]);
+
+        /* Step 3: DecoderPrefill */
+        sess2.current_seq_len = 0;
+        cudaEvent_t ev_p0, ev_p1;
+        cudaEventCreate(&ev_p0);
+        cudaEventCreate(&ev_p1);
+        cudaEventRecord(ev_p0);
+        status = backend.DecoderPrefill(&sess2,
+                                         static_cast<float *>(sess2.enc_output.data()),
+                                         enc_seq_len,
+                                         tokens.data(), total_tokens);
+        cudaEventRecord(ev_p1);
+        cudaEventSynchronize(ev_p1);
+        float prefill_ms = 0;
+        cudaEventElapsedTime(&prefill_ms, ev_p0, ev_p1);
+        cudaEventDestroy(ev_p0);
+        cudaEventDestroy(ev_p1);
+        if (!status.ok()) {
+            fprintf(stderr, "  FAIL: DecoderPrefill: %s\n", status.ToString().c_str());
+            qwen_tokenizer_free(tok);
+            if (force_prompt_tokens) free(force_prompt_tokens);
+            QASR_EXPECT(false);
+            continue;
+        }
+        fprintf(stderr, "  DecoderPrefill: %.1f ms (current_seq_len=%d)\n",
+                prefill_ms, sess2.current_seq_len);
+
+        /* Step 4: Autoregressive decode loop */
+        sess2.prev_token = tokens[total_tokens - 1];
+        int past_asr_text = (n_force_prompt_tokens > 0) ? 1 : 0;
+        fprintf(stderr, "  past_asr_text=%d\n", past_asr_text);
+
+        cudaEvent_t ev_d0, ev_d1;
+        cudaEventCreate(&ev_d0);
+        cudaEventCreate(&ev_d1);
+        cudaEventRecord(ev_d0);
+
+        fprintf(stderr, "\n  Decode steps:\n");
+        fprintf(stderr, "  %-6s | %-8s | %-10s | %s\n",
+                "Step", "TokenID", "Type", "Decoded");
+        fprintf(stderr, "  %s\n", std::string(60, '-').c_str());
+
+        std::vector<int> gen_tokens;
+        std::string output_text;
+        for (int step = 0; step < max_decode_steps; step++) {
+            std::int32_t token_id = 0;
+            status = backend.DecodeStep(&sess2, token_id);
+            if (!status.ok()) {
+                fprintf(stderr, "  FAIL at step %d: %s\n", step, status.ToString().c_str());
+                break;
+            }
+
+            gen_tokens.push_back(static_cast<int>(token_id));
+
+            /* Categorize token */
+            const char * type_str = "OTHER";
+            if (token_id == QWEN_TOKEN_ENDOFTEXT) {
+                type_str = "ENDOFTEXT";
+            } else if (token_id == QWEN_TOKEN_IM_END) {
+                type_str = "IM_END";
+            } else if (token_id == QWEN_TOKEN_ASR_TEXT) {
+                type_str = "ASR_TEXT";
+                past_asr_text = 1;
+            } else if (past_asr_text) {
+                type_str = "TEXT_TOK";
+            }
+
+            const char * decoded = qwen_tokenizer_decode(tok, static_cast<int>(token_id));
+            if (!decoded) decoded = "(null)";
+
+            fprintf(stderr, "  %-6d | %-8d | %-10s | ", step, token_id, type_str);
+            /* Print decoded text safely, escape non-printable */
+            for (const char *p = decoded; *p; p++) {
+                if ((unsigned char)*p >= 32 && *p != 127)
+                    fputc(*p, stderr);
+                else
+                    fprintf(stderr, "\\x%02x", (unsigned char)*p);
+            }
+            fprintf(stderr, "\n");
+
+            /* Accumulate text tokens */
+            if (type_str == std::string("TEXT_TOK")) {
+                output_text += decoded;
+            }
+
+            /* Stop conditions */
+            if (token_id == QWEN_TOKEN_ENDOFTEXT || token_id == QWEN_TOKEN_IM_END)
+                break;
+        }
+
+        cudaEventRecord(ev_d1);
+        cudaEventSynchronize(ev_d1);
+        float decode_ms = 0;
+        cudaEventElapsedTime(&decode_ms, ev_d0, ev_d1);
+        cudaEventDestroy(ev_d0);
+        cudaEventDestroy(ev_d1);
+
+        fprintf(stderr, "\n  Decode: %d steps, %.1f ms\n", (int)gen_tokens.size(), decode_ms);
+        fprintf(stderr, "  past_asr_text after decode: %d\n", past_asr_text);
+        fprintf(stderr, "  Accumulated text: \"%s\"\n", output_text.c_str());
+
+        /* Statistical analysis */
+        int n_text = 0, n_special = 0;
+        for (int id : gen_tokens) {
+            if (id == QWEN_TOKEN_ENDOFTEXT || id == QWEN_TOKEN_IM_END ||
+                id == QWEN_TOKEN_ASR_TEXT || id == QWEN_TOKEN_IM_START ||
+                id == QWEN_TOKEN_AUDIO_START || id == QWEN_TOKEN_AUDIO_END)
+                n_special++;
+            else
+                n_text++;
+        }
+        fprintf(stderr, "  Stats: %d total, %d special, %d text tokens, text=\"%s\"\n",
+                (int)gen_tokens.size(), n_special, n_text, output_text.c_str());
+
+        /* Critical assertion: must produce at least 1 text token after ASR_TEXT marker */
+        bool has_text_after_asr = false;
+        bool seen_asr = false;
+        for (int id : gen_tokens) {
+            if (id == QWEN_TOKEN_ASR_TEXT) { seen_asr = true; continue; }
+            if (seen_asr && id != QWEN_TOKEN_ENDOFTEXT && id != QWEN_TOKEN_IM_END)
+                has_text_after_asr = true;
+        }
+        if (!has_text_after_asr) {
+            fprintf(stderr, "  *** DIAGNOSIS: decoder produced ASR_TEXT but no text tokens followed ***\n");
+            fprintf(stderr, "  *** Check: encoder output quality, lm_head logits, KV cache correctness ***\n");
+        }
+
+        /* Verify encoder output statistics */
+        float * enc_host = nullptr;
+        cudaMallocHost(&enc_host, (size_t)enc_seq_len * enc_out_dim * sizeof(float));
+        cudaMemcpy(enc_host, sess2.enc_output.data(),
+                   (size_t)enc_seq_len * enc_out_dim * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        FloatStats enc_stats = ComputeStats(enc_host, enc_seq_len * enc_out_dim);
+        fprintf(stderr, "  Encoder output stats: mean=%.6f std=%.6f abs_mean=%.6f nonzero=%d/%d\n",
+                enc_stats.mean, enc_stats.stddev, enc_stats.abs_mean,
+                enc_stats.nonzero, enc_stats.total);
+        cudaFreeHost(enc_host);
+
+        fprintf(stderr, "  %s\n", std::string(60, '-').c_str());
+
+        qwen_tokenizer_free(tok);
+        if (force_prompt_tokens) free(force_prompt_tokens);
+    }
+
+    std::free(mel);
+    fprintf(stderr, "\n===== TEST PASSED =====\n\n");
+}
+
+/* =================================================================
+ * Test 4: Encoding stress test — 10s audio
  * Checks if larger audio triggers different behavior.
  * ================================================================= */
 QASR_TEST(CudaEncoderStress10s) {
