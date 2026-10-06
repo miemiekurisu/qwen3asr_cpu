@@ -1,6 +1,7 @@
 #include "qasr/runtime/model_bridge.h"
 
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -332,6 +333,8 @@ AsrRunResult RunAsr(const AsrRunOptions & options) {
     engCfg.verbosity = options.verbosity;
     engCfg.language = options.language;
     engCfg.prompt = options.prompt;
+    engCfg.hotwords = options.hotwords;
+    engCfg.hotword_bias = options.hotword_bias;
 
     auto engine = CreateEngine(BackendKind::kCpu);
     if (!engine) {
@@ -350,6 +353,8 @@ AsrRunResult RunAsr(const AsrRunOptions & options) {
     SessionOptions sOpts;
     sOpts.language = options.language;
     sOpts.prompt = options.prompt;
+    sOpts.hotwords = options.hotwords;
+    sOpts.hotword_bias = options.hotword_bias;
     if (options.temperature >= 0.0f) {
         sOpts.temperature = options.temperature;
     }
@@ -442,6 +447,14 @@ AsrRunResult RunAsrSegmented(const AsrRunOptions & options) {
         qwen_free(ctx);
         result.status = Status(StatusCode::kInvalidArgument, "failed to set prompt");
         return result;
+    }
+    if (!options.hotwords.empty()) {
+        float hw_bias = options.hotword_bias > 0.0f ? options.hotword_bias : 2.0f;
+        if (qwen_set_hotwords(ctx, options.hotwords.c_str(), logf(hw_bias)) != 0) {
+            qwen_free(ctx);
+            result.status = Status(StatusCode::kInvalidArgument, "failed to set hotwords");
+            return result;
+        }
     }
     if (!options.language.empty() && qwen_set_force_language(ctx, options.language.c_str()) != 0) {
         qwen_free(ctx);
@@ -557,6 +570,14 @@ AsrRunResult RunAsrSegmentedStreaming(const AsrRunOptions & options,
         qwen_free(ctx);
         result.status = Status(StatusCode::kInvalidArgument, "failed to set prompt");
         return result;
+    }
+    if (!options.hotwords.empty()) {
+        float hw_bias = options.hotword_bias > 0.0f ? options.hotword_bias : 2.0f;
+        if (qwen_set_hotwords(ctx, options.hotwords.c_str(), logf(hw_bias)) != 0) {
+            qwen_free(ctx);
+            result.status = Status(StatusCode::kInvalidArgument, "failed to set hotwords");
+            return result;
+        }
     }
     if (!options.language.empty() && qwen_set_force_language(ctx, options.language.c_str()) != 0) {
         qwen_free(ctx);

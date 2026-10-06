@@ -380,6 +380,25 @@ typedef struct {
     int n_force_prompt_tokens;
     int prompt_tokens_ready;       /* cache valid flag */
 
+    /* Hotword logit boosting (optional, model-agnostic mechanism).
+     * A CSV term list is tokenized lazily into candidate token
+     * sequences (with and without a leading space, so both
+     * sentence-initial and mid-sentence forms are covered).  During
+     * decode, each sequence tracks how many of its leading tokens the
+     * generated stream has matched so far; the token that would
+     * continue an in-progress match gets +hotword_bias added to its
+     * logit.  Prefix tokens (depth 0) are boosted unconditionally,
+     * which biases generation towards starting the word; continuation
+     * tokens are boosted only inside an active match, which avoids
+     * corrupting unrelated context. */
+    char *hotwords;                  /* raw CSV text, NULL = disabled */
+    float hotword_bias;             /* logit add for the next expected token */
+    int **hotword_seqs;             /* [n_hotword_seqs] token id sequences */
+    int *hotword_seq_lens;          /* per-sequence length */
+    int *hotword_seq_depth;         /* per-sequence matched-prefix length */
+    int n_hotword_seqs;
+    int hotword_seqs_ready;         /* lazy-tokenize flag */
+
     /* Per-run performance stats (populated by last transcription call) */
     double perf_total_ms;          /* end-to-end inference time in milliseconds */
     int perf_text_tokens;          /* emitted text tokens (after <asr_text>) */
@@ -522,6 +541,15 @@ int qwen_was_cancelled(const qwen_ctx_t *ctx);
 /* Set optional system prompt text (UTF-8). Pass NULL or "" to clear.
  * Returns 0 on success, -1 on allocation/encoding errors. */
 int qwen_set_prompt(qwen_ctx_t *ctx, const char *prompt);
+
+/* Set optional hotword list and logit bias (UTF-8, comma/semicolon/
+ * newline separated, e.g. "Zentrix, RayRemote, vLLM").  While a
+ * hotword's token prefix is being matched during decode, the token
+ * that would continue the match gets +bias added to its logit
+ * (a probability multiplier of m corresponds to bias = logf(m)).
+ * bias <= 0 or an empty/NULL list disables boosting.
+ * Returns 0 on success, -1 on allocation errors. */
+int qwen_set_hotwords(qwen_ctx_t *ctx, const char *hotwords, float bias);
 
 /* Set optional forced language. Pass NULL or "" to clear.
  * Returns 0 on success, -1 if language is unsupported. */

@@ -30,6 +30,11 @@ struct OpenAiRealtimeRequest {
     std::string session_id;
     std::string model;
     std::string language;
+    /* Optional system-prompt context ("prompt" or OpenAI-style
+     * "instructions") and CSV hotword list for logit boosting —
+     * both are applied to the realtime decode. */
+    std::string prompt;
+    std::string hotwords;
     std::string input_audio_format = "pcm16le";
     std::string audio;
     bool stream = true;
@@ -53,6 +58,12 @@ struct ServerConfig {
     std::int32_t threads = 0;
     std::int32_t verbosity = 0;
     float temperature = -1.0f;
+    /* Default system prompt / hotword list applied to realtime and
+     * host-capture sessions when the request does not specify them.
+     * --prompt / --hotwords / --hotword-bias. */
+    std::string prompt;
+    std::string hotwords;
+    float hotword_bias = 2.0f;
     bool encoder_int8 = false;
     /* Encoder INT8 is propagated to the realtime clone when enabled
      * (its quality impact is minimal).  Decoder INT8 is intentionally

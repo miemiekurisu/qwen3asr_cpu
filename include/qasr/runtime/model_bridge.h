@@ -34,6 +34,13 @@ struct AsrRunOptions {
     float temperature = -1.0f;
     std::string prompt;
     std::string language;
+    /* Hotword logit boosting: CSV term list (--hotwords) and the
+     * probability multiplier applied to the next expected token while
+     * a hotword prefix is being matched (--hotword-bias, default 2.0
+     * when hotwords are given).  Implemented in the C decoder via
+     * qwen_set_hotwords; orthogonal to --prompt. */
+    std::string hotwords;
+    float hotword_bias = 0.0f;
 };
 
 struct AsrRunResult {

@@ -15,6 +15,10 @@ namespace qasr {
 struct SessionOptions {
     std::string language;
     std::string prompt;
+    /* Hotword logit boosting: CSV term list + probability multiplier.
+     * Falls back to EngineConfig values when empty/0. */
+    std::string hotwords;
+    float hotword_bias = 0.0f;
     std::int32_t stream_max_new_tokens = 32;
     float temperature = -1.0f;
     bool realtime = false;

@@ -45,6 +45,11 @@ struct V2EngineConfig {
     float temperature = -1.0f;
     std::string language;
     std::string prompt;
+    /* Hotword boosting (logit-bias mechanism).  hotwords is a CSV of
+     * terms; hotword_bias is a probability multiplier (>1 boosts,
+     * e.g. 2.0 ~= +0.69 logit).  0/empty disables. */
+    std::string hotwords;
+    float hotword_bias = 0.0f;
 };
 
 BackendKind ParseBackendKind(std::string_view s);

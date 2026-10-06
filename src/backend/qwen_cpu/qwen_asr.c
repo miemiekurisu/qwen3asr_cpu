@@ -141,6 +141,46 @@ int qwen_set_prompt(qwen_ctx_t *ctx, const char *prompt) {
     return 0;
 }
 
+static void reset_hotword_cache(qwen_ctx_t *ctx) {
+    if (ctx->hotword_seqs) {
+        for (int i = 0; i < ctx->n_hotword_seqs; i++) {
+            free(ctx->hotword_seqs[i]);
+        }
+        free(ctx->hotword_seqs);
+    }
+    ctx->hotword_seqs = NULL;
+    free(ctx->hotword_seq_lens);
+    ctx->hotword_seq_lens = NULL;
+    free(ctx->hotword_seq_depth);
+    ctx->hotword_seq_depth = NULL;
+    ctx->n_hotword_seqs = 0;
+    ctx->hotword_seqs_ready = 0;
+}
+
+/* Zero the per-sequence match depth (called once per decode run so a
+ * partial match never leaks across independent transcriptions). */
+static void reset_hotword_depths(qwen_ctx_t *ctx) {
+    if (ctx->hotword_seq_depth) {
+        memset(ctx->hotword_seq_depth, 0,
+               (size_t)ctx->n_hotword_seqs * sizeof(int));
+    }
+}
+
+int qwen_set_hotwords(qwen_ctx_t *ctx, const char *hotwords, float bias) {
+    if (!ctx) return -1;
+
+    char *dup = NULL;
+    if (hotwords && hotwords[0] != '\0') {
+        dup = strdup(hotwords);
+        if (!dup) return -1;
+    }
+    free(ctx->hotwords);
+    ctx->hotwords = dup;
+    ctx->hotword_bias = bias;
+    reset_hotword_cache(ctx);
+    return 0;
+}
+
 static int normalize_language_name(const char *language, char *out, size_t out_cap) {
     if (!language || !out || out_cap < 2) return -1;
 
@@ -456,6 +496,13 @@ qwen_ctx_t *qwen_clone_shared(const qwen_ctx_t *src) {
     ctx->force_prompt_tokens = NULL;
     ctx->n_force_prompt_tokens = 0;
     ctx->prompt_tokens_ready = 0;
+    ctx->hotwords = NULL;
+    ctx->hotword_bias = 0.0f;
+    ctx->hotword_seqs = NULL;
+    ctx->hotword_seq_lens = NULL;
+    ctx->hotword_seq_depth = NULL;
+    ctx->n_hotword_seqs = 0;
+    ctx->hotword_seqs_ready = 0;
 
     ctx->kv_cache_k = NULL;
     ctx->kv_cache_v = NULL;
@@ -591,6 +638,10 @@ void qwen_free(qwen_ctx_t *ctx) {
     free(ctx->dec_rope_cos); free(ctx->dec_rope_sin);
     free(ctx->dec_logits_buf);
 
+    /* Hotword boosting */
+    free(ctx->hotwords);
+    reset_hotword_cache(ctx);
+
     /* Persistent decoder prefill buffers */
     free(ctx->pref_x); free(ctx->pref_x_norm);
     free(ctx->pref_q); free(ctx->pref_k); free(ctx->pref_v);
@@ -692,6 +743,7 @@ static double get_time_ms(void) {
 }
 
 static void reset_runtime_perf_stats(qwen_ctx_t *ctx) {
+    reset_hotword_depths(ctx);
     const double prepare_ms = ctx->runtime_perf.decoder_prefill_qkv_prepare_ms;
     const double gate_up_prepare_ms = ctx->runtime_perf.decoder_prefill_gate_up_prepare_ms;
     memset(&ctx->runtime_perf, 0, sizeof(ctx->runtime_perf));
@@ -869,6 +921,8 @@ static float *compact_silence(const float *samples, int n_samples, int *out_samp
     return out;
 }
 
+static int prepare_hotword_tokens(qwen_ctx_t *ctx, qwen_tokenizer_t *tokenizer);
+
 /* Prepare cached prompt-related tokens once per context. */
 static int prepare_prompt_tokens(qwen_ctx_t *ctx, qwen_tokenizer_t *tokenizer) {
     if (ctx->prompt_tokens_ready) return 0;
@@ -907,7 +961,124 @@ static int prepare_prompt_tokens(qwen_ctx_t *ctx, qwen_tokenizer_t *tokenizer) {
         free(lang_txt_tokens);
     }
 
+    if (prepare_hotword_tokens(ctx, tokenizer) != 0) {
+        return -1;
+    }
+
     ctx->prompt_tokens_ready = 1;
+    return 0;
+}
+
+/* Lazily tokenize the CSV hotword list into candidate token sequences.
+ * Each term is encoded twice — once bare and once with a leading
+ * space — so both sentence-initial ("Zentrix works well") and
+ * mid-sentence ("I used Zentrix") surface forms are boosted.  Called
+ * from prepare_prompt_tokens, which is the one place a tokenizer is
+ * guaranteed to be in scope; results are cached on the ctx. */
+static int prepare_hotword_tokens(qwen_ctx_t *ctx, qwen_tokenizer_t *tokenizer) {
+    if (ctx->hotword_seqs_ready) return 0;
+    if (!ctx->hotwords || ctx->hotwords[0] == '\0' ||
+        ctx->hotword_bias <= 0.0f) {
+        reset_hotword_cache(ctx);
+        ctx->hotword_seqs_ready = 1;
+        return 0;
+    }
+
+    char *work = strdup(ctx->hotwords);
+    if (!work) return -1;
+
+    int cap = 8;
+    int **seqs = (int **)malloc((size_t)cap * sizeof(int *));
+    int *lens = (int *)malloc((size_t)cap * sizeof(int));
+    if (!seqs || !lens) {
+        free(seqs);
+        free(lens);
+        free(work);
+        return -1;
+    }
+    int n = 0;
+
+    char *save = NULL;
+    for (char *term = strtok_r(work, ",;\n", &save);
+         term;
+         term = strtok_r(NULL, ",;\n", &save)) {
+        while (*term == ' ' || *term == '\t' || *term == '\r') term++;
+        size_t tlen = strlen(term);
+        while (tlen > 0 &&
+               (term[tlen - 1] == ' ' || term[tlen - 1] == '\t' ||
+                term[tlen - 1] == '\r')) {
+            term[--tlen] = '\0';
+        }
+        if (tlen == 0) continue;
+
+        char spaced[256];
+        int n_variants = 1;
+        const char *variants[2] = { term, spaced };
+        if (tlen + 2 < sizeof(spaced)) {
+            snprintf(spaced, sizeof(spaced), " %s", term);
+            n_variants = 2;
+        }
+
+        for (int v = 0; v < n_variants; v++) {
+            int n_tok = 0;
+            int *toks = qwen_tokenizer_encode(tokenizer, variants[v], &n_tok);
+            if (!toks || n_tok <= 0) {
+                free(toks);
+                continue;
+            }
+            /* Skip exact-duplicate sequences (e.g. term already starts
+             * with a token that is invariant to the leading space). */
+            int dup = 0;
+            for (int i = 0; i < n; i++) {
+                if (lens[i] == n_tok &&
+                    memcmp(seqs[i], toks, (size_t)n_tok * sizeof(int)) == 0) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (dup) {
+                free(toks);
+                continue;
+            }
+            if (n == cap) {
+                int ncap = cap * 2;
+                int **nseqs = (int **)realloc(seqs, (size_t)ncap * sizeof(int *));
+                int *nlens = (int *)realloc(lens, (size_t)ncap * sizeof(int));
+                if (!nseqs || !nlens) {
+                    free(nseqs ? nseqs : seqs);
+                    free(nlens ? nlens : lens);
+                    free(toks);
+                    for (int i = 0; i < n; i++) free(seqs[i]);
+                    free(work);
+                    return -1;
+                }
+                seqs = nseqs;
+                lens = nlens;
+                cap = ncap;
+            }
+            seqs[n] = toks;
+            lens[n] = n_tok;
+            n++;
+        }
+    }
+    free(work);
+
+    reset_hotword_cache(ctx);
+    ctx->hotword_seqs = seqs;
+    ctx->hotword_seq_lens = lens;
+    ctx->hotword_seq_depth = (int *)calloc((size_t)(n > 0 ? n : 1), sizeof(int));
+    if (!ctx->hotword_seq_depth) {
+        for (int i = 0; i < n; i++) free(seqs[i]);
+        free(seqs);
+        free(lens);
+        return -1;
+    }
+    ctx->n_hotword_seqs = n;
+    ctx->hotword_seqs_ready = 1;
+    if (qwen_verbose >= 1) {
+        fprintf(stderr, "qwen: hotwords configured, %d token sequences, bias=%.3f\n",
+                n, ctx->hotword_bias);
+    }
     return 0;
 }
 

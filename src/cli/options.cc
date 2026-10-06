@@ -135,6 +135,30 @@ Status ParseCliArguments(int argc, const char * const argv[], CliOptions * optio
             ++index;
             continue;
         }
+        if (arg == "--hotwords") {
+            const char * value = nullptr;
+            Status status = RequireValue(argc, argv, index, "--hotwords", &value);
+            if (!status.ok()) {
+                return status;
+            }
+            options->asr.hotwords = value;
+            ++index;
+            continue;
+        }
+        if (arg == "--hotword-bias") {
+            const char * value = nullptr;
+            Status status = RequireValue(argc, argv, index, "--hotword-bias", &value);
+            if (!status.ok()) {
+                return status;
+            }
+            float b = 0.0f;
+            if (sscanf(value, "%f", &b) != 1 || b <= 0.0f) {
+                return Status(StatusCode::kInvalidArgument, "hotword-bias must be a positive float (probability multiplier)");
+            }
+            options->asr.hotword_bias = b;
+            ++index;
+            continue;
+        }
         if (arg == "--language") {
             const char * value = nullptr;
             Status status = RequireValue(argc, argv, index, "--language", &value);
@@ -248,7 +272,9 @@ std::string BuildCliUsage(std::string_view program_name) {
     usage += "推理选项 / Inference:\n";
     usage += "  --threads <n>                  CPU 线程数 (默认: 自动检测)\n";
     usage += "  --language <lang>              强制语言 (如 Chinese, English)\n";
-    usage += "  --prompt <text>                提示文本 (引导识别风格)\n";
+    usage += "  --prompt <text>                提示文本/热词上下文 (引导识别风格与词汇)\n";
+    usage += "  --hotwords <a,b,c>             热词列表 (logit 偏置, 逗号分隔)\n";
+    usage += "  --hotword-bias <float>         热词概率倍率 (默认: 2.0, 即 +0.69 logit)\n";
     usage += "  --temperature <float>          采样温度 (默认: auto, 0=贪心, >0=采样)\n\n";
     usage += "高级选项 / Advanced:\n";
     usage += "  --stream                       流式分段推理\n";

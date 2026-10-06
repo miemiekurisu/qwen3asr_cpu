@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 
 /* ========================================================================
  * Weight Loading
@@ -801,6 +802,94 @@ static void ensure_dec_buffers(qwen_ctx_t *ctx) {
     ctx->dec_rope_sin = (float *)malloc(head_dim * sizeof(float));
 }
 
+/* ---- Hotword logit boosting ----
+ *
+ * Each configured hotword is a token sequence; hotword_seq_depth[h]
+ * tracks how many leading tokens the generated stream has matched.
+ * While a match is in progress the token that would continue it
+ * receives +hotword_bias on its logit.  Depth-0 (first) tokens are
+ * boosted unconditionally — that is what nudges the model towards
+ * starting the word at all; deeper tokens are only boosted inside a
+ * live match, so common sub-tokens ("in", "Ray") never get boosted
+ * out of context.
+ *
+ * Two self-regulating guards keep large hotword lists safe:
+ *  - rarity attenuation: a single-token sequence whose token has a
+ *    low BPE id is a common word (" Pro"=1298); BPE merge order is a
+ *    frequency proxy, so its depth-0 boost is attenuated by id/60000.
+ *    Multi-token sequences and high-id tokens ("秘"=99780) keep
+ *    full boost — the sequence structure already guards them.
+ *  - margin cap: the applied boost is capped at (top logit - token
+ *    logit + eps), so a boosted token can at most just overtake the
+ *    current argmax — it can never be pushed to an extreme logit that
+ *    snowballs into repetition loops.
+ */
+static int hotwords_active(const qwen_ctx_t *ctx) {
+    return ctx->n_hotword_seqs > 0 && ctx->hotword_bias != 0.0f;
+}
+
+static float hotword_first_scale(const qwen_ctx_t *ctx, int h) {
+    int id = ctx->hotword_seqs[h][0];
+    int len = ctx->hotword_seq_lens[h];
+    float s = (float)id / 60000.0f;
+    if (s > 1.0f) s = 1.0f;
+    /* Multi-token sequences get a floor: the sequence structure itself
+     * is a rarity signal, and coined compounds often START with a
+     * common prefix token ("De", "Ray") that still deserves a nudge.
+     * Single-token sequences get no floor — a low-id single token is
+     * just a common word and boosting it unconditionally is what
+     * turns large lists into hotword soup. */
+    if (len >= 2 && s < 0.3f) s = 0.3f;
+    if (s < 0.02f) s = 0.02f;
+    return s;
+}
+
+static void hotword_apply_bias(qwen_ctx_t *ctx) {
+    float top = -FLT_MAX;
+    for (int v = 0; v < ctx->config.vocab_size; v++) {
+        if (ctx->dec_logits_buf[v] > top) top = ctx->dec_logits_buf[v];
+    }
+    for (int h = 0; h < ctx->n_hotword_seqs; h++) {
+        int d = ctx->hotword_seq_depth[h];
+        int tid = ctx->hotword_seqs[h][d];
+        if (tid < 0 || tid >= ctx->config.vocab_size) continue;
+        float b = ctx->hotword_bias;
+        if (d == 0) b *= hotword_first_scale(ctx, h);
+        float need = top - ctx->dec_logits_buf[tid] + 1e-3f;
+        float add = b < need ? b : need;
+        if (add > 0.0f) ctx->dec_logits_buf[tid] += add;
+    }
+}
+
+/* Advance every hotword's prefix-match state after emitting `token`.
+ * On mismatch, fall back to the longest hotword prefix that is a
+ * suffix of (matched prefix + token) — a KMP-style transition that
+ * keeps overlapping matches alive (e.g. "ABA" in "ABAB"). */
+static void hotword_advance(qwen_ctx_t *ctx, int token) {
+    for (int h = 0; h < ctx->n_hotword_seqs; h++) {
+        const int *seq = ctx->hotword_seqs[h];
+        int len = ctx->hotword_seq_lens[h];
+        int d = ctx->hotword_seq_depth[h];
+        int nd = 0;
+        if (token == seq[d]) {
+            nd = d + 1;
+        } else {
+            int maxl = d + 1;
+            if (maxl > len) maxl = len;
+            for (int l = maxl; l >= 1; l--) {
+                if (seq[l - 1] != token) continue;
+                int ok = 1;
+                for (int k = 0; k < l - 1; k++) {
+                    if (seq[k] != seq[d - l + 1 + k]) { ok = 0; break; }
+                }
+                if (ok) { nd = l; break; }
+            }
+        }
+        if (nd >= len) nd = 0;  /* completed match: restart tracking */
+        ctx->hotword_seq_depth[h] = nd;
+    }
+}
+
 int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
     qwen_decoder_t *dec = &ctx->decoder;
     const qwen_config_t *cfg = &ctx->config;
@@ -895,11 +984,13 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
     /* Final norm + output projection */
     qwen_rms_norm(x, x, dec->norm, 1, dim, eps);
 
-    /* Temperature sampling / repetition penalty mode: compute full logits.
-     * Used by batch fallback and streaming temperature escalation. */
+    /* Temperature sampling / repetition penalty / hotword-bias mode:
+     * compute full logits.  Used by batch fallback, streaming
+     * temperature escalation, and hotword boosting. */
     int need_logits = (ctx->decode_temperature > 0.01f) ||
                       (ctx->decode_repetition_penalty > 1.001f &&
-                       ctx->rep_pen_ring_count > 0);
+                       ctx->rep_pen_ring_count > 0) ||
+                      hotwords_active(ctx);
 
     if (need_logits) {
         /* Compute L1_x once for argmax early-termination upper bound.
@@ -918,6 +1009,14 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
         /* logits = x @ tok_embeddings^T */
         qwen_matmul_t_bf16(ctx->dec_logits_buf, x, dec->tok_embeddings_bf16,
                            1, dim, cfg->vocab_size);
+
+        /* Hotword boosting: nudge the logit of every token that would
+         * extend an in-progress hotword prefix match.  Applied before
+         * the repetition penalty so a repeatedly-generated hotword
+         * token can still be penalised. */
+        if (hotwords_active(ctx)) {
+            hotword_apply_bias(ctx);
+        }
 
         /* Frequency-scaled repetition penalty: penalize each recent token
          * by base_pen ^ min(freq, 10).  Tokens appearing many times in
@@ -1017,8 +1116,12 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
             float cs = 0.0f;
             for (int j = 0; j < n_active; j++) {
                 cs += top_val[j];
-                if (cs >= r) return top_idx[j];
+                if (cs >= r) {
+                    if (ctx->n_hotword_seqs > 0) hotword_advance(ctx, top_idx[j]);
+                    return top_idx[j];
+                }
             }
+            if (ctx->n_hotword_seqs > 0) hotword_advance(ctx, top_idx[0]);
             return top_idx[0];
         }
 
@@ -1031,6 +1134,7 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
                 best_id = i;
             }
         }
+        if (ctx->n_hotword_seqs > 0) hotword_advance(ctx, best_id);
         return best_id;
     }
 
@@ -1039,8 +1143,10 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
         /* #1 argmax early term disabled (L1_x=0): bound was too loose in
          * practice, no measurable speedup, and a double-free crash was
          * traced to the early-term path during long-audio streaming. */
-        return qwen_argmax_matvec_bf16(x, dec->tok_embeddings_bf16, dim,
-                                       cfg->vocab_size,
-                                       dec->tok_embed_suffix_max, 0.0f);
+        int tok = qwen_argmax_matvec_bf16(x, dec->tok_embeddings_bf16, dim,
+                                          cfg->vocab_size,
+                                          dec->tok_embed_suffix_max, 0.0f);
+        if (ctx->n_hotword_seqs > 0) hotword_advance(ctx, tok);
+        return tok;
     }
 }

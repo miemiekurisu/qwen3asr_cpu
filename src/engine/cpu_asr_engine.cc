@@ -1,5 +1,6 @@
 #include "qasr/engine/cpu_asr_engine.h"
 #include "qasr/backend/cpu_backend.h"
+#include <cmath>
 #include <cstdio>
 
 extern "C" {
@@ -89,6 +90,17 @@ AsrSegmentResult CpuAsrEngine::TranscribeSegment(std::uint64_t session_id,
 
     qwen_set_force_language(base, lang);
     qwen_set_prompt(base, prompt);
+
+    const char * hotwords = session->opts.hotwords.empty()
+        ? (config_.hotwords.empty() ? nullptr : config_.hotwords.c_str())
+        : session->opts.hotwords.c_str();
+    float hotword_bias = session->opts.hotword_bias > 0.0f
+        ? session->opts.hotword_bias : config_.hotword_bias;
+    if (hotwords && hotword_bias > 1.0f) {
+        qwen_set_hotwords(base, hotwords, logf(hotword_bias));
+    } else {
+        qwen_set_hotwords(base, nullptr, 0.0f);
+    }
 
     float temp = session->opts.temperature >= 0.0f
         ? session->opts.temperature
